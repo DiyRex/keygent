@@ -183,6 +183,7 @@ You type values in your own terminal, and every change asks for your passphrase.
 
 ```sh
 keygent add stripe/live --env STRIPE_API_KEY --desc "Stripe live key"
+keygent add gcp/sa --from-file ./sa.json --delete   # multi-line / file secrets (PEM keys, JSON credentials); --multiline to paste
 keygent edit stripe/live        # change metadata or policy
 keygent rotate stripe/live      # replace the value, keep the handle (--undo within 24 h)
 keygent rename stripe/live stripe/prod
@@ -316,7 +317,7 @@ This installs:
 
 | Hook | What it does |
 |---|---|
-| `UserPromptSubmit` | Blocks prompts that contain a secret and tells you to `keygent add` it instead. Prefix `!!` to override; the handle is then marked as exposed. |
+| `UserPromptSubmit` | Blocks prompts that contain a secret, so it never reaches the model, and tells you to `keygent add` it instead. Claude Code may still keep the text in its local history, so a known secret is marked exposed and you're asked to rotate it. Prefix `!!` to send anyway (also marked exposed). |
 | `PreToolUse` · Bash / PowerShell | Wraps commands that use placeholders or manifest handles in `keygent run --`, triggers the approval prompt when needed, and blocks env dumps. |
 | `PreToolUse` · Write/Edit | Blocks writing a secret value into a file, and blocks edits to keygent's manifest, your agent settings and shell startup files. |
 | `PreToolUse` · Read/Grep/Glob | Blocks reads of the vault, `.env*` and key files. |
@@ -369,7 +370,11 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 ## Good to know
 
 - **Interactive programs:** commands run with plain pipes, not a terminal, so tools that need an interactive login prompt
-  won't work through keygent. Use their token- or env-based login instead. Runs stop after 30 minutes or 10 MiB of output per stream.
+  won't work through keygent. Use their token- or env-based login instead.
+- **Long-running commands:** runs stop after 30 minutes (or 10 MiB of output per stream) by default. A dev server or watcher can ask for up
+  to 4 hours with `--max-runtime`. The requested time is shown in the approval prompt.
+- **Pasting a secret into the chat:** keygent stops it from being sent to the model, but Claude Code may already have saved it in its
+  local history. keygent marks that secret as exposed, so rotate it. Better: add secrets with `keygent add` in your own terminal.
 - **Works alongside other tools' hooks:** keygent always runs first. Other hooks (lean-ctx, for example) only see prompts and
   output after keygent has blocked or redacted them. `keygent doctor` points out hooks that aren't chained yet.
 - **Where it runs:**
@@ -443,7 +448,8 @@ keygent is built for the two situations you actually run into:
 - an agent reading `.env` or the vault
 - an agent printing the environment
 - secrets echoed in command output, in common encodings
-- you accidentally pasting a secret into the chat
+- you accidentally pasting a secret into the chat (it isn't sent to the model, and you're told to rotate it)
+- an agent reading Claude Code's own transcripts or history to dig up old output
 - an agent writing a secret into source code
 - an agent granting itself access by editing the manifest, the policy or its settings
 - an agent faking an approval, or swapping in a look-alike program for an allowed tool
