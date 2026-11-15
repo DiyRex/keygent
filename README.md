@@ -7,7 +7,7 @@
 
 <p align="center">
   <img alt="status" src="https://img.shields.io/badge/status-pre--alpha-orange">
-  <img alt="platforms" src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-blue">
+  <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue">
   <img alt="language" src="https://img.shields.io/badge/built%20with-Rust-dea584">
   <img alt="size" src="https://img.shields.io/badge/binary-%E2%89%A42%20MB-green">
 </p>
@@ -62,14 +62,25 @@ before the agent reads it.
 - 🪶 **Small and fast.** Single static binary ≤ 2 MB, ≤ 5 MB RAM when idle, hooks under 30 ms, zero agent tokens on the
   happy path.
 - 🤝 **Works with lean-ctx.** Detects it automatically and composes with it, redacting before anything is compressed or cached.
+- 💻 **macOS, Windows and Linux.** Same guarantees on each, built on each OS's native protections: named pipes and Job Objects
+  on Windows, the hardened runtime on macOS, and subreaper and locked memory on Linux. Works with bash, Git Bash and PowerShell.
+
+### Safe for your machine
+
+keygent never needs admin or root rights. It installs no services, drivers or startup items, and never edits your shell
+config. It only listens on `localhost` (for the optional web console), and only while you use it. It makes no network
+connections and sends no telemetry. Commands it runs are contained, so nothing they start keeps running after they finish.
+`keygent uninstall` removes everything it added. Add `--purge` to delete the vault too.
 
 ---
 
 ## Install
 
-**Prebuilt binaries** (from the first release on). Static binaries for Linux (x86_64, arm64) and macOS (Intel, Apple
-Silicon) are attached to each [GitHub release](https://github.com/DiyRex/keygent/releases), with `SHA256SUMS`
-signed by Sigstore:
+**Prebuilt binaries** (from the first release on). Static binaries for macOS (Apple Silicon, Intel), Windows (x64, ARM64)
+and Linux (x86_64, arm64) are attached to each [GitHub release](https://github.com/DiyRex/keygent/releases), with
+`SHA256SUMS` signed by Sigstore and build-provenance attestations.
+
+macOS / Linux:
 
 ```sh
 # pick your target: x86_64-unknown-linux-musl | aarch64-unknown-linux-musl | aarch64-apple-darwin | x86_64-apple-darwin
@@ -87,12 +98,34 @@ shasum -a 256 --ignore-missing -c SHA256SUMS
 tar xzf keygent-$VER-$TARGET.tar.gz && install -m 0755 keygent-$VER-$TARGET/keygent ~/.local/bin/keygent
 ```
 
+Windows (PowerShell, no admin needed):
+
+```powershell
+# pick your target: x86_64-pc-windows-msvc | aarch64-pc-windows-msvc
+$Ver = "v0.1.0"; $Target = "x86_64-pc-windows-msvc"
+$Base = "https://github.com/DiyRex/keygent/releases/download/$Ver"
+Invoke-WebRequest "$Base/keygent-$Ver-$Target.zip" -OutFile keygent.zip
+Invoke-WebRequest "$Base/SHA256SUMS" -OutFile SHA256SUMS
+Invoke-WebRequest "$Base/SHA256SUMS.sigstore.json" -OutFile SHA256SUMS.sigstore.json
+
+# verify signature (cosign) + checksum
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json `
+  --certificate-identity-regexp '^https://github.com/DiyRex/keygent/' `
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+$Expected = (Select-String "keygent-$Ver-$Target.zip" SHA256SUMS).Line.Split(" ")[0]
+if ((Get-FileHash keygent.zip -Algorithm SHA256).Hash -ne $Expected) { throw "checksum mismatch" }
+
+$Dest = "$env:LOCALAPPDATA\Programs\keygent"
+Expand-Archive keygent.zip -DestinationPath $Dest -Force
+[Environment]::SetEnvironmentVariable("Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$Dest\keygent-$Ver-$Target", "User")
+```
+
 **From source** (requires Rust stable):
 
 ```sh
 git clone https://github.com/DiyRex/keygent.git && cd keygent
 cargo build --release --locked
-install -m 0755 target/release/keygent ~/.local/bin/keygent
+install -m 0755 target/release/keygent ~/.local/bin/keygent      # Windows: copy target\release\keygent.exe onto your PATH
 ```
 
 ## Quickstart (60 seconds)
@@ -163,7 +196,9 @@ keygent ls
 keygent run -- curl -u {{keygent:stripe/live}}: https://api.stripe.com/v1/customers
 ```
 
-The placeholder becomes `"$KEYGENT_STRIPE_LIVE"`. The value lives only in that child's environment.
+The placeholder becomes `"$KEYGENT_STRIPE_LIVE"` (in PowerShell: `$env:KEYGENT_STRIPE_LIVE`). The value lives only in that
+child's environment. Supported shells: `sh`/`bash`/`zsh`-style POSIX, Git Bash, and PowerShell 7. `cmd.exe` is not supported for
+placeholders, because its quoting can't be made safe.
 
 **Option B: project manifest.** Commit a `.keygent.toml` to your repo. It holds no values, only names:
 
@@ -314,13 +349,14 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 
 ### Files
 
-| Path | Purpose |
-|---|---|
-| `$XDG_DATA_HOME/keygent/vault.kgt` | encrypted vault (0600) |
-| `$XDG_RUNTIME_DIR/keygent/` (macOS: `$TMPDIR/keygent/`) | broker socket, in a private 0700 directory |
-| `$XDG_CONFIG_HOME/keygent/global.toml` | machine-wide manifest |
-| `$XDG_STATE_HOME/keygent/audit.jsonl` | HMAC-chained audit log |
-| `.keygent.toml` | per-project manifest (safe to commit) |
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Vault (`vault.kgt`, encrypted, owner-only) | `~/.local/share/keygent/` | `~/Library/Application Support/keygent/` | `%LOCALAPPDATA%\keygent\` |
+| Config + `global.toml` | `~/.config/keygent/` | `~/Library/Application Support/keygent/config/` | `%APPDATA%\keygent\` |
+| Audit log (`audit.jsonl`, HMAC-chained) | `~/.local/state/keygent/` | `~/Library/Application Support/keygent/state/` | `%LOCALAPPDATA%\keygent\state\` |
+| Broker endpoint (private to you) | `$XDG_RUNTIME_DIR/keygent/` | `$TMPDIR/keygent/` | named pipe `\\.\pipe\keygent-<your SID>` |
+
+`.keygent.toml` is the per-project manifest, safe to commit. XDG variables are respected on Linux.
 
 ---
 
