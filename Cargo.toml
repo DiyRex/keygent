@@ -1,0 +1,26 @@
+[package]
+name = "sealr"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Sealed secrets broker for AI coding agents"
+publish = false
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+print_stderr = "warn"
