@@ -29,8 +29,8 @@ The agent works with **handles** like `stripe/live`, never with values.
 
 ```text
 You:    "List my Stripe customers using {{keygent:stripe/live}}"
-Agent:  curl https://api.stripe.com/v1/customers -u {{keygent:stripe/live}}:
-keygent:  ↳ Touch ID / Windows Hello: "Allow curl … to use stripe/live?"   ← you approve
+Agent:  STRIPE_API_KEY={{keygent:stripe/live}} stripe customers list --limit 3
+keygent:  ↳ Touch ID prompt: "Allow stripe customers list to use stripe/live?"   ← you approve
         ↳ runs it with the value injected into that one process only
         ↳ output streamed through the redactor
 Agent sees: {"data":[…], "api_key": "‹keygent:stripe/live›"}
@@ -44,13 +44,13 @@ prints is redacted before the agent reads it.
 - 🔐 **Encrypted local vault.** XChaCha20-Poly1305 per entry, Argon2id key derivation, envelope encryption.
   Uses audited RustCrypto crates only.
 - 🧷 **Handles, not values.** Use `{{keygent:<handle>}}` in commands, or map handles to env vars once per project.
-- 🚫 **Never in argv.** Secrets are injected as env vars of the child process, so they don't show up in `ps` or `/proc/*/cmdline`.
+- 🚫 **Never in argv (by default).** Secrets reach a command as an environment variable or a private file, never as an argument, so other users can't see them in `ps` or `/proc/*/cmdline`. You can allow argument use for a specific secret if you accept that.
 - 🧹 **Streaming redactor.** Catches raw, base64 (std/url, every alignment), hex, percent-encoded and JSON-escaped
   forms, including matches split across output chunks. Also flags unknown key-shaped tokens (AWS, GitHub,
   Stripe, JWT, PEM).
 - 🛡️ **Guardrails.** Blocks `env`/`printenv` dumps, reads of `.env` or the vault, pasted secrets in prompts, and
   secret values written into source files.
-- ✋ **Approvals the agent can't fake.** By default, every use of a secret needs your OK through Touch ID, Windows Hello,
+- ✋ **Approvals the agent can't fake.** By default, every use of a secret needs your OK through Touch ID (macOS),
   your passkey, or `keygent approve` in your own terminal. keygent checks the approval itself, so an agent can't click
   through it or forge it.
 - 📌 **Pinned allow rules.** Make trusted tools silent: a rule pins the exact program (path and fingerprint) and its
@@ -73,7 +73,7 @@ prints is redacted before the agent reads it.
 keygent never needs admin or root rights. It installs no services, drivers or startup items, and never edits your shell
 config. It only listens on `localhost` (for the optional web console), and only while you use it. It makes no network
 connections and sends no telemetry. Commands it runs are contained, so nothing they start keeps running after they finish.
-`keygent uninstall` removes everything it added. Add `--purge` to delete the vault too.
+`keygent uninstall` removes everything it added (it asks for your passphrase). Add `--purge` to delete the vault too (you'll be asked to type a confirmation).
 
 ---
 
@@ -94,7 +94,7 @@ curl -LO https://github.com/DiyRex/keygent/releases/download/$VER/SHA256SUMS.sig
 
 # verify signature + checksum
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/DiyRex/keygent/' \
+  --certificate-identity-regexp '^https://github\.com/DiyRex/keygent/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 shasum -a 256 --ignore-missing -c SHA256SUMS
 
@@ -113,14 +113,20 @@ Invoke-WebRequest "$Base/SHA256SUMS.sigstore.json" -OutFile SHA256SUMS.sigstore.
 
 # verify signature (cosign) + checksum
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json `
-  --certificate-identity-regexp '^https://github.com/DiyRex/keygent/' `
+  --certificate-identity-regexp '^https://github\.com/DiyRex/keygent/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' `
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 $Expected = (Select-String "keygent-$Ver-$Target.zip" SHA256SUMS).Line.Split(" ")[0]
 if ((Get-FileHash keygent.zip -Algorithm SHA256).Hash -ne $Expected) { throw "checksum mismatch" }
 
-$Dest = "$env:LOCALAPPDATA\Programs\keygent"
-Expand-Archive keygent.zip -DestinationPath $Dest -Force
-[Environment]::SetEnvironmentVariable("Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$Dest\keygent-$Ver-$Target", "User")
+$Dest = "$env:LOCALAPPDATA\Programs\keygent"          # stable path: hooks point here, so upgrades keep working
+Expand-Archive keygent.zip -DestinationPath "$env:TEMP\keygent-$Ver" -Force
+New-Item -ItemType Directory -Force $Dest | Out-Null
+Copy-Item "$env:TEMP\keygent-$Ver\keygent-$Ver-$Target\keygent.exe" "$Dest\keygent.exe" -Force
+
+# optional: add it to your user PATH (no admin needed)
+if ((Read-Host "Add $Dest to your user PATH? [y/N]") -eq "y") {
+  [Environment]::SetEnvironmentVariable("Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$Dest", "User")
+}
 ```
 
 **From source** (requires Rust stable):
@@ -144,9 +150,9 @@ Now, in Claude Code:
 
 > *"List my Stripe customers using {{keygent:stripe/live}}"*
 
-The first time, you approve the exact command with Touch ID, Windows Hello, your passkey, or `keygent approve`. The agent
-gets the results, and the key never appears in the transcript. To skip prompts for a command you trust, choose "approve and
-remember as rule".
+The first time, you approve the exact command with Touch ID (macOS), your passkey in the console, or `keygent approve`. The
+agent gets the results, and the key never appears in the transcript. To make a trusted tool silent, add an **allow rule** for it
+(`keygent edit stripe/live`, or "approve and add as rule" in the console). `--remember` only skips prompts for the identical command for 15 minutes.
 
 ---
 
@@ -168,8 +174,9 @@ keygent restore <file> [--new-machine]
 ```
 
 `keygent init` shows a **recovery key** once and asks you to type it back. Store it offline (a password manager or paper).
-Without the passphrase or the recovery key, your secrets cannot be recovered by anyone. Use `init --generate` to get a strong
-six-word passphrase.
+Without the passphrase or the recovery key, your secrets cannot be recovered by anyone. By default `init` gives you a strong
+six-word passphrase. Use `--own-passphrase` to pick your own (at least 16 characters, and common or guessable ones are refused).
+The vault is also tied to this device, so a copied vault file can't be cracked on another machine. To move machines, use `restore --new-machine` with your recovery key.
 
 While the vault is sealed, any command that needs a secret stops with:
 
@@ -187,9 +194,9 @@ keygent add gcp/sa --from-file ./sa.json --delete   # multi-line / file secrets 
 keygent edit stripe/live        # change metadata or policy
 keygent rotate stripe/live      # replace the value, keep the handle (--undo within 24 h)
 keygent rename stripe/live stripe/prod
-keygent rm stripe/live
+keygent rm stripe/live          # always asks for your passphrase
 keygent import .env [--delete]  # bulk import, optionally delete the file afterwards
-keygent reveal stripe/live      # copies to a concealed clipboard (no history, cleared after 30 s); --print to show it
+keygent reveal stripe/live      # shows it full-screen and clears it after 20 s (never in scrollback); --copy to use the clipboard
 ```
 
 Handles look like `stripe/live` (lowercase, up to 4 levels). Very short or low-entropy values are refused, because they
@@ -207,15 +214,18 @@ keygent ls
 
 ### 3. Use secrets in commands
 
-**Option A: placeholders.** Put the placeholder anywhere in a command:
+**Option A: placeholders.** Hand the secret to the tool as an environment variable, or as a private file:
 
 ```sh
-keygent run -- curl -u {{keygent:stripe/live}}: https://api.stripe.com/v1/customers
+keygent run -- STRIPE_API_KEY={{keygent:stripe/live}} stripe customers list        # env var the tool reads itself
+keygent run -- curl -sS -K {{keygent-file:stripe/curl-auth}} https://api.stripe.com/v1/customers   # path to a private file
 ```
 
-The placeholder becomes `"$KEYGENT_STRIPE_LIVE"` (in PowerShell: `$env:KEYGENT_STRIPE_LIVE`). The value lives only in that
-child's environment. Supported shells: `sh`/`bash`/`zsh`-style POSIX, Git Bash, and PowerShell 7. `cmd.exe` is not supported for
-placeholders, because its quoting can't be made safe.
+`{{keygent:…}}` sets an environment variable for that one process. `{{keygent-file:…}}` becomes the path of a private,
+temporary file holding the value (deleted when the command ends). keygent **refuses** to put a secret directly into a command's
+arguments (like `curl -u {{keygent:stripe/live}}:`), because arguments show up in the process list where other users on the machine
+can see them. You can allow it for a specific secret if you accept that. Supported shells: `sh`/`bash`/`zsh`-style POSIX, Git Bash
+and PowerShell 7. `cmd.exe` is not supported. Commands get no input from the agent: keygent runs them with an empty stdin.
 
 **Option B: project manifest.** Commit a `.keygent.toml` to your repo. It holds no values, only names:
 
@@ -264,7 +274,7 @@ Each secret has a mode (change it with `keygent edit <handle>`):
 
 | Mode | What happens |
 |---|---|
-| `approve` *(default)* | Every use needs your approval: Touch ID / Windows Hello (macOS, Windows), your passkey in the console, or `keygent approve` in your terminal. You see the exact command. |
+| `approve` *(default)* | Every use needs your approval: Touch ID (macOS; Windows Hello once verified), your passkey in the console, or `keygent approve` in your terminal. You see the exact command. |
 | `allow` | Runs silently, but **only** for commands matching one of its allow rules. Anything else is treated as `approve`. |
 | `confirm` | Uses Claude Code's own permission dialog. Convenient, but an agent can work around it. Use it only for low-risk secrets. |
 | `deny` | Never used. |
@@ -273,15 +283,16 @@ Approving from a terminal:
 
 ```sh
 keygent pending                 # what's waiting, with the full command
-keygent approve                 # approve the latest request (passphrase)
+keygent approve <id>            # approve a request (passphrase); the id is optional if only one is waiting
 keygent approve --remember      # …and allow the identical command again for 15 minutes
 ```
 
-What you approve is exactly what runs. Approval prompts show the full command (with hidden or special characters made
-visible), the folder, which secrets it gets, and the program. If the command runs a script (`bash ./deploy.sh`,
-`python sync.py`), keygent shows the script and records its fingerprint. If the script changes before it runs, it is blocked.
-Long or unusual commands are approved in your terminal or the console, where you can read all of it, rather than in the short
-system prompt.
+Approval prompts show the full command (with hidden or special characters made visible), the project folder, which secrets
+it gets, and every program it runs, each fingerprinted. If the command runs a script (`bash ./deploy.sh`, `python sync.py`), you see
+**the whole script** and have to scroll to the end before you can approve. If any program or script changes before it runs, the run
+is blocked. keygent can't see code that a script loads in turn (imports, `make`, `npm run`), so those approvals carry a clear
+warning and can't be remembered. Read them like you'd read code before running it. Long or unusual commands are approved in your
+terminal or the console, not in the short system prompt.
 
 Allow rules pin the exact program, its fingerprint and its arguments:
 
@@ -330,7 +341,7 @@ It also installs a tiny skill so the agent knows how to use handles. That costs 
 If lean-ctx is installed, keygent detects it and composes with it:
 
 ```sh
-keygent integrate lean-ctx            # add keygent to lean-ctx's allowlist + secret-path rules
+keygent integrate lean-ctx            # chain lean-ctx's hooks behind keygent, add keygent to its allowlist + secret paths
 keygent integrate lean-ctx --remove
 ```
 
@@ -397,7 +408,7 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 
 | Area | Commands |
 |---|---|
-| Vault | `init [--generate]` · `unseal [--ttl]` · `seal` · `status` · `passwd`🔑 · `rekey`🔑 · `recover` · `verify` · `backup` · `restore`🔑 |
+| Vault | `init [--own-passphrase]` · `unseal [--ttl]` · `seal` · `status` · `passwd`🔑 · `rekey`🔑 · `recover` · `verify` · `backup` · `restore`🔑 |
 | Secrets | `add`🔑 · `edit`🔑 · `rm`🔑 · `rename`🔑 · `rotate [--undo]`🔑 · `import`🔑 · `reveal`🔑 |
 | Approvals | `pending` · `approve [--remember]`🔑 · `deny` |
 | Agent-safe | `ls` · `run -- <cmd>` · `capture <handle> -- <cmd>` · `check <cmd>` · `untrust` |
@@ -407,7 +418,7 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 | Audit | `audit [--since] [--verify]` · `exposed` |
 | Optional | `mcp`: stdio MCP server for agents without hooks |
 
-🔑 = asks for your passphrase (or Touch ID / Windows Hello where available).
+🔑 = asks for your passphrase in your own terminal. A few quick actions (approving a short request, `rename`, `deny`) can use Touch ID instead; `rm` always needs the passphrase. `reveal` always needs the passphrase.
 
 ### Exit codes
 
@@ -419,6 +430,7 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 | `76` | project manifest changed, needs `keygent trust` |
 | `77` | denied by policy |
 | `78` | vault sealed |
+| `74` | run stopped at its time or output limit |
 | `79` | broker or version error (run `keygent doctor`) |
 
 keygent's own errors always print one line starting with `keygent:`, so you can tell them apart from a command that happens to use the same code.
@@ -432,7 +444,7 @@ keygent's own errors always print one line starting with `keygent:`, so you can 
 | Audit log (`audit.jsonl`, HMAC-chained) | `~/.local/state/keygent/` | `~/Library/Application Support/keygent/state/` | `%LOCALAPPDATA%\keygent\state\` |
 | Broker endpoint (private to you) | `/run/user/<uid>/keygent/` | your per-user temp folder `…/keygent/` | named pipe `\\.\pipe\keygent-<your SID>-<session>` |
 
-`.keygent.toml` is the per-project manifest, safe to commit. XDG variables are respected on Linux.
+`.keygent.toml` is the per-project manifest, safe to commit. On Linux, `XDG_*` variables are deliberately ignored (an agent could change them to redirect keygent); paths come from your account's home directory.
 
 ---
 
@@ -445,11 +457,11 @@ keygent is built for the two situations you actually run into:
 
 **What it protects against:**
 
-- an agent reading `.env` or the vault
+- an agent reading `.env` or the vault with its file tools (to also stop shell commands like `cat`, turn on Claude Code's sandbox — `keygent doctor` checks it); a copied vault file is useless without this device
 - an agent printing the environment
 - secrets echoed in command output, in common encodings
 - you accidentally pasting a secret into the chat (it isn't sent to the model, and you're told to rotate it)
-- an agent reading Claude Code's own transcripts or history to dig up old output
+- an agent reading Claude Code's own transcripts or history with its file tools
 - an agent writing a secret into source code
 - an agent granting itself access by editing the manifest, the policy or its settings
 - an agent faking an approval, or swapping in a look-alike program for an allowed tool
@@ -464,7 +476,7 @@ attacks keygent itself has more options than these protections cover. Redaction 
 - A command you approve can send the secret wherever that command sends data, or print it in a disguised form. Read
   what you approve. The planned egress proxy will bind secrets to specific hosts.
 - Arbitrary transformations (reversing, XOR, splitting across lines) defeat pattern matching.
-- While an approved command runs, a determined process running as your user could inspect its environment.
+- While an approved command runs, another process running as your user can read its environment (for example with `ps eww`). Keep runs short; the planned egress proxy removes this.
 - Software that replaces the `keygent` program itself or wraps your shell could show you a fake passphrase prompt. Touch ID,
   Windows Hello and passkey approvals can't be phished this way, and `keygent doctor` checks the binary's signature.
 
