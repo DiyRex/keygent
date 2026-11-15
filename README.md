@@ -134,7 +134,7 @@ install -m 0755 target/release/keygent ~/.local/bin/keygent      # Windows: copy
 ## Quickstart (60 seconds)
 
 ```sh
-keygent init                    # create your encrypted vault and choose a passphrase
+keygent init                    # create your vault, choose a passphrase, save the recovery key it shows you
 keygent add stripe/live         # paste the value here, in YOUR terminal (never in the chat)
 keygent integrate claude        # install the Claude Code hooks + skill
 keygent unseal                  # unlock for this session (default TTL 8h)
@@ -159,10 +159,17 @@ keygent init                    # create the vault (owner-only, see Files below)
 keygent unseal [--ttl 8h]       # unlock: starts the local broker that holds keys in locked memory
 keygent status                  # sealed/unsealed, time left, number of handles
 keygent seal                    # lock now: key wiped from memory
-keygent rekey                   # change passphrase / key slots
+keygent passwd                  # change your passphrase
+keygent rekey                   # new encryption key for everything (after a suspected leak)
+keygent recover                 # forgot your passphrase? use the recovery key from init
+keygent verify                  # check the vault for damage; offers the last good copy
 keygent backup <file>           # encrypted backup
-keygent restore <file>
+keygent restore <file> [--new-machine]
 ```
+
+`keygent init` shows a **recovery key** once and asks you to type it back. Store it offline (a password manager or paper).
+Without the passphrase or the recovery key, your secrets cannot be recovered by anyone. Use `init --generate` to get a strong
+six-word passphrase.
 
 While the vault is sealed, any command that needs a secret stops with:
 
@@ -177,7 +184,8 @@ You type values in your own terminal, and every change asks for your passphrase.
 ```sh
 keygent add stripe/live --env STRIPE_API_KEY --desc "Stripe live key"
 keygent edit stripe/live        # change metadata or policy
-keygent rotate stripe/live      # replace the value, keep the handle
+keygent rotate stripe/live      # replace the value, keep the handle (--undo within 24 h)
+keygent rename stripe/live stripe/prod
 keygent rm stripe/live
 keygent import .env [--delete]  # bulk import, optionally delete the file afterwards
 keygent reveal stripe/live      # copies to a concealed clipboard (no history, cleared after 30 s); --print to show it
@@ -268,6 +276,12 @@ keygent approve                 # approve the latest request (passphrase)
 keygent approve --remember      # …and allow the identical command again for 15 minutes
 ```
 
+What you approve is exactly what runs. Approval prompts show the full command (with hidden or special characters made
+visible), the folder, which secrets it gets, and the program. If the command runs a script (`bash ./deploy.sh`,
+`python sync.py`), keygent shows the script and records its fingerprint. If the script changes before it runs, it is blocked.
+Long or unusual commands are approved in your terminal or the console, where you can read all of it, rather than in the short
+system prompt.
+
 Allow rules pin the exact program, its fingerprint and its arguments:
 
 ```toml
@@ -352,12 +366,34 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 
 ---
 
+## Good to know
+
+- **Interactive programs:** commands run with plain pipes, not a terminal, so tools that need an interactive login prompt
+  won't work through keygent. Use their token- or env-based login instead. Runs stop after 30 minutes or 10 MiB of output per stream.
+- **Works alongside other tools' hooks:** keygent always runs first. Other hooks (lean-ctx, for example) only see prompts and
+  output after keygent has blocked or redacted them. `keygent doctor` points out hooks that aren't chained yet.
+- **Where it runs:**
+
+| Environment | Support |
+|---|---|
+| macOS, Windows, Linux desktops | Full |
+| WSL2 | As Linux (approve in the terminal or console) |
+| SSH / headless servers | Yes. Approve from a second terminal with `keygent approve` |
+| Docker / devcontainers | One vault per container |
+| CI pipelines | Not supported in v1 (no unattended unlock, by design) |
+
+- **Upgrading:** replace the binary, then `keygent seal && keygent unseal`. `keygent doctor` repairs hook paths if needed.
+- **Something wrong?** `keygent doctor` checks everything. `keygent doctor --report` prints a summary that's safe to paste into an
+  issue (no secrets, handles or commands).
+- **Uninstall:** `keygent uninstall` removes hooks, config and everything keygent added, and keeps your vault and audit log.
+  Add `--purge` to delete those too.
+
 ## Command reference
 
 | Area | Commands |
 |---|---|
-| Vault | `init` · `unseal [--ttl]` · `seal` · `status` · `rekey`🔑 · `backup` · `restore`🔑 |
-| Secrets | `add`🔑 · `edit`🔑 · `rm`🔑 · `rotate`🔑 · `import`🔑 · `reveal`🔑 |
+| Vault | `init [--generate]` · `unseal [--ttl]` · `seal` · `status` · `passwd`🔑 · `rekey`🔑 · `recover` · `verify` · `backup` · `restore`🔑 |
+| Secrets | `add`🔑 · `edit`🔑 · `rm`🔑 · `rename`🔑 · `rotate [--undo]`🔑 · `import`🔑 · `reveal`🔑 |
 | Approvals | `pending` · `approve [--remember]`🔑 · `deny` |
 | Agent-safe | `ls` · `run -- <cmd>` · `capture <handle> -- <cmd>` · `check <cmd>` · `untrust` |
 | Project | `manifest init` · `manifest add <handle> [--env NAME] [--file]` · `trust`🔑 |
@@ -373,8 +409,14 @@ Every run that uses an exposed handle prints a one-line reminder to `keygent rot
 | Code | Meaning |
 |---|---|
 | child's code | `keygent run` passes through the command's exit code |
+| `64` | usage error |
+| `75` | approval denied or timed out |
+| `76` | project manifest changed, needs `keygent trust` |
 | `77` | denied by policy |
 | `78` | vault sealed |
+| `79` | broker or version error (run `keygent doctor`) |
+
+keygent's own errors always print one line starting with `keygent:`, so you can tell them apart from a command that happens to use the same code.
 
 ### Files
 
