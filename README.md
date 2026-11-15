@@ -261,7 +261,25 @@ keygent integrate lean-ctx --remove
 keygent always runs **innermost** (`lean-ctx -c "keygent run -- …"`). Output is redacted before lean-ctx compresses or caches
 it.
 
-### 8. Audit and exposure
+### 8. Web console (coming soon)
+
+A local dashboard for your vault, unlocked with a passkey (Touch ID, Windows Hello, iCloud Keychain, or a security key).
+
+```sh
+keygent passkey add      # enroll a passkey (asks for your passphrase first)
+keygent ui               # opens http://localhost:<random-port> in your browser
+```
+
+- See every secret at a glance: handle, env var, description, policy, last used, and whether it was ever exposed.
+- Add, rotate, and delete secrets, edit policies, and trust project manifests.
+- Approve agent requests with a tap of your passkey instead of a dialog.
+- Browse the audit log.
+
+Every sensitive action asks for your passkey again, so a stolen browser session can only look, not change anything.
+Revealing a value copies it to your clipboard (cleared after 30 seconds) rather than showing it on screen. The console
+runs only on your machine. Nothing is hosted, and nothing leaves your computer.
+
+### 9. Audit and exposure
 
 ```sh
 keygent audit --since 24h       # who used what, when, with what result (values never logged)
@@ -352,6 +370,7 @@ without hooks can use the optional MCP mode.
 ## Roadmap
 
 - [ ] v1: local vault, `run`/`capture`, redactor, Claude Code hooks, lean-ctx composition
+- [ ] Passkey-powered local web console (manage secrets, approve agent requests, passkey unlock)
 - [ ] OS keychain unlock, auto-seal on screen lock, Shamir unseal for shared machines
 - [ ] Egress proxy (credentials injected per host, so the child never holds the value)
 - [ ] Windows, more agent adapters, external secret backends
