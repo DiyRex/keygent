@@ -168,10 +168,21 @@ pub struct Hardening {
     pub mlockall: bool,
 }
 
+/// Core-dump limit captured before hardening, restored in every child so children get default process state.
+static CORE_LIMIT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
 /// Broker-only hardening (PLATFORMS "No dumps / debug"): no core dumps, not dumpable / deny attach, and on Linux
-/// `mlockall` (degrades to arena-only if RLIMIT_MEMLOCK is too low). Never `NO_NEW_PRIVS` (it would be inherited).
+/// `mlockall` (degrades to arena-only if RLIMIT_MEMLOCK is too low) plus child subreaper. Never `NO_NEW_PRIVS`.
 pub fn harden_broker() -> Hardening {
     let mut h = Hardening::default();
+    let mut orig = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: valid out-pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut orig) } == 0 {
+        let _ = CORE_LIMIT.set((orig.rlim_cur, orig.rlim_max));
+    }
     let zero = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -185,6 +196,9 @@ pub fn harden_broker() -> Hardening {
         h.no_dumps = core && nd;
         // SAFETY: no pointers involved.
         h.mlockall = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0;
+        // orphans of a run reparent to the broker, which kills and reaps them (PLATFORMS "Child containment")
+        // SAFETY: prctl with integer arguments.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
     }
     #[cfg(target_os = "macos")]
     {
@@ -285,4 +299,149 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         return Err(Error::UnsafePath("runtime dir"));
     }
     Ok(())
+}
+
+/// Spawn a run's child contained (PLATFORMS "Child containment", ADR 0009): its own session (pgid = sid = pid),
+/// Linux `PR_SET_PDEATHSIG(SIGKILL)`, the signal mask cleared and `RLIMIT_CORE` restored to its pre-hardening value.
+/// The caller sets env, cwd and stdio (stdin is always /dev/null for runs). `keep_fds` (close-on-exec memfds of this
+/// run only) are made inheritable in the child alone, so concurrent runs never see each other's bindings.
+pub fn spawn_contained(cmd: &mut Command, keep_fds: Vec<i32>) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    let (cur, max) = CORE_LIMIT.get().copied().unwrap_or((0, 0));
+    // SAFETY: only async-signal-safe calls (setsid, prctl, sigprocmask, setrlimit, fcntl) on data captured before
+    // fork; no allocation.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &keep_fds {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+            let rl = libc::rlimit {
+                rlim_cur: cur,
+                rlim_max: max,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &rl);
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+fn all_pids() -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc")
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pids = vec![0 as libc::c_int; 16384];
+        let bytes = libc::c_int::try_from(pids.len().saturating_mul(4)).unwrap_or(0);
+        // SAFETY: buffer valid for `bytes` bytes.
+        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        pids.truncate(usize::try_from(n).unwrap_or(0));
+        pids
+    }
+}
+
+/// Signal the run's process group (interrupt forwarding).
+pub fn signal_group(pgid: i32, sig: i32) {
+    if pgid > 1 {
+        // SAFETY: kill with a negative pid signals the process group; no memory involved.
+        unsafe { libc::kill(pgid.wrapping_neg(), sig) };
+    }
+}
+
+/// Kill every process of a run (ADR 0009): the process group, then every pid whose session id is the run's session
+/// (catches `&`/`nohup` survivors, Apple binaries included), and reap any that reparented to us (Linux subreaper).
+/// A survivor that called `setsid()` itself escapes this sweep (documented best effort).
+pub fn kill_session(sid: i32) {
+    if sid <= 1 {
+        return;
+    }
+    signal_group(sid, libc::SIGKILL);
+    let me = i32::try_from(std::process::id()).unwrap_or(0);
+    for pid in all_pids() {
+        // SAFETY: getsid/kill on a pid value; no memory involved.
+        if pid > 1 && pid != me && unsafe { libc::getsid(pid) } == sid {
+            // SAFETY: as above.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // SAFETY: non-blocking reap of a pid that may have been reparented to us.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        }
+    }
+}
+
+/// The user's login name from the passwd database (for the child's USER/LOGNAME).
+pub fn user_name() -> Option<String> {
+    let mut buf = vec![0u8; 16 * 1024];
+    // SAFETY: passwd is POD.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: valid pointers and lengths; `out` is set to &pw or null.
+    let rc =
+        unsafe { libc::getpwuid_r(uid(), &mut pw, buf.as_mut_ptr().cast(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pw.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: NUL-terminated string inside `buf`, alive here.
+    let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) };
+    name.to_str().ok().map(str::to_owned)
+}
+
+/// Per-user temp dir for children (`TMPDIR`): macOS `_CS_DARWIN_USER_TEMP_DIR`, Linux `/tmp`.
+pub fn temp_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; 1024];
+        // SAFETY: buffer valid for its length.
+        let n = unsafe {
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n > 1 && n <= buf.len() {
+            buf.truncate(n.saturating_sub(1));
+            use std::os::unix::ffi::OsStrExt;
+            return PathBuf::from(std::ffi::OsStr::from_bytes(&buf));
+        }
+        PathBuf::from("/tmp")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/tmp")
+    }
+}
+
+/// Linux file binding (PLATFORMS "File bindings"): an anonymous memfd holding the value, inherited by the child and
+/// reachable as `/dev/fd/N`. Never touches a filesystem. Close-on-exec until `spawn_contained` clears it in the child.
+#[cfg(target_os = "linux")]
+pub fn memfd_with(data: &[u8]) -> Result<std::fs::File> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    // SAFETY: NUL-terminated name and flags only.
+    let fd = unsafe { libc::memfd_create(c"keygent".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd is a fresh, owned descriptor.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(data)?;
+    Ok(f)
 }

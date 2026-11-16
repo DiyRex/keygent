@@ -382,6 +382,13 @@ impl Vault {
         crypto::proof_broker(&kb, nc, nb)
     }
 
+    /// `proof_c` for an authenticated request (ADR 0004): `HMAC(K_auth, enc("kg/v1/client")‖enc(nb)‖enc(nc)‖enc(H(req)))`.
+    /// Both the CLI (after the passphrase) and the broker (to verify) compute it from the DEK.
+    pub fn auth_proof(&self, nb: &[u8], nc: &[u8], request: &[u8]) -> Result<[u8; 32]> {
+        let ka = crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::AUTH)?;
+        crypto::proof_client(&ka, nb, nc, request)
+    }
+
     /// A copy of the DEK for reopening (the broker's reload). Lives in the locked arena when active.
     pub fn dek_copy(&self) -> Dek {
         Dek::from_bytes(*self.keys.dek.expose())

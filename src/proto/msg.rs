@@ -43,6 +43,7 @@ pub mod code {
     pub const TOO_LARGE: u16 = 8;
     pub const NEEDS_AUTH: u16 = 9;
     pub const BAD_REQUEST: u16 = 10;
+    pub const RUN_LIMIT: u16 = 11;
 }
 
 fn enc() -> Encoder {
@@ -277,6 +278,225 @@ pub fn decode_data(b: &[u8], with_hits: bool) -> Result<(Vec<u8>, u32), TlvError
     Ok((data, hits))
 }
 
+// ---------------------------------------------------------------- grants and runs (SPEC §5.5.2, §5.7)
+
+pub const GRANT_ID_LEN: usize = 16;
+/// Rendered approvals carry full script contents (≤ 16 KiB each), so they get a larger cap than `MAX_STR`.
+pub const MAX_RENDERED: usize = 256 * 1024;
+
+/// `GrantCreate{cmd, cwd, max_runtime?}` (dialect is POSIX until the PowerShell tokenizer lands).
+#[derive(Debug, PartialEq, Eq)]
+pub struct GrantCreate {
+    pub cmd: String,
+    pub cwd: String,
+    pub max_runtime_secs: Option<u64>,
+}
+
+impl GrantCreate {
+    pub fn encode(&self) -> Result<Vec<u8>, TlvError> {
+        let mut e = enc();
+        e.utf8(t::CMD, &self.cmd)?;
+        e.utf8(t::CWD, &self.cwd)?;
+        if let Some(m) = self.max_runtime_secs {
+            e.u64(t::MAX_RUNTIME, m)?;
+        }
+        Ok(done(e))
+    }
+    pub fn decode(b: &[u8]) -> Result<GrantCreate, TlvError> {
+        let mut d = Decoder::new(b, Endian::Big)?;
+        let v = d.req(t::CMD)?;
+        if v.len() > 64 * 1024 {
+            return Err(TlvError::TooLarge);
+        }
+        let cmd = d.as_str(t::CMD, v)?.to_owned();
+        let v = d.req(t::CWD)?;
+        let cwd = string(&d, t::CWD, v)?;
+        let max_runtime_secs = match d.opt(t::MAX_RUNTIME)? {
+            Some(v) => Some(d.as_u64(t::MAX_RUNTIME, v)?),
+            None => None,
+        };
+        d.finish()?;
+        Ok(GrantCreate {
+            cmd,
+            cwd,
+            max_runtime_secs,
+        })
+    }
+}
+
+/// Grant states on the wire.
+pub mod gstate {
+    pub const PENDING: u8 = 1;
+    pub const APPROVED: u8 = 2;
+    pub const DENIED: u8 = 3;
+    pub const EXPIRED: u8 = 4;
+}
+
+/// `GrantCreated{id, state}`, `GrantDecision{id, state}` and the requests `AwaitGrant{id}` / `Run{id}` / `Deny{id}`
+/// (state omitted on requests).
+pub fn encode_grant(id: &[u8; GRANT_ID_LEN], state: Option<u8>) -> Result<Vec<u8>, TlvError> {
+    let mut e = enc();
+    e.bytes(t::GRANT_ID, id)?;
+    if let Some(s) = state {
+        e.u8(t::GRANT_STATE, s)?;
+    }
+    Ok(done(e))
+}
+
+pub fn decode_grant(b: &[u8], with_state: bool) -> Result<([u8; GRANT_ID_LEN], u8), TlvError> {
+    let mut d = Decoder::new(b, Endian::Big)?;
+    let v = d.req(t::GRANT_ID)?;
+    let id = d.as_array(t::GRANT_ID, v)?;
+    let state = if with_state {
+        let v = d.req(t::GRANT_STATE)?;
+        d.as_u8(t::GRANT_STATE, v)?
+    } else {
+        0
+    };
+    d.finish()?;
+    Ok((id, state))
+}
+
+/// `Deny{id | all}`.
+pub fn encode_deny(id: Option<&[u8; GRANT_ID_LEN]>) -> Result<Vec<u8>, TlvError> {
+    let mut e = enc();
+    match id {
+        Some(id) => e.bytes(t::GRANT_ID, id)?,
+        None => e.bool(t::ALL, true)?,
+    }
+    Ok(done(e))
+}
+
+pub fn decode_deny(b: &[u8]) -> Result<Option<[u8; GRANT_ID_LEN]>, TlvError> {
+    let mut d = Decoder::new(b, Endian::Big)?;
+    let id = match d.opt(t::GRANT_ID)? {
+        Some(v) => Some(d.as_array(t::GRANT_ID, v)?),
+        None => None,
+    };
+    let all = match d.opt(t::ALL)? {
+        Some(v) => d.as_bool(t::ALL, v)?,
+        None => false,
+    };
+    d.finish()?;
+    match (id, all) {
+        (Some(id), false) => Ok(Some(id)),
+        (None, true) => Ok(None),
+        _ => Err(TlvError::Value(t::ALL)),
+    }
+}
+
+/// One entry of `PendingReply`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct PendingGrant {
+    pub id: [u8; GRANT_ID_LEN],
+    pub key: [u8; 32],
+    pub unbound: bool,
+    pub rendered: String,
+}
+
+pub fn encode_pending(list: &[PendingGrant]) -> Result<Vec<u8>, TlvError> {
+    let mut e = enc();
+    for g in list {
+        e.nested(t::GRANT, |e| {
+            e.bytes(t::GRANT_ID, &g.id)?;
+            e.bytes(t::GRANT_KEY, &g.key)?;
+            e.utf8(t::RENDERED, &g.rendered)?;
+            e.bool(t::UNBOUND, g.unbound)
+        })?;
+    }
+    Ok(done(e))
+}
+
+pub fn decode_pending(b: &[u8]) -> Result<Vec<PendingGrant>, TlvError> {
+    let mut d = Decoder::new(b, Endian::Big)?;
+    let mut out = Vec::new();
+    for raw in d.list(t::GRANT)? {
+        let mut s = d.sub(raw)?;
+        let v = s.req(t::GRANT_ID)?;
+        let id = s.as_array(t::GRANT_ID, v)?;
+        let v = s.req(t::GRANT_KEY)?;
+        let key = s.as_array(t::GRANT_KEY, v)?;
+        let v = s.req(t::RENDERED)?;
+        if v.len() > MAX_RENDERED {
+            return Err(TlvError::TooLarge);
+        }
+        let rendered = s.as_str(t::RENDERED, v)?.to_owned();
+        let v = s.req(t::UNBOUND)?;
+        let unbound = s.as_bool(t::UNBOUND, v)?;
+        s.finish()?;
+        out.push(PendingGrant {
+            id,
+            key,
+            unbound,
+            rendered,
+        });
+    }
+    d.finish()?;
+    Ok(out)
+}
+
+/// `Approve{grant_id, grant_key, remember, proof_c}`. The proof covers `approve_request()` (SPEC §5.5.2: the human
+/// approves the grant key they saw).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Approve {
+    pub id: [u8; GRANT_ID_LEN],
+    pub key: [u8; 32],
+    pub remember: bool,
+    pub proof: [u8; 32],
+}
+
+impl Approve {
+    /// The bytes `proof_c` binds: everything in the frame except the proof itself.
+    pub fn request_bytes(&self) -> Result<Vec<u8>, TlvError> {
+        let mut e = enc();
+        e.bytes(t::GRANT_ID, &self.id)?;
+        e.bytes(t::GRANT_KEY, &self.key)?;
+        e.bool(t::REMEMBER, self.remember)?;
+        Ok(done(e))
+    }
+    pub fn encode(&self) -> Result<Vec<u8>, TlvError> {
+        let mut e = enc();
+        e.bytes(t::PROOF, &self.proof)?;
+        e.bytes(t::GRANT_ID, &self.id)?;
+        e.bytes(t::GRANT_KEY, &self.key)?;
+        e.bool(t::REMEMBER, self.remember)?;
+        Ok(done(e))
+    }
+    pub fn decode(b: &[u8]) -> Result<Approve, TlvError> {
+        let mut d = Decoder::new(b, Endian::Big)?;
+        let v = d.req(t::PROOF)?;
+        let proof = d.as_array(t::PROOF, v)?;
+        let v = d.req(t::GRANT_ID)?;
+        let id = d.as_array(t::GRANT_ID, v)?;
+        let v = d.req(t::GRANT_KEY)?;
+        let key = d.as_array(t::GRANT_KEY, v)?;
+        let v = d.req(t::REMEMBER)?;
+        let remember = d.as_bool(t::REMEMBER, v)?;
+        d.finish()?;
+        Ok(Approve {
+            id,
+            key,
+            remember,
+            proof,
+        })
+    }
+}
+
+/// `Exit{code}` (128 + n for a signal, 74 for a limit) and client `Signal{n}`.
+pub fn encode_u32(tag: u16, v: u32) -> Result<Vec<u8>, TlvError> {
+    let mut e = enc();
+    e.u32(tag, v)?;
+    Ok(done(e))
+}
+
+pub fn decode_u32(b: &[u8], tag: u16) -> Result<u32, TlvError> {
+    let mut d = Decoder::new(b, Endian::Big)?;
+    let v = d.req(tag)?;
+    let x = d.as_u32(tag, v)?;
+    d.finish()?;
+    Ok(x)
+}
+
 /// An empty payload (requests without fields). Anything else is a protocol error.
 pub fn expect_empty(b: &[u8]) -> Result<(), TlvError> {
     Decoder::new(b, Endian::Big)?.finish()
@@ -330,6 +550,45 @@ mod tests {
         };
         let d = ErrMsg::decode(&e.encode().unwrap()).unwrap();
         assert_eq!((d.code, d.message.as_str()), (code::SEALED, "keygent: x"));
+    }
+
+    #[test]
+    fn grant_roundtrips() {
+        let g = GrantCreate {
+            cmd: "X={{keygent:a}} t".into(),
+            cwd: "/p".into(),
+            max_runtime_secs: Some(60),
+        };
+        assert_eq!(GrantCreate::decode(&g.encode().unwrap()).unwrap(), g);
+        let id = [7; GRANT_ID_LEN];
+        assert_eq!(
+            decode_grant(&encode_grant(&id, Some(gstate::APPROVED)).unwrap(), true).unwrap(),
+            (id, gstate::APPROVED)
+        );
+        assert_eq!(
+            decode_deny(&encode_deny(Some(&id)).unwrap()).unwrap(),
+            Some(id)
+        );
+        assert_eq!(decode_deny(&encode_deny(None).unwrap()).unwrap(), None);
+        assert!(decode_deny(&[]).is_err(), "deny needs an id or all");
+        let p = vec![PendingGrant {
+            id,
+            key: [9; 32],
+            unbound: true,
+            rendered: "r".into(),
+        }];
+        assert_eq!(decode_pending(&encode_pending(&p).unwrap()).unwrap(), p);
+        let a = Approve {
+            id,
+            key: [1; 32],
+            remember: false,
+            proof: [2; 32],
+        };
+        assert_eq!(Approve::decode(&a.encode().unwrap()).unwrap(), a);
+        assert_eq!(
+            decode_u32(&encode_u32(t::EXIT_CODE, 74).unwrap(), t::EXIT_CODE).unwrap(),
+            74
+        );
     }
 
     #[test]

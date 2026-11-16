@@ -21,7 +21,7 @@ use std::time::Duration;
 const START_WAIT: Duration = Duration::from_secs(10);
 
 /// `30s`, `45m`, `8h` → Duration (≤ 24 h).
-fn parse_duration(s: &str) -> Option<Duration> {
+pub(super) fn parse_duration(s: &str) -> Option<Duration> {
     let (num, unit) = s.split_at(s.len().checked_sub(1)?);
     let n: u64 = num.parse().ok()?;
     let secs = match unit {
@@ -173,7 +173,7 @@ pub fn ls(a: Args) -> Result<()> {
         return Err(Error::Usage("keygent ls"));
     }
     let d = platform::dirs()?;
-    let mut c = client::connect(&d, Class::Control)?;
+    let mut c = client::connect(&d, Class::Run)?;
     let f = c.request(ty::LIST, &[])?;
     let entries = msg::decode_list(&f.payload).map_err(|_| Error::BrokerUnverified)?;
     let mut out = String::new();

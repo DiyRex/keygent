@@ -2,11 +2,17 @@
 //! handshake with the broker proof, then one request per connection. Timeouts: 5 s for the first frame, 30 s idle.
 //! Errors never echo request contents.
 
-use super::{Shared, log::Level};
+use super::grant::{self, State as GState};
+use super::{Shared, log::Level, run};
 use crate::crypto;
+use crate::error::{Error, PolicyMsg};
 use crate::platform::ipc;
 use crate::proto::frame::{self, ty};
-use crate::proto::msg::{self, Class, ErrMsg, Hello, ListEntry, StatusReply, Welcome, code};
+use crate::proto::msg::{
+    self, Approve, Class, ErrMsg, GrantCreate, Hello, ListEntry, PendingGrant, StatusReply,
+    Welcome, code, gstate,
+};
+use crate::vault::index::Mode;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,6 +78,31 @@ fn send_err(s: &mut UnixStream, code: u16, message: &str) {
     }
 }
 
+/// Send a canonical `keygent:` error line with the protocol code its exit code maps to (ERRORS.md).
+pub fn send_error(s: &mut UnixStream, e: &Error) {
+    let c = match e {
+        Error::RateLimited => code::RATE_LIMITED,
+        Error::TooLarge(_) => code::TOO_LARGE,
+        Error::Sealed => code::SEALED,
+        _ => match e.exit_code() {
+            crate::error::exit::APPROVAL => code::APPROVAL_DENIED,
+            crate::error::exit::POLICY => code::POLICY_DENIED,
+            crate::error::exit::RUN_LIMIT => code::RUN_LIMIT,
+            crate::error::exit::USAGE => code::BAD_REQUEST,
+            _ => code::INTERNAL,
+        },
+    };
+    send_err(s, c, &e.to_string());
+}
+
+fn bad_request(s: &mut UnixStream) {
+    send_err(
+        s,
+        code::BAD_REQUEST,
+        "keygent: broker error 10 — run 'keygent doctor'",
+    );
+}
+
 fn handle(shared: &Shared, mut s: UnixStream) {
     let _ = s.set_read_timeout(Some(FIRST_FRAME));
     let _ = s.set_write_timeout(Some(IDLE));
@@ -132,7 +163,18 @@ fn handle(shared: &Shared, mut s: UnixStream) {
     if shared.ttl.expired() {
         shared.seal("seal_ttl");
     }
+    // `control` is limited to Seal/Status/Deny (SPEC §4.1)
+    if hello.class == Class::Control && !matches!(req.ty, ty::SEAL | ty::STATUS | ty::DENY) {
+        bad_request(&mut s);
+        return;
+    }
     match req.ty {
+        ty::GRANT_CREATE => grant_create(shared, &mut s, &req.payload),
+        ty::AWAIT_GRANT => await_grant(shared, &mut s, &req.payload),
+        ty::PENDING if msg::expect_empty(&req.payload).is_ok() => pending(shared, &mut s),
+        ty::APPROVE => approve(shared, &mut s, &req.payload, &nb, &hello.nonce),
+        ty::DENY => deny(shared, &mut s, &req.payload),
+        ty::RUN => run_grant(shared, s, &req.payload),
         ty::STATUS if msg::expect_empty(&req.payload).is_ok() => status(shared, &mut s),
         ty::LIST if msg::expect_empty(&req.payload).is_ok() => list(shared, &mut s),
         ty::REDACT => redact(shared, &mut s, &req.payload),
@@ -257,5 +299,301 @@ fn redact(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
             let _ = frame::write(s, ty::REDACTED, &p);
         }
         Err(_) => send_err(s, code::TOO_LARGE, "keygent: input too large (limit 1 MiB)"),
+    }
+}
+
+// ---------------------------------------------------------------- grants (SPEC §5.5.2)
+
+/// Lock the state, reload if the vault changed (sealing on failure), and run `f`. `None` when sealed.
+fn with_state<T>(shared: &Shared, f: impl FnOnce(&mut super::State) -> T) -> Option<T> {
+    let mut g = shared.state.lock().ok()?;
+    let st = g.as_mut()?;
+    if let Err(reason) = shared.reload_if_changed(st) {
+        drop(g);
+        shared.seal(reason);
+    }
+    shared.touch(st);
+    Some(f(st))
+}
+
+fn wire_state(g: &grant::Grant) -> u8 {
+    match g.state {
+        GState::Pending => gstate::PENDING,
+        GState::Approved => gstate::APPROVED,
+        GState::Denied => gstate::DENIED,
+        GState::Consumed => gstate::EXPIRED,
+    }
+}
+
+fn first_handle(g: &grant::Grant) -> String {
+    g.handles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "this command".into())
+}
+
+fn grant_create(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
+    let Ok(gc) = GrantCreate::decode(payload) else {
+        return bad_request(s);
+    };
+    let Some(snap) = with_state(shared, |st| grant::policy_snapshot(&st.vault.index)) else {
+        return;
+    };
+    // resolution and hashing happen without the state lock
+    let home = run::user_home();
+    let built = grant::build(
+        &grant::Request {
+            command: &gc.cmd,
+            cwd: &gc.cwd,
+            max_runtime: gc.max_runtime_secs.map(std::time::Duration::from_secs),
+        },
+        |h| grant::lookup_in(&snap, h),
+        &shared.path,
+        home.as_deref(),
+    );
+    let g = match built {
+        Ok(g) => g,
+        Err(e) => return send_error(s, &e),
+    };
+    let r = with_state(shared, |st| {
+        let id = grant::insert(&mut st.grants, g)?;
+        let state = grant::find(&mut st.grants, &id).map_or(gstate::EXPIRED, |x| wire_state(x));
+        Ok::<_, Error>((id, state))
+    });
+    match r {
+        Some(Ok((id, state))) => {
+            shared.log.event(Level::Info, "grant_created", None);
+            match msg::encode_grant(&id, Some(state)) {
+                Ok(p) => {
+                    let _ = frame::write(s, ty::GRANT_CREATED, &p);
+                }
+                Err(_) => bad_request(s),
+            }
+        }
+        Some(Err(e)) => send_error(s, &e),
+        None => {}
+    }
+}
+
+/// Blocks until the grant is decided or ages out of the queue (SPEC §4.1 "Approval wait").
+fn await_grant(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
+    let Ok((id, _)) = msg::decode_grant(payload, false) else {
+        return bad_request(s);
+    };
+    let outcome: Result<(), Error> = {
+        let Ok(mut g) = shared.state.lock() else {
+            return;
+        };
+        loop {
+            let Some(st) = g.as_mut() else { return };
+            match grant::find(&mut st.grants, &id) {
+                None => break Err(Error::Policy(PolicyMsg::QueueTimeout)),
+                Some(x) if x.created.expired() => {
+                    break Err(Error::Policy(PolicyMsg::QueueTimeout));
+                }
+                Some(x) => match x.state {
+                    GState::Approved => break Ok(()),
+                    GState::Denied | GState::Consumed => {
+                        break Err(Error::Policy(PolicyMsg::Denied(first_handle(x))));
+                    }
+                    GState::Pending => {}
+                },
+            }
+            g = match shared
+                .decided
+                .wait_timeout(g, std::time::Duration::from_secs(1))
+            {
+                Ok((g, _)) => g,
+                Err(_) => return,
+            };
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            if let Ok(p) = msg::encode_grant(&id, Some(gstate::APPROVED)) {
+                let _ = frame::write(s, ty::GRANT_DECISION, &p);
+            }
+        }
+        Err(e) => send_error(s, &e),
+    }
+}
+
+fn pending(shared: &Shared, s: &mut UnixStream) {
+    let Some(list) = with_state(shared, |st| {
+        grant::prune(&mut st.grants);
+        st.grants
+            .iter()
+            .filter(|g| g.state == GState::Pending)
+            .map(|g| PendingGrant {
+                id: g.id,
+                key: g.key,
+                unbound: g.unbound,
+                rendered: g.rendered.clone(),
+            })
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    match msg::encode_pending(&list) {
+        Ok(p) => {
+            let _ = frame::write(s, ty::PENDING_REPLY, &p);
+        }
+        Err(_) => send_err(s, code::TOO_LARGE, "keygent: input too large (limit 1 MiB)"),
+    }
+}
+
+/// Failed auth proofs in the current minute (SPEC §4.1 "Auth failure": 30/min, then `RateLimited`).
+static AUTH_FAILS: std::sync::Mutex<Option<(std::time::Instant, u32)>> =
+    std::sync::Mutex::new(None);
+const AUTH_FAILS_PER_MIN: u32 = 30;
+
+/// Count a failure; `false` once over the cap.
+fn auth_failure() -> bool {
+    let Ok(mut g) = AUTH_FAILS.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    let (start, n) = match *g {
+        Some((t, n)) if now.duration_since(t) < std::time::Duration::from_secs(60) => (t, n),
+        _ => (now, 0),
+    };
+    *g = Some((start, n.saturating_add(1)));
+    n < AUTH_FAILS_PER_MIN
+}
+
+/// `Approve` needs `proof_c` over the request (grant id + the grant key the human saw), which only a holder of the
+/// DEK — i.e. someone who just typed the passphrase — can compute. A correct proof is never delayed.
+fn approve(shared: &Shared, s: &mut UnixStream, payload: &[u8], nb: &[u8], nc: &[u8]) {
+    let Ok(a) = Approve::decode(payload) else {
+        return bad_request(s);
+    };
+    let Ok(req) = a.request_bytes() else {
+        return bad_request(s);
+    };
+    let Some(expected) = with_state(shared, |st| st.vault.auth_proof(nb, nc, &req)) else {
+        return;
+    };
+    if !expected.is_ok_and(|e| crypto::verify_proof(&e, &a.proof)) {
+        shared.log.event(Level::Warn, "auth_failed", None);
+        if auth_failure() {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            send_err(
+                s,
+                code::NEEDS_AUTH,
+                "keygent: this needs your passphrase — run it in your own terminal",
+            );
+        } else {
+            send_error(s, &Error::RateLimited);
+        }
+        return;
+    }
+    let r = with_state(shared, |st| {
+        let g = grant::find(&mut st.grants, &a.id)
+            .filter(|g| g.state == GState::Pending && !g.created.expired())
+            .ok_or(Error::Policy(PolicyMsg::QueueTimeout))?;
+        if !crypto::ct_eq(&g.key, &a.key) {
+            return Err(Error::Policy(PolicyMsg::Changed));
+        }
+        if a.remember && g.unbound {
+            return Err(Error::Policy(PolicyMsg::NoRemember));
+        }
+        g.state = GState::Approved;
+        // the approved grant waits for its run for at most another queue lifetime
+        g.created = super::clock::Deadline::after(grant::QUEUE_LIFE);
+        Ok(())
+    });
+    match r {
+        Some(Ok(())) => {
+            shared.decided.notify_all();
+            shared.log.event(Level::Info, "grant_approved", None);
+            let _ = frame::write(s, ty::OK, &[]);
+        }
+        Some(Err(e)) => send_error(s, &e),
+        None => {}
+    }
+}
+
+/// `Deny{id | all}`: no auth (it only removes capability). Unknown ids are not an error.
+fn deny(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
+    let Ok(target) = msg::decode_deny(payload) else {
+        return bad_request(s);
+    };
+    let n = with_state(shared, |st| {
+        let mut n = 0u64;
+        for g in st.grants.iter_mut().filter(|g| g.state == GState::Pending) {
+            if target.is_none_or(|id| crypto::ct_eq(&g.id, &id)) {
+                g.state = GState::Denied;
+                n = n.saturating_add(1);
+            }
+        }
+        n
+    });
+    if let Some(n) = n {
+        shared.decided.notify_all();
+        shared.log.event(Level::Info, "grant_denied", Some(n));
+        let _ = frame::write(s, ty::OK, &[]);
+    }
+}
+
+/// `Run{grant_id}`: consume an approved grant and execute the command stored in it.
+fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
+    let Ok((id, _)) = msg::decode_grant(payload, false) else {
+        return bad_request(&mut s);
+    };
+    let Some(slot) = run::take_slot() else {
+        return send_error(&mut s, &Error::RateLimited);
+    };
+    let job = with_state(shared, |st| {
+        let g = grant::find(&mut st.grants, &id).ok_or(Error::Policy(PolicyMsg::QueueTimeout))?;
+        if g.created.expired() {
+            return Err(Error::Policy(PolicyMsg::QueueTimeout));
+        }
+        if g.state != GState::Approved {
+            return Err(Error::Policy(PolicyMsg::Denied(first_handle(g))));
+        }
+        g.state = GState::Consumed;
+        let (bindings, handles) = (g.bindings.clone(), g.handles.clone());
+        let job = run::Job {
+            command: g.rewritten.clone(),
+            cwd: g.cwd.clone(),
+            env_secrets: Vec::new(),
+            file_secrets: Vec::new(),
+            scripts: g
+                .scripts
+                .iter()
+                .map(|x| (x.var.clone(), x.content.clone()))
+                .collect(),
+            programs: g.programs.clone(),
+            max_runtime: g.max_runtime,
+            redactor: st.redactor.clone(),
+        };
+        // policy may have changed since approval (a handle denied or removed): re-check at use
+        for h in &handles {
+            match st.vault.index.get(h) {
+                Some(r) if r.mode != Mode::Deny => {}
+                _ => return Err(Error::Policy(PolicyMsg::NotAllowed(h.clone()))),
+            }
+        }
+        let mut job = job;
+        for b in &bindings {
+            let v = st
+                .vault
+                .read_entry(&b.handle)
+                .map_err(|_| Error::Internal(143))?;
+            if b.file {
+                job.file_secrets.push((b.var.clone(), v));
+            } else {
+                job.env_secrets.push((b.var.clone(), v));
+            }
+        }
+        Ok(job)
+    });
+    match job {
+        Some(Ok(job)) => {
+            run::execute(shared, s, job);
+            drop(slot);
+        }
+        Some(Err(e)) => send_error(&mut s, &e),
+        None => {}
     }
 }

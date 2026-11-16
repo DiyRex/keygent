@@ -111,6 +111,19 @@ pub mod proto {
     pub const E_DESCRIPTION: u16 = 0x1026;
     pub const DATA: u16 = 0x1030;
     pub const HITS: u16 = 0x1031;
+    pub const CMD: u16 = 0x1040;
+    pub const CWD: u16 = 0x1041;
+    pub const MAX_RUNTIME: u16 = 0x1042;
+    pub const GRANT_ID: u16 = 0x1043;
+    pub const GRANT_KEY: u16 = 0x1044;
+    pub const GRANT_STATE: u16 = 0x1045;
+    pub const RENDERED: u16 = 0x1046;
+    pub const REMEMBER: u16 = 0x1047;
+    pub const ALL: u16 = 0x1048;
+    pub const EXIT_CODE: u16 = 0x1049;
+    pub const SIGNAL: u16 = 0x104a;
+    pub const GRANT: u16 = 0x104b;
+    pub const UNBOUND: u16 = 0x104c;
 }
 
 /// Unseal handoff over the inherited pipe (CLI → `keygent broker`), little-endian TLV. Range `0x20xx`.

@@ -10,7 +10,9 @@
 
 pub mod clock;
 pub mod endpoint;
+pub mod grant;
 pub mod log;
+pub mod run;
 mod server;
 
 use crate::crypto::{self, Dek};
@@ -24,7 +26,7 @@ use log::{Level, Log};
 use std::io::Read;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -96,7 +98,9 @@ pub struct State {
     /// Every value seen this session (current, previous, and values since rotated away): the redactor keeps old
     /// values until seal (SPEC §5.7.5). Locked arena.
     pub registered: Vec<(String, crate::crypto::Secret)>,
-    pub redactor: crate::redact::Redactor,
+    /// Shared with running jobs, which keep the snapshot they started with.
+    pub redactor: Arc<crate::redact::Redactor>,
+    pub grants: Vec<grant::Grant>,
 }
 
 impl State {
@@ -121,12 +125,14 @@ impl State {
                 }
             }
         }
-        self.redactor = crate::redact::Redactor::new(
-            self.registered
-                .iter()
-                .map(|(h, s)| (h.as_str(), s.expose())),
-        )
-        .map_err(|_| "seal_redactor_too_large")?;
+        self.redactor = Arc::new(
+            crate::redact::Redactor::new(
+                self.registered
+                    .iter()
+                    .map(|(h, s)| (h.as_str(), s.expose())),
+            )
+            .map_err(|_| "seal_redactor_too_large")?,
+        );
         Ok(())
     }
 }
@@ -139,10 +145,13 @@ pub struct Shared {
     pub idle: Duration,
     pub hardening: ipc::Hardening,
     pub build_id: String,
-    /// PATH captured at unseal; executable resolution arrives with `run` (M3).
-    #[allow(dead_code)]
+    /// PATH captured at unseal: executable resolution and the child's PATH (SPEC §5.5.2).
     pub path: String,
     pub sock: std::path::PathBuf,
+    /// Signalled (with `state`) whenever a grant is approved or denied.
+    pub decided: Condvar,
+    /// Session ids of active runs; sealing kills them.
+    pub runs: Mutex<Vec<i32>>,
     sealing: AtomicBool,
 }
 
@@ -157,11 +166,21 @@ impl Shared {
         }
         self.log.event(Level::Info, reason, None);
         let _ = std::fs::remove_file(&self.sock);
+        if let Ok(r) = self.runs.try_lock() {
+            for &sid in r.iter() {
+                ipc::kill_session(sid);
+            }
+        }
         // never block here: a caller may (wrongly) still hold the lock; exiting frees everything regardless
         if let Ok(mut g) = self.state.try_lock() {
             drop(g.take());
         }
         std::process::exit(0)
+    }
+
+    /// A client request counts as activity for the idle timer.
+    pub fn touch(&self, st: &mut State) {
+        st.idle_deadline = Deadline::after(self.idle);
     }
 
     /// Fail-closed reload: if the vault on disk moved to another generation (a CLI write, ADR 0012), reopen it with
@@ -256,6 +275,7 @@ pub fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    run::sweep_bindings(&dirs.run);
     log.event(
         Level::Info,
         "unsealed",
@@ -268,9 +288,10 @@ pub fn main() -> ExitCode {
         idle_deadline: Deadline::after(handoff.idle),
         registered: Vec::new(),
         redactor: match crate::redact::Redactor::new(std::iter::empty()) {
-            Ok(r) => r,
+            Ok(r) => Arc::new(r),
             Err(_) => return ExitCode::from(1),
         },
+        grants: Vec::new(),
     };
     // SPEC §5.8: unseal refuses a vault whose secrets exceed the redactor cap
     if let Err(reason) = state.refresh_redactor() {
@@ -288,6 +309,8 @@ pub fn main() -> ExitCode {
         build_id: crate::cli::build_id(),
         path: handoff.path,
         sock: endpoint.sock.clone(),
+        decided: Condvar::new(),
+        runs: Mutex::new(Vec::new()),
         sealing: AtomicBool::new(false),
     });
     spawn_watchers(&shared);
@@ -316,11 +339,16 @@ fn spawn_watchers(shared: &Arc<Shared>) {
                 if watch.suspended_longer_than(s.idle) {
                     s.seal("seal_wake");
                 }
-                let idle_expired = s
-                    .state
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|st| st.idle_deadline.expired()));
+                // an active run is activity: it keeps the idle timer from firing (the TTL still applies)
+                let running = s.runs.lock().is_ok_and(|r| !r.is_empty());
+                let idle_expired = s.state.lock().ok().and_then(|mut g| {
+                    g.as_mut().map(|st| {
+                        if running {
+                            st.idle_deadline = Deadline::after(s.idle);
+                        }
+                        st.idle_deadline.expired()
+                    })
+                });
                 if idle_expired != Some(false) {
                     s.seal("seal_idle");
                 }

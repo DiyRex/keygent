@@ -1,0 +1,651 @@
+//! Grants (SPEC §5.5.2): a pending authorization to run one exact command.
+//!
+//! - The grant stores the command; `run --grant <id>` carries no command text.
+//! - Grant key = SHA-256 over `enc()` of: command, dialect, cwd, handles, every resolved program (path + SHA-256),
+//!   script files (path + SHA-256 + size), max runtime. Single-use: consumed by the first `Run`.
+//! - Approval happens only through broker-observed channels (here: `keygent approve` with a passphrase proof).
+//! - Limits (SPEC §4.1): 16 pending, 4 per cwd (oldest from the same cwd evicted), dedupe by key, 5 min queue life.
+//! - Phase 2 ships no per-tool grammars, so every approved run is **unbound** (warning shown, `--remember` off). That
+//!   is the conservative reading of "anything not proven bound is unbound" (BUILD_PROMPT §3.5).
+
+use super::clock::Deadline;
+use crate::crypto;
+use crate::error::{Error, Result};
+use crate::policy::render::{self, ProgramLine, RenderInput, ScriptView};
+use crate::policy::resolve::{self, Program};
+use crate::policy::rewrite::{self, Binding, RewriteError};
+use crate::policy::tokenize::{self, TokError};
+use crate::vault::index::{Argv, Index, Mode};
+
+/// Snapshot of `(handle, mode, argv)` for `build` without holding the state lock.
+pub fn policy_snapshot(index: &Index) -> Vec<(String, Mode, Argv)> {
+    index
+        .handles
+        .iter()
+        .map(|r| (r.handle.clone(), r.mode, r.argv))
+        .collect()
+}
+
+pub fn lookup_in(snap: &[(String, Mode, Argv)], h: &str) -> Option<(Mode, Argv)> {
+    snap.iter()
+        .find(|(x, _, _)| x == h)
+        .map(|(_, m, a)| (*m, *a))
+}
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+pub const MAX_PENDING: usize = 16;
+pub const MAX_PER_CWD: usize = 4;
+pub const MAX_GRANTS: usize = 64;
+pub const QUEUE_LIFE: Duration = Duration::from_secs(5 * 60);
+pub const MAX_SCRIPT: u64 = 16 * 1024;
+pub const DEFAULT_RUNTIME: Duration = Duration::from_secs(30 * 60);
+pub const MAX_RUNTIME: Duration = Duration::from_secs(4 * 3600);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    Pending,
+    Approved,
+    Denied,
+    Consumed,
+}
+
+pub struct Script {
+    pub path: PathBuf,
+    pub sha256: [u8; 32],
+    pub content: Vec<u8>,
+    /// The script word is rewritten to `"${KEYGENT_SCRIPT_<n>}"`, set at run time to the private copy.
+    pub var: String,
+}
+
+pub struct Grant {
+    pub id: [u8; 16],
+    pub key: [u8; 32],
+    pub rewritten: String,
+    pub cwd: PathBuf,
+    pub handles: Vec<String>,
+    pub bindings: Vec<Binding>,
+    pub programs: Vec<Program>,
+    pub scripts: Vec<Script>,
+    pub max_runtime: Duration,
+    pub unbound: bool,
+    pub created: Deadline,
+    pub state: State,
+    pub rendered: String,
+}
+
+/// What a client asked for.
+pub struct Request<'a> {
+    pub command: &'a str,
+    pub cwd: &'a str,
+    pub max_runtime: Option<Duration>,
+}
+
+/// Whole minutes, rounded up (display and the limit message).
+pub fn minutes(d: Duration) -> u64 {
+    d.as_secs().div_ceil(60)
+}
+
+/// Folders a run may never start in (SPEC §5.5.2 "cwd rule").
+fn forbidden_cwd(cwd: &Path, home: Option<&Path>) -> bool {
+    let sys = [
+        "/",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/etc",
+        "/var",
+        "/tmp",
+        "/private",
+        "/System",
+        "/Library",
+        "/Applications",
+        "/opt",
+        "/dev",
+        "/proc",
+        "/sys",
+    ];
+    sys.iter().any(|s| cwd == Path::new(s)) || home.is_some_and(|h| cwd == h)
+}
+
+/// Nearest ancestor with `.git` or `.keygent.toml` (UX only for direct runs: an agent can create one anywhere).
+pub fn project_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|d| d.join(".git").exists() || d.join(".keygent.toml").exists())
+        .map(Path::to_path_buf)
+}
+
+fn tok_err(e: &TokError) -> Error {
+    match e {
+        TokError::TooLong => Error::TooLarge("64 KiB command"),
+        _ => Error::Policy(crate::error::PolicyMsg::Unparsable),
+    }
+}
+
+/// Read a script once (regular file, inside `root`, ≤ 16 KiB): the exact bytes that will run.
+/// (canonical path, SHA-256, content) of a bindable script.
+type ScriptBytes = (PathBuf, [u8; 32], Vec<u8>);
+
+fn read_script(path: &Path, root: &Path) -> Result<Option<ScriptBytes>> {
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return Ok(None);
+    };
+    let Ok(m) = std::fs::metadata(&canon) else {
+        return Ok(None);
+    };
+    if !m.is_file() {
+        return Ok(None);
+    }
+    if !canon.starts_with(root) || m.len() > MAX_SCRIPT {
+        return Err(Error::Policy(crate::error::PolicyMsg::ScriptNotBindable));
+    }
+    let content = std::fs::read(&canon)?;
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > MAX_SCRIPT {
+        return Err(Error::Policy(crate::error::PolicyMsg::ScriptNotBindable));
+    }
+    Ok(Some((canon, crypto::sha256(&content), content)))
+}
+
+fn has_shebang(p: &Path) -> bool {
+    let mut b = [0u8; 2];
+    std::fs::File::open(p)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+        .is_ok_and(|()| &b == b"#!")
+}
+
+/// Shebang interpreter of a script (`#!/bin/sh`, `#!/usr/bin/env node`), resolved on the captured PATH.
+fn shebang(content: &[u8], cwd: &Path, path_var: &str) -> Option<PathBuf> {
+    let line = content.strip_prefix(b"#!")?;
+    let line = line.split(|&b| b == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?.trim();
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    let target = if first.ends_with("/env") {
+        parts.find(|p| !p.starts_with('-'))?
+    } else {
+        first
+    };
+    match resolve::resolve(Some(target), cwd, path_var) {
+        Program::File { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+/// Record a bound script and the edit that replaces its word with `"${KEYGENT_SCRIPT_<n>}"`.
+fn bind_script(
+    scripts: &mut Vec<Script>,
+    edits: &mut Vec<(usize, usize, String)>,
+    span: Option<&(usize, usize)>,
+    path: PathBuf,
+    sha256: [u8; 32],
+    content: Vec<u8>,
+) -> Result<()> {
+    let &(start, end) = span.ok_or(Error::Policy(crate::error::PolicyMsg::Unparsable))?;
+    let var = format!("KEYGENT_SCRIPT_{}", scripts.len());
+    edits.push((start, end, format!("\"${{{var}}}\"")));
+    scripts.push(Script {
+        path,
+        sha256,
+        content,
+        var,
+    });
+    Ok(())
+}
+
+/// Build a grant (not yet stored). Errors are agent-facing policy decisions.
+/// `lookup(handle)` returns the handle's mode and argv policy (a snapshot taken under the state lock).
+pub fn build(
+    req: &Request<'_>,
+    lookup: impl Fn(&str) -> Option<(Mode, Argv)>,
+    path_var: &str,
+    home: Option<&Path>,
+) -> Result<Grant> {
+    let parsed = tokenize::parse(req.command).map_err(|e| tok_err(&e))?;
+    // handles must exist and not be denied
+    let mut handles: Vec<String> = Vec::new();
+    for p in &parsed.placeholders {
+        let (mode, _) = lookup(&p.handle).ok_or_else(|| {
+            Error::Policy(crate::error::PolicyMsg::UnknownHandle(p.handle.clone()))
+        })?;
+        if mode == Mode::Deny {
+            return Err(Error::Policy(crate::error::PolicyMsg::NotAllowed(
+                p.handle.clone(),
+            )));
+        }
+        if !handles.contains(&p.handle) {
+            handles.push(p.handle.clone());
+        }
+    }
+    let argv_exposed = parsed
+        .placeholders
+        .iter()
+        .any(|p| !p.file && p.role == tokenize::Role::Argv);
+    let cwd = std::fs::canonicalize(req.cwd)
+        .map_err(|_| Error::Policy(crate::error::PolicyMsg::BadCwd))?;
+    if !cwd.is_dir() || forbidden_cwd(&cwd, home) {
+        return Err(Error::Policy(crate::error::PolicyMsg::BadCwd));
+    }
+    let root = project_root(&cwd);
+    let bind_root = root.clone().unwrap_or_else(|| cwd.clone());
+    let max_runtime = req.max_runtime.unwrap_or(DEFAULT_RUNTIME);
+    if max_runtime.is_zero() || max_runtime > MAX_RUNTIME {
+        return Err(Error::Usage("--max-runtime: 1s … 4h"));
+    }
+    // programs and scripts
+    let mut programs = Vec::new();
+    let mut scripts = Vec::new();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for c in &parsed.commands {
+        let Some(word0) = c.argv.first() else {
+            continue;
+        };
+        let prog = resolve::resolve(word0.as_deref(), &cwd, path_var);
+        // `source x` / `. x`: the sourced file is a script run by the dialect shell
+        if let Program::Builtin(b) = &prog
+            && (b == "source" || b == ".")
+            && let Some(Some(arg)) = c.argv.get(1)
+        {
+            let p = cwd.join(arg);
+            if let Some((canon, sha256, content)) = read_script(&p, &bind_root)? {
+                bind_script(
+                    &mut scripts,
+                    &mut edits,
+                    c.spans.get(1),
+                    canon,
+                    sha256,
+                    content,
+                )?;
+            }
+        }
+        if let Program::File { path, .. } = &prog {
+            if resolve::is_script_interpreter(path) {
+                // first non-flag literal argument is the script (`python x.py`, `bash ./x.sh`)
+                if let Some((i, Some(arg))) = c
+                    .argv
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, a)| a.as_deref().is_none_or(|s| !s.starts_with('-')))
+                {
+                    let p = if Path::new(arg).is_absolute() {
+                        PathBuf::from(arg)
+                    } else {
+                        cwd.join(arg)
+                    };
+                    if let Some((canon, sha256, content)) = read_script(&p, &bind_root)? {
+                        bind_script(
+                            &mut scripts,
+                            &mut edits,
+                            c.spans.get(i),
+                            canon,
+                            sha256,
+                            content,
+                        )?;
+                    }
+                }
+            } else if path.starts_with(&bind_root) && has_shebang(path) {
+                // a project-local script: bind its bytes (compiled binaries are pinned like any program)
+                if let Some((canon, sha256, content)) = read_script(path, &bind_root)?
+                    && let Some(interp) = shebang(&content, &cwd, path_var)
+                {
+                    // the private copy is exec'd directly; its shebang interpreter is pinned like any program
+                    programs.push(resolve::resolve(interp.to_str(), &cwd, path_var));
+                    bind_script(
+                        &mut scripts,
+                        &mut edits,
+                        c.spans.first(),
+                        canon,
+                        sha256,
+                        content,
+                    )?;
+                    continue;
+                }
+            }
+        }
+        programs.push(prog);
+    }
+    let rw = rewrite::rewrite(
+        req.command,
+        &parsed,
+        |h| lookup(h).is_some_and(|(_, a)| a == Argv::Allow),
+        &edits,
+    )
+    .map_err(|e| match e {
+        RewriteError::ArgvSecret(_) => Error::Policy(crate::error::PolicyMsg::ArgvSecret),
+        RewriteError::SingleQuoted(_) => Error::Policy(crate::error::PolicyMsg::SingleQuoted),
+        RewriteError::Overlap => Error::Policy(crate::error::PolicyMsg::Unparsable),
+    })?;
+    let key = grant_key(
+        req.command,
+        &cwd,
+        &handles,
+        &programs,
+        &scripts,
+        max_runtime,
+    )?;
+    let env: Vec<(String, String)> = rw
+        .bindings
+        .iter()
+        .map(|b| (b.handle.clone(), b.var.clone()))
+        .collect();
+    let program_lines: Vec<ProgramLine> = programs
+        .iter()
+        .map(|p| match p {
+            Program::File { path, sha256 } => ProgramLine {
+                path: path.display().to_string(),
+                sha256: Some(*sha256),
+            },
+            Program::Builtin(b) => ProgramLine {
+                path: format!("{b} (shell builtin)"),
+                sha256: None,
+            },
+            Program::Unknown(w) => ProgramLine {
+                path: w.clone(),
+                sha256: None,
+            },
+        })
+        .collect();
+    let script_views: Vec<ScriptView> = scripts
+        .iter()
+        .map(|s| ScriptView {
+            path: s.path.display().to_string(),
+            sha256: s.sha256,
+            content: s.content.clone(),
+        })
+        .collect();
+    let cwd_s = cwd.display().to_string();
+    let root_s = root.as_ref().map(|r| r.display().to_string());
+    let rendered = render::render_for_approval(&RenderInput {
+        grant_key: &key,
+        command: req.command,
+        cwd: &cwd_s,
+        project_root: root_s.as_deref(),
+        env: &env,
+        programs: &program_lines,
+        scripts: &script_views,
+        unbound: true,
+        argv_exposed,
+        max_runtime_min: minutes(max_runtime),
+    });
+    Ok(Grant {
+        id: crypto::random()?,
+        key,
+        rewritten: rw.cmd,
+        cwd,
+        handles,
+        bindings: rw.bindings,
+        programs,
+        scripts,
+        max_runtime,
+        unbound: true,
+        created: Deadline::after(QUEUE_LIFE),
+        state: if parsed.placeholders.is_empty() {
+            State::Approved
+        } else {
+            State::Pending
+        },
+        rendered,
+    })
+}
+
+pub fn grant_key(
+    command: &str,
+    cwd: &Path,
+    handles: &[String],
+    programs: &[Program],
+    scripts: &[Script],
+    max_runtime: Duration,
+) -> Result<[u8; 32]> {
+    let mut fields: Vec<Vec<u8>> = vec![
+        command.as_bytes().to_vec(),
+        b"posix".to_vec(),
+        cwd.as_os_str().as_encoded_bytes().to_vec(),
+    ];
+    fields.push(handles.join("\0").into_bytes());
+    for p in programs {
+        match p {
+            Program::File { path, sha256 } => {
+                fields.push(path.as_os_str().as_encoded_bytes().to_vec());
+                fields.push(sha256.to_vec());
+            }
+            Program::Builtin(b) => fields.push(format!("builtin:{b}").into_bytes()),
+            Program::Unknown(w) => fields.push(format!("unknown:{w}").into_bytes()),
+        }
+    }
+    for s in scripts {
+        fields.push(s.path.as_os_str().as_encoded_bytes().to_vec());
+        fields.push(s.sha256.to_vec());
+        fields.push(
+            u64::try_from(s.content.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes()
+                .to_vec(),
+        );
+    }
+    fields.push(max_runtime.as_secs().to_le_bytes().to_vec());
+    let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    Ok(crypto::sha256(&crypto::enc(&refs)?))
+}
+
+/// Insert respecting the queue limits; returns the id to hand back (an existing grant with the same key is reused).
+/// Every grant ages out at its deadline (5 min from creation, reset on approval); denied and consumed ones stay
+/// until then so a waiting `run` learns the outcome. `MAX_GRANTS` bounds memory (oldest decided ones go first).
+pub fn insert(grants: &mut Vec<Grant>, g: Grant) -> Result<[u8; 16]> {
+    prune(grants);
+    while grants.len() >= MAX_GRANTS {
+        match grants.iter().position(|x| x.state != State::Pending) {
+            Some(pos) => {
+                grants.remove(pos);
+            }
+            None => return Err(Error::RateLimited),
+        }
+    }
+    if let Some(x) = grants
+        .iter()
+        .find(|x| x.key == g.key && matches!(x.state, State::Pending | State::Approved))
+    {
+        return Ok(x.id);
+    }
+    let pending = |gs: &Vec<Grant>| gs.iter().filter(|x| x.state == State::Pending).count();
+    if g.state == State::Pending {
+        let same_cwd = grants
+            .iter()
+            .filter(|x| x.state == State::Pending && x.cwd == g.cwd)
+            .count();
+        if same_cwd >= MAX_PER_CWD
+            && let Some(pos) = grants
+                .iter()
+                .position(|x| x.state == State::Pending && x.cwd == g.cwd)
+        {
+            grants.remove(pos);
+        }
+        if pending(grants) >= MAX_PENDING {
+            return Err(Error::RateLimited);
+        }
+    }
+    let id = g.id;
+    grants.push(g);
+    Ok(id)
+}
+
+pub fn prune(grants: &mut Vec<Grant>) {
+    grants.retain(|x| !x.created.expired());
+}
+
+pub fn find<'a>(grants: &'a mut [Grant], id: &[u8]) -> Option<&'a mut Grant> {
+    grants.iter_mut().find(|g| crypto::ct_eq(&g.id, id))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+    use crate::vault::index::{Index, new_handle};
+
+    fn index() -> Index {
+        let mut i = Index::new([0; 16]);
+        i.handles.push(new_handle(
+            "stripe/live",
+            "STRIPE_API_KEY",
+            "",
+            Mode::Approve,
+            0,
+        ));
+        i.handles
+            .push(new_handle("deny/me", "D", "", Mode::Deny, 0));
+        i
+    }
+
+    fn tmp_project() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "kg-grant-{}",
+            crate::crypto::random::<4>()
+                .unwrap()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::canonicalize(d).unwrap()
+    }
+
+    fn req<'a>(cmd: &'a str, cwd: &'a str) -> Request<'a> {
+        Request {
+            command: cmd,
+            cwd,
+            max_runtime: None,
+        }
+    }
+
+    #[test]
+    fn build_binds_programs_scripts_and_key() {
+        let p = tmp_project();
+        std::fs::write(p.join("x.sh"), b"echo hi\n").unwrap();
+        let g = build(
+            &req(
+                "STRIPE_API_KEY={{keygent:stripe/live}} sh ./x.sh",
+                p.to_str().unwrap(),
+            ),
+            |h| lookup_in(&policy_snapshot(&index()), h),
+            "/usr/bin:/bin",
+            None,
+        )
+        .unwrap();
+        assert_eq!(g.handles, vec!["stripe/live"]);
+        assert_eq!(g.state, State::Pending);
+        assert_eq!(
+            g.rewritten,
+            "STRIPE_API_KEY=\"${KEYGENT_STRIPE_LIVE}\" sh \"${KEYGENT_SCRIPT_0}\""
+        );
+        assert_eq!(g.scripts.len(), 1);
+        assert_eq!(g.scripts[0].content, b"echo hi\n");
+        assert!(g.rendered.contains("echo hi") && g.rendered.contains("⚠ unbound"));
+        // the key changes when the script changes
+        std::fs::write(p.join("x.sh"), b"echo bye\n").unwrap();
+        let g2 = build(
+            &req(
+                "STRIPE_API_KEY={{keygent:stripe/live}} sh ./x.sh",
+                p.to_str().unwrap(),
+            ),
+            |h| lookup_in(&policy_snapshot(&index()), h),
+            "/usr/bin:/bin",
+            None,
+        )
+        .unwrap();
+        assert_ne!(g.key, g2.key);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn refusals() {
+        let p = tmp_project();
+        let cwd = p.to_str().unwrap();
+        let e = |c: &str| {
+            build(
+                &req(c, cwd),
+                |h| lookup_in(&policy_snapshot(&index()), h),
+                "/usr/bin:/bin",
+                None,
+            )
+            .err()
+            .unwrap()
+        };
+        assert!(matches!(
+            e("tool {{keygent:stripe/live}}"),
+            Error::Policy(crate::error::PolicyMsg::ArgvSecret)
+        ));
+        assert!(matches!(
+            e("X='{{keygent:stripe/live}}' t"),
+            Error::Policy(crate::error::PolicyMsg::SingleQuoted)
+        ));
+        assert!(matches!(
+            e("X={{keygent:deny/me}} t"),
+            Error::Policy(crate::error::PolicyMsg::NotAllowed(_))
+        ));
+        assert!(matches!(
+            e("X={{keygent:nope}} t"),
+            Error::Policy(crate::error::PolicyMsg::UnknownHandle(_))
+        ));
+        assert!(matches!(
+            e("echo 'x"),
+            Error::Policy(crate::error::PolicyMsg::Unparsable)
+        ));
+        // forbidden cwd
+        let r = build(
+            &req("X={{keygent:stripe/live}} t", "/"),
+            |h| lookup_in(&policy_snapshot(&index()), h),
+            "/usr/bin",
+            None,
+        );
+        assert!(matches!(
+            r.err().unwrap(),
+            Error::Policy(crate::error::PolicyMsg::BadCwd)
+        ));
+        // a script outside the project can't be bound
+        let outside = std::env::temp_dir().join("kg-outside-script.sh");
+        std::fs::write(&outside, b"echo x").unwrap();
+        let c = format!("X={{{{keygent:stripe/live}}}} sh {}", outside.display());
+        assert!(matches!(
+            e(&c),
+            Error::Policy(crate::error::PolicyMsg::ScriptNotBindable)
+        ));
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn queue_limits_and_dedupe() {
+        let p = tmp_project();
+        let cwd = p.to_str().unwrap();
+        let mut gs = Vec::new();
+        let mk = |n: usize| {
+            build(
+                &req(&format!("X={{{{keygent:stripe/live}}}} echo {n}"), cwd),
+                |h| lookup_in(&policy_snapshot(&index()), h),
+                "/usr/bin:/bin",
+                None,
+            )
+            .unwrap()
+        };
+        let a = insert(&mut gs, mk(1)).unwrap();
+        assert_eq!(insert(&mut gs, mk(1)).unwrap(), a, "same key → same grant");
+        for n in 2..=6 {
+            insert(&mut gs, mk(n)).unwrap();
+        }
+        assert_eq!(
+            gs.iter().filter(|g| g.state == State::Pending).count(),
+            MAX_PER_CWD,
+            "oldest from the same cwd evicted"
+        );
+        assert!(find(&mut gs, &a).is_none(), "the first one was evicted");
+        // a command without placeholders needs no approval
+        let g = build(
+            &req("echo hi", cwd),
+            |h| lookup_in(&policy_snapshot(&index()), h),
+            "/usr/bin:/bin",
+            None,
+        )
+        .unwrap();
+        assert_eq!(g.state, State::Approved);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+}

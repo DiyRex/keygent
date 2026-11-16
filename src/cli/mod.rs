@@ -6,6 +6,8 @@ mod client;
 mod cmds;
 mod console;
 mod dotenv;
+#[cfg(unix)]
+mod grants;
 mod recovery;
 #[cfg(unix)]
 mod session;
@@ -18,6 +20,8 @@ const USAGE: &str = "\
 keygent — let AI coding agents use secrets without seeing them
 
 Session:  unseal [--ttl 8h] · seal · status · ls
+Run:      run [--max-runtime 30m] -- '<command with {{keygent:<handle>}}>' · run --grant <id>
+Approve:  pending · approve [<id>] [--remember] · deny [<id> | --all]
 Vault:    init [--own-passphrase] · passwd [--own-passphrase] · rekey · recover [--own-passphrase]
           verify · backup <file> · restore <file> [--new-machine] [--own-passphrase] · status
 Secrets:  add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]
@@ -109,6 +113,30 @@ fn run(argv: &[String]) -> Result<()> {
             &rest,
             &[("--ttl", true), ("--log", true)],
             "keygent unseal [--ttl 8h] [--log info|debug]",
+        )?),
+        #[cfg(unix)]
+        "run" => grants::run(Args::parse(
+            &rest,
+            &[
+                ("--grant", true),
+                ("--max-runtime", true),
+                ("--dialect", true),
+            ],
+            "keygent run [--max-runtime 30m] -- '<command>' | run --grant <id>",
+        )?),
+        #[cfg(unix)]
+        "pending" => grants::pending(Args::parse(&rest, &[], "keygent pending")?),
+        #[cfg(unix)]
+        "approve" => grants::approve(Args::parse(
+            &rest,
+            &[("--remember", false)],
+            "keygent approve [<id>] [--remember]",
+        )?),
+        #[cfg(unix)]
+        "deny" => grants::deny(Args::parse(
+            &rest,
+            &[("--all", false)],
+            "keygent deny [<id> | --all]",
         )?),
         #[cfg(unix)]
         "seal" => session::seal(Args::parse(&rest, &[], "keygent seal")?),
@@ -231,6 +259,9 @@ pub fn main() -> ExitCode {
 }
 
 fn fail(e: &Error) -> ExitCode {
+    if let Error::Exit(code) = e {
+        return ExitCode::from(*code);
+    }
     let _ = writeln!(std::io::stderr(), "{e}");
     ExitCode::from(e.exit_code())
 }

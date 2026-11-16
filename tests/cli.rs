@@ -227,9 +227,10 @@ fn assert_no_plaintext(root: &Root, c: &str) {
     fn walk(p: &Path, c: &str) {
         for e in std::fs::read_dir(p).unwrap().flatten() {
             let path = e.path();
-            if path.is_dir() {
+            let ft = e.file_type().unwrap();
+            if ft.is_dir() {
                 walk(&path, c);
-            } else {
+            } else if ft.is_file() {
                 let b = std::fs::read(&path).unwrap();
                 assert!(
                     !b.windows(c.len()).any(|w| w == c.as_bytes()),
@@ -1023,4 +1024,248 @@ fn broker_redacts_values_old_values_and_detectors() {
     assert_eq!(run(&root, &["rotate", "svc/key"], &[PASS, &c2]).0, 0);
     let out = redact(&format!("{c1} {c2}"));
     assert_eq!(out, "‹keygent:svc/key› ‹keygent:svc/key›");
+}
+
+// ---------------------------------------------------------------- grants, approvals and run (Phase 2 M3)
+
+const WAITING: &str = "keygent: waiting for approval — ask the user to run 'keygent approve'";
+
+/// An unsealed vault with `svc/key` = a canary, and a project dir (`.git`) to run in.
+fn run_setup() -> (Root, String, PathBuf) {
+    let root = Root::new();
+    init(&root);
+    let c = canary();
+    assert_eq!(add(&root, "svc/key", &c).0, 0);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let proj = root.0.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    (root, c, proj)
+}
+
+fn run_in(root: &Root, proj: &Path, args: &[&str]) -> Session {
+    let mut c = cmd(root, args);
+    c.current_dir(proj);
+    Session::start_cmd(c)
+}
+
+fn approve(root: &Root) {
+    let (code, _, err) = run(root, &["approve"], &[PASS]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("keygent: approved"), "{err}");
+}
+
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[test]
+fn run_with_approval_streams_redacted_output() {
+    let (root, c, proj) = run_setup();
+    let mut s = run_in(
+        &root,
+        &proj,
+        &[
+            "run",
+            "--",
+            "X={{keygent:svc/key}} sh -c 'printf \"%s\\n\" \"$X\"; echo to-stderr >&2; exit 3'",
+        ],
+    );
+    s.expect(WAITING);
+    // the request as the human sees it: command, cwd, secret → env, programs, unbound warning
+    let (code, out, _) = run(&root, &["pending"], &[]);
+    assert_eq!(code, 0);
+    for want in [
+        "request ",
+        "X={{keygent:svc/key}} sh -c",
+        "svc/key → $KEYGENT_SVC_KEY",
+        "program:  /",
+        "⚠ unbound",
+    ] {
+        assert!(out.contains(want), "missing {want}: {out}");
+    }
+    assert!(!out.contains(&c));
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(out, "‹keygent:svc/key›\n");
+    assert!(err.contains("to-stderr"), "{err}");
+    assert!(!out.contains(&c) && !err.contains(&c));
+    // the grant was single-use and nothing is pending any more
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert_eq!(out, "no pending requests\n");
+    assert_no_plaintext(&root, &c);
+}
+
+#[test]
+fn deny_and_policy_refusals() {
+    let (root, _c, proj) = run_setup();
+    let mut s = run_in(&root, &proj, &["run", "--", "X={{keygent:svc/key}} true"]);
+    s.expect(WAITING);
+    let (code, _, err) = run(&root, &["deny"], &[]);
+    assert_eq!((code, err.trim()), (0, "keygent: denied"));
+    let (code, _, err) = s.finish();
+    assert_eq!(
+        (code, err.lines().last().unwrap()),
+        (75, "keygent: approval denied or timed out for svc/key")
+    );
+    // refusals happen before anything is queued
+    let refuse = |c: &str, cwd: &Path| {
+        let mut x = cmd(&root, &["run", "--", c]);
+        x.current_dir(cwd);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let (code, err) = refuse("tool --key {{keygent:svc/key}}", &proj);
+    assert_eq!(code, 77);
+    assert!(
+        err.starts_with("keygent: secret would be visible in the process list"),
+        "{err}"
+    );
+    let (code, err) = refuse("X='{{keygent:svc/key}}' tool", &proj);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            77,
+            "keygent: placeholder inside single quotes won't expand — use double quotes"
+        )
+    );
+    let (code, err) = refuse("X={{keygent:no/such}} tool", &proj);
+    assert_eq!(code, 77, "{err}");
+    let (code, err) = refuse("echo hi", Path::new("/"));
+    assert_eq!(
+        (code, err.trim()),
+        (
+            77,
+            "keygent: can't approve runs from this folder — run inside a project"
+        )
+    );
+    let (code, err) = refuse("echo 'unterminated", &proj);
+    assert_eq!(code, 64, "{err}");
+    // approve with nothing pending
+    let (code, _, err) = run(&root, &["approve"], &[]);
+    assert_eq!((code, err.trim()), (1, "keygent: no pending requests"));
+    // a command without placeholders runs without approval
+    let mut x = cmd(&root, &["run", "--", "echo hi; exit 4"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        (o.status.code(), o.stdout.as_slice()),
+        (Some(4), b"hi\n".as_slice())
+    );
+}
+
+#[test]
+fn bound_script_runs_the_approved_bytes() {
+    let (root, c, proj) = run_setup();
+    std::fs::write(proj.join("x.sh"), "printf '%s|' \"$X\"\n").unwrap();
+    let mut s = run_in(
+        &root,
+        &proj,
+        &["run", "--", "X={{keygent:svc/key}} sh ./x.sh"],
+    );
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("--- ") && out.contains("printf '%s|'"),
+        "script shown in full: {out}"
+    );
+    // swapping the script after approval-time reading has no effect
+    std::fs::write(proj.join("x.sh"), "echo SWAPPED\n").unwrap();
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!((code, out.as_str()), (0, "‹keygent:svc/key›|"), "{err}");
+    assert!(!out.contains(&c));
+}
+
+#[test]
+fn changed_program_after_approval_fails_closed() {
+    let (root, _c, proj) = run_setup();
+    std::fs::create_dir_all(proj.join("bin")).unwrap();
+    let tool = proj.join("bin/tool");
+    std::fs::copy("/bin/echo", &tool).unwrap();
+    let mut s = run_in(
+        &root,
+        &proj,
+        &["run", "--", "X={{keygent:svc/key}} ./bin/tool hi"],
+    );
+    s.expect(WAITING);
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tool)
+        .unwrap();
+    f.write_all(b"\0").unwrap();
+    drop(f);
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 77, "{err}");
+    assert!(out.is_empty());
+    assert!(err.ends_with("keygent: a program or script changed after approval — re-run to request approval again\n"), "{err}");
+}
+
+#[test]
+fn run_limits_and_containment() {
+    let (root, _c, proj) = run_setup();
+    // runtime cap: exit 74 with the canonical line; the backgrounded child dies with the session
+    let mut x = cmd(
+        &root,
+        &[
+            "run",
+            "--max-runtime",
+            "2s",
+            "--",
+            "sleep 30 & echo $!; sleep 30",
+        ],
+    );
+    x.current_dir(&proj);
+    let t = Instant::now();
+    let o = x.output().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(10));
+    let err = String::from_utf8(o.stderr).unwrap();
+    assert_eq!(o.status.code(), Some(74), "{err}");
+    assert_eq!(
+        err.trim(),
+        "keygent: run stopped at its limit (1 min / 10 MiB) — use --max-runtime or run_in_background"
+    );
+    let bg = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        wait_until(|| !alive(bg.trim())),
+        "background child {bg} survived"
+    );
+    // output cap
+    let mut x = cmd(&root, &["run", "--", "head -c 11000000 /dev/zero"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(74));
+    assert!(o.stdout.len() <= 10 * 1024 * 1024);
+    // a killed client kills its run
+    let mut s = run_in(&root, &proj, &["run", "--", "echo $$; sleep 30"]);
+    let pid = loop {
+        let o = s.out.lock().unwrap().clone();
+        if o.ends_with(b"\n") {
+            break String::from_utf8(o).unwrap().trim().to_owned();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(alive(&pid));
+    s.child.kill().unwrap();
+    let _ = s.finish();
+    assert!(wait_until(|| !alive(&pid)), "run survived its client");
+    // an interrupt is forwarded: sh dies of SIGINT → 130
+    let s = run_in(&root, &proj, &["run", "--", "echo ready; sleep 30"]);
+    while !s.out.lock().unwrap().ends_with(b"ready\n") {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Command::new("kill")
+        .args(["-INT", &s.child.id().to_string()])
+        .status()
+        .unwrap();
+    let (code, _, _) = s.finish();
+    assert_eq!(code, 130);
 }

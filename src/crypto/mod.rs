@@ -333,7 +333,6 @@ pub fn proof_broker(k_broker: &Subkey, nc: &[u8], nb: &[u8]) -> Result<[u8; 32]>
 }
 
 /// Client auth proof (ADR 0004), used by `Approve` (M3): `HMAC(K_auth, enc("kg/v1/client") ‖ enc(nb) ‖ enc(nc) ‖ enc(H(request)))`.
-#[allow(dead_code)]
 pub fn proof_client(k_auth: &Subkey, nb: &[u8], nc: &[u8], request: &[u8]) -> Result<[u8; 32]> {
     hmac(k_auth, &enc(&[b"kg/v1/client", nb, nc, &sha256(request)])?)
 }

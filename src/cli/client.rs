@@ -66,9 +66,29 @@ fn verify_peer(s: &UnixStream, run: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A broker-relayed line must look like one of ours: `keygent:` prefix, ≤ 120 chars, no control characters.
+fn relayed(exit: u8, m: String) -> Error {
+    if m.starts_with("keygent: ") && m.chars().count() <= 120 && !m.chars().any(char::is_control) {
+        Error::Remote(exit, m)
+    } else {
+        Error::BrokerUnverified
+    }
+}
+
 pub fn err_from(f: &Frame) -> Error {
+    use crate::error::exit;
     match ErrMsg::decode(&f.payload) {
         Ok(e) => match e.code {
+            code::APPROVAL_DENIED => relayed(exit::APPROVAL, e.message),
+            code::POLICY_DENIED => relayed(exit::POLICY, e.message),
+            code::RUN_LIMIT => relayed(exit::RUN_LIMIT, e.message),
+            code::BAD_REQUEST
+                if e.message.starts_with("keygent: usage")
+                    || e.message.starts_with("keygent: can't parse")
+                    || e.message.starts_with("keygent: --remember") =>
+            {
+                relayed(exit::USAGE, e.message)
+            }
             code::SEALED => Error::Sealed,
             code::VERSION_MISMATCH => Error::VersionMismatch,
             code::RATE_LIMITED => Error::RateLimited,
@@ -140,6 +160,25 @@ impl Conn {
         } else {
             Err(Error::BrokerUnverified)
         }
+    }
+
+    /// Runs and approval waits can be quiet for a long time: no read timeout.
+    pub fn no_read_timeout(&self) -> Result<()> {
+        self.s.set_read_timeout(None)?;
+        Ok(())
+    }
+
+    pub fn try_clone_stream(&self) -> Result<UnixStream> {
+        Ok(self.s.try_clone()?)
+    }
+
+    /// Send one frame without reading a reply (`Run` streams its replies).
+    pub fn send(&mut self, t: u8, payload: &[u8]) -> Result<()> {
+        frame::write(&mut self.s, t, payload).map_err(|_| Error::Broker(0))
+    }
+
+    pub fn recv(&mut self) -> Result<Frame> {
+        frame::read(&mut self.s).map_err(|_| Error::Broker(0))
     }
 
     /// Send one request and read one reply frame; `Err` frames become errors.
