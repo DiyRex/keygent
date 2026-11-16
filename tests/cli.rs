@@ -45,7 +45,10 @@ fn canary() -> String {
 struct Root(PathBuf);
 impl Root {
     fn new() -> Root {
-        let p = std::env::temp_dir().join(format!("kg-cli-{:016x}", rand_u64()));
+        Self::under(&std::env::temp_dir())
+    }
+    fn under(dir: &Path) -> Root {
+        let p = dir.join(format!("kg-cli-{:016x}", rand_u64()));
         std::fs::create_dir_all(&p).unwrap();
         Root(p)
     }
@@ -672,4 +675,54 @@ fn version_and_status() {
     assert!(out.starts_with("keygent 0.0.0 ("));
     let (_, out, _) = run(&root, &["status"], &[]);
     assert_eq!(out.trim(), "keygent: no vault — run 'keygent init'");
+}
+
+/// Disk full (SPEC §5.2): the vault stays intact and the user gets the canonical line. Runs only when
+/// `KEYGENT_TEST_SMALLFS` names a small dedicated filesystem (the Linux container task mounts a 2 MiB tmpfs).
+#[test]
+fn disk_full_leaves_vault_intact() {
+    let Some(fs) = std::env::var_os("KEYGENT_TEST_SMALLFS") else {
+        eprintln!("disk_full_leaves_vault_intact: skipped (set KEYGENT_TEST_SMALLFS)");
+        return;
+    };
+    let root = Root::under(Path::new(&fs));
+    init(&root);
+    assert_eq!(add(&root, "a/one", &canary()).0, 0);
+    let value_file = root.0.join("big.txt");
+    let big: String = (0..2000).map(|_| canary()).collect::<Vec<_>>().join("")[..60_000].to_owned();
+    std::fs::write(&value_file, &big).unwrap();
+    let before = std::fs::read(root.data().join("vault.kgt")).unwrap();
+    // fill the filesystem completely
+    let mut filler = std::fs::File::create(root.0.join("filler")).unwrap();
+    let chunk = vec![0u8; 64 * 1024];
+    loop {
+        if filler.write_all(&chunk).is_err() {
+            break;
+        }
+    }
+    let mut small = vec![0u8; 4096];
+    while filler.write_all(&small[..1]).is_ok() {}
+    small.clear();
+    let (code, _, err) = run(
+        &root,
+        &["add", "a/big", "--from-file", value_file.to_str().unwrap()],
+        &[PASS],
+    );
+    assert_eq!(
+        (code, err.lines().last().unwrap()),
+        (1, "keygent: disk full — vault unchanged")
+    );
+    assert_eq!(
+        std::fs::read(root.data().join("vault.kgt")).unwrap(),
+        before
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(root.data())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left behind");
+    drop(filler);
+    std::fs::remove_file(root.0.join("filler")).unwrap();
+    assert_eq!(run(&root, &["verify"], &[PASS]).0, 0);
 }

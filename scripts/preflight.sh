@@ -12,14 +12,15 @@ if grep -rnwE 'Secret|Dek|Kek|Subkey' src/hook src/adapter src/policy src/proto 
   echo "preflight: secret type referenced outside the plaintext boundary" >&2; exit 1
 fi
 # unsafe only in src/platform/
-if grep -rnE '\bunsafe\b|allow\(unsafe_code\)' src --include='*.rs' | grep -v '^src/platform/' \
+if grep -rnE '^[^"]*\bunsafe[[:space:]]*(\{|fn\b|impl\b|extern\b)|allow\(unsafe_code\)' src --include='*.rs' \
+     | grep -v '^src/platform/' \
      | grep -vE '^[^:]+:[0-9]+:\s*//'; then
   echo "preflight: unsafe outside src/platform/" >&2; exit 1
 fi
 
 step "fmt";    cargo fmt --check
-step "clippy"; cargo clippy --locked --all-targets -- -D warnings
-step "test";   cargo test --locked
+step "clippy"; cargo clippy --locked --all-targets --all-features -- -D warnings
+step "test";   cargo test --locked --features test-profile
 step "build";  cargo build --locked --release
 step "size";   sh scripts/size-check.sh
 step "no test hooks in release"

@@ -11,9 +11,11 @@ vars:
   BIN: target/release/keygent
   # Linux checks run in a throwaway container; the repo is mounted read-only, target dir lives in a volume.
   LINUX_IMAGE: rust:1-bookworm
+  # A 2 MiB tmpfs lets the disk-full test fill a filesystem safely.
   LINUX_RUN: >-
     docker run --rm -v "{{.ROOT_DIR}}:/src:ro" -v keygent-linux-target:/target
     -v keygent-cargo-registry:/usr/local/cargo/registry
+    --tmpfs /smallfs:rw,size=2m,mode=1777 -e KEYGENT_TEST_SMALLFS=/smallfs
     -e CARGO_TARGET_DIR=/target -w /src {{.LINUX_IMAGE}}
 
 tasks:
@@ -35,7 +37,7 @@ tasks:
 
   test:
     desc: Run the test suite
-    cmds: ["{{.RUST}} cargo test --locked"]
+    cmds: ["{{.RUST}} cargo test --locked --features test-profile"]
 
   build:
     desc: Debug build
@@ -68,7 +70,8 @@ tasks:
     cmds:
       - >-
         {{.LINUX_RUN}} sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
-        cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
+        cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings
+        && cargo test --locked --features test-profile'
 
   linux:shell:
     desc: Interactive shell in the Linux dev container
