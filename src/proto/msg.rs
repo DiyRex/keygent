@@ -44,6 +44,8 @@ pub mod code {
     pub const NEEDS_AUTH: u16 = 9;
     pub const BAD_REQUEST: u16 = 10;
     pub const RUN_LIMIT: u16 = 11;
+    /// The audit log couldn't be written or failed verification; the message is the canonical line (exit 79).
+    pub const AUDIT: u16 = 12;
 }
 
 fn enc() -> Encoder {

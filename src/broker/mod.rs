@@ -104,6 +104,51 @@ pub struct State {
 }
 
 impl State {
+    /// Append one audit record (SPEC §9). Errors are fail-closed for the caller.
+    pub fn audit(&self, dirs: &platform::Dirs, r: &crate::vault::audit::Record<'_>) -> Result<()> {
+        let k = self.vault.audit_key()?;
+        crate::vault::audit::append(dirs, &k, r).map(|_| ())
+    }
+
+    /// The audit record of a grant (command template redacted, pins and scripts by hash).
+    pub fn grant_record<'a>(
+        &self,
+        g: &grant::Grant,
+        event: &'a str,
+        decision: &'a str,
+    ) -> crate::vault::audit::Record<'a> {
+        let mut r = crate::vault::audit::Record::new(event);
+        r.handles = g.handles.clone();
+        r.decision = Some(decision);
+        r.cmd = Some(
+            String::from_utf8_lossy(&self.redactor.redact_all(g.command.as_bytes()).0).into_owned(),
+        );
+        r.grant_key = Some(g.key);
+        r.exes = g
+            .programs
+            .iter()
+            .filter_map(|p| match p {
+                crate::policy::resolve::Program::File { path, sha256 } => {
+                    Some((path.display().to_string(), *sha256))
+                }
+                _ => None,
+            })
+            .collect();
+        r.scripts = g
+            .scripts
+            .iter()
+            .map(|s| {
+                (
+                    s.path.display().to_string(),
+                    s.sha256,
+                    u64::try_from(s.content.len()).unwrap_or(u64::MAX),
+                )
+            })
+            .collect();
+        r.cwd = Some(g.cwd.display().to_string());
+        r
+    }
+
     /// Register current + previous values of every handle, then (re)build the redactor. Any failure → caller seals.
     pub fn refresh_redactor(&mut self) -> std::result::Result<(), &'static str> {
         for r in &self.vault.index.handles {
@@ -173,6 +218,12 @@ impl Shared {
         }
         // never block here: a caller may (wrongly) still hold the lock; exiting frees everything regardless
         if let Ok(mut g) = self.state.try_lock() {
+            if let Some(st) = g.as_ref() {
+                // best effort: sealing never waits on, or is blocked by, the audit log
+                let mut r = crate::vault::audit::Record::new("seal");
+                r.decision = Some(reason);
+                let _ = st.audit(&self.dirs, &r);
+            }
             drop(g.take());
         }
         std::process::exit(0)
@@ -296,6 +347,15 @@ pub fn main() -> ExitCode {
     // SPEC §5.8: unseal refuses a vault whose secrets exceed the redactor cap
     if let Err(reason) = state.refresh_redactor() {
         log.event(Level::Error, reason, None);
+        let _ = std::fs::remove_file(&endpoint.sock);
+        return ExitCode::from(1);
+    }
+    // fail closed: no session starts without a writable audit log
+    if state
+        .audit(&dirs, &crate::vault::audit::Record::new("unseal"))
+        .is_err()
+    {
+        log.event(Level::Error, "refuse_start_audit", None);
         let _ = std::fs::remove_file(&endpoint.sock);
         return ExitCode::from(1);
     }

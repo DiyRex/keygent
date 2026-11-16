@@ -26,7 +26,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -75,6 +75,8 @@ pub struct Job {
     pub programs: Vec<Program>,
     pub max_runtime: Duration,
     pub redactor: Arc<Redactor>,
+    /// `K_audit` and the run's end record (exit, redaction count and duration are filled in at the end).
+    pub audit: (crate::crypto::Subkey, crate::vault::audit::Record<'static>),
 }
 
 /// One private binding; removed (macOS) or closed (Linux) on drop.
@@ -213,6 +215,7 @@ const STOP_GONE: u8 = 2;
 struct Flags {
     done: AtomicBool,
     stop: AtomicU8,
+    hits: AtomicU64,
 }
 
 impl Flags {
@@ -255,6 +258,7 @@ fn pump(
     }
     out.clear();
     st.finish(&mut out);
+    flags.hits.fetch_add(st.hits, Ordering::SeqCst);
     if flags.stop.load(Ordering::SeqCst) == STOP_NONE {
         let _ = send_data(w, t, &out);
     }
@@ -335,7 +339,9 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     let flags = Arc::new(Flags {
         done: AtomicBool::new(false),
         stop: AtomicU8::new(STOP_NONE),
+        hits: AtomicU64::new(0),
     });
+    let started = std::time::Instant::now();
     let _ = s.set_read_timeout(None);
     let writer = match s.try_clone() {
         Ok(w) => Arc::new(Mutex::new(w)),
@@ -438,7 +444,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         r.retain(|&p| p != sid);
     }
     drop(bindings);
-    let code = match status {
+    let code: i32 = match status {
         Ok(st) => {
             use std::os::unix::process::ExitStatusExt;
             st.code()
@@ -447,6 +453,20 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         }
         Err(_) => 1,
     };
+    let (key, mut end) = job.audit;
+    end.exit = Some(code);
+    end.redactions = Some(flags.hits.load(Ordering::SeqCst));
+    end.dur_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    end.decision = Some(match flags.stop.load(Ordering::SeqCst) {
+        STOP_LIMIT => "limit",
+        STOP_GONE => "client_gone",
+        _ => "end",
+    });
+    // the run already happened; a failed end record is logged, not hidden
+    if crate::vault::audit::append(&shared.dirs, &key, &end).is_err() {
+        shared.log.event(Level::Error, "audit_append_failed", None);
+    }
+    drop(key);
     match flags.stop.load(Ordering::SeqCst) {
         STOP_LIMIT => {
             shared.log.event(Level::Info, "run_limit", None);

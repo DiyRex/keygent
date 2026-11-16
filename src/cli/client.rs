@@ -82,6 +82,7 @@ pub fn err_from(f: &Frame) -> Error {
             code::APPROVAL_DENIED => relayed(exit::APPROVAL, e.message),
             code::POLICY_DENIED => relayed(exit::POLICY, e.message),
             code::RUN_LIMIT => relayed(exit::RUN_LIMIT, e.message),
+            code::AUDIT => relayed(exit::BROKER, e.message),
             code::BAD_REQUEST
                 if e.message.starts_with("keygent: usage")
                     || e.message.starts_with("keygent: can't parse")

@@ -10,6 +10,7 @@
 //! - The header MAC is verified on every open; any failure fails closed with `Damaged`.
 //! - Values stay in `Secret`s; nothing here logs or formats them.
 
+pub mod audit;
 pub mod format;
 pub mod index;
 pub mod keystore;
@@ -387,6 +388,11 @@ impl Vault {
     pub fn auth_proof(&self, nb: &[u8], nc: &[u8], request: &[u8]) -> Result<[u8; 32]> {
         let ka = crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::AUTH)?;
         crypto::proof_client(&ka, nb, nc, request)
+    }
+
+    /// `K_audit` for the audit chain (SPEC §9).
+    pub fn audit_key(&self) -> Result<crypto::Subkey> {
+        crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::AUDIT)
     }
 
     /// A copy of the DEK for reopening (the broker's reload). Lives in the locked arena when active.

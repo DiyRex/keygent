@@ -61,6 +61,8 @@ pub struct Script {
 pub struct Grant {
     pub id: [u8; 16],
     pub key: [u8; 32],
+    /// The command as requested (placeholders, never values): shown, hashed and audited.
+    pub command: String,
     pub rewritten: String,
     pub cwd: PathBuf,
     pub handles: Vec<String>,
@@ -370,6 +372,7 @@ pub fn build(
     Ok(Grant {
         id: crypto::random()?,
         key,
+        command: req.command.to_owned(),
         rewritten: rw.cmd,
         cwd,
         handles,

@@ -41,6 +41,8 @@ pub mod ty {
     pub const REDACTED: u8 = 53;
     pub const CHECK: u8 = 54;
     pub const CHECK_REPLY: u8 = 55;
+    pub const AUDIT_VERIFY: u8 = 56;
+    pub const AUDIT_OK: u8 = 57;
 }
 
 #[derive(Debug, PartialEq, Eq)]

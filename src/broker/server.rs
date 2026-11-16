@@ -84,6 +84,7 @@ pub fn send_error(s: &mut UnixStream, e: &Error) {
         Error::RateLimited => code::RATE_LIMITED,
         Error::TooLarge(_) => code::TOO_LARGE,
         Error::Sealed => code::SEALED,
+        Error::AuditUnwritable | Error::AuditBroken(_) => code::AUDIT,
         _ => match e.exit_code() {
             crate::error::exit::APPROVAL => code::APPROVAL_DENIED,
             crate::error::exit::POLICY => code::POLICY_DENIED,
@@ -174,6 +175,7 @@ fn handle(shared: &Shared, mut s: UnixStream) {
         ty::PENDING if msg::expect_empty(&req.payload).is_ok() => pending(shared, &mut s),
         ty::APPROVE => approve(shared, &mut s, &req.payload, &nb, &hello.nonce),
         ty::DENY => deny(shared, &mut s, &req.payload),
+        ty::AUDIT_VERIFY if msg::expect_empty(&req.payload).is_ok() => audit_verify(shared, &mut s),
         ty::RUN => run_grant(shared, s, &req.payload),
         ty::STATUS if msg::expect_empty(&req.payload).is_ok() => status(shared, &mut s),
         ty::LIST if msg::expect_empty(&req.payload).is_ok() => list(shared, &mut s),
@@ -356,6 +358,12 @@ fn grant_create(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
         Err(e) => return send_error(s, &e),
     };
     let r = with_state(shared, |st| {
+        let decision = if g.state == GState::Approved {
+            "auto"
+        } else {
+            "pending"
+        };
+        st.audit(&shared.dirs, &st.grant_record(&g, "grant", decision))?;
         let id = grant::insert(&mut st.grants, g)?;
         let state = grant::find(&mut st.grants, &id).map_or(gstate::EXPIRED, |x| wire_state(x));
         Ok::<_, Error>((id, state))
@@ -475,6 +483,9 @@ fn approve(shared: &Shared, s: &mut UnixStream, payload: &[u8], nb: &[u8], nc: &
     };
     if !expected.is_ok_and(|e| crypto::verify_proof(&e, &a.proof)) {
         shared.log.event(Level::Warn, "auth_failed", None);
+        let _ = with_state(shared, |st| {
+            st.audit(&shared.dirs, &crate::vault::audit::Record::new("auth_fail"))
+        });
         if auth_failure() {
             std::thread::sleep(std::time::Duration::from_secs(1));
             send_err(
@@ -488,15 +499,24 @@ fn approve(shared: &Shared, s: &mut UnixStream, payload: &[u8], nb: &[u8], nc: &
         return;
     }
     let r = with_state(shared, |st| {
-        let g = grant::find(&mut st.grants, &a.id)
-            .filter(|g| g.state == GState::Pending && !g.created.expired())
+        let pos = st
+            .grants
+            .iter()
+            .position(|g| {
+                crypto::ct_eq(&g.id, &a.id) && g.state == GState::Pending && !g.created.expired()
+            })
             .ok_or(Error::Policy(PolicyMsg::QueueTimeout))?;
+        let g = st.grants.get(pos).ok_or(Error::Internal(144))?;
         if !crypto::ct_eq(&g.key, &a.key) {
             return Err(Error::Policy(PolicyMsg::Changed));
         }
         if a.remember && g.unbound {
             return Err(Error::Policy(PolicyMsg::NoRemember));
         }
+        let mut rec = st.grant_record(g, "approve", "approved");
+        rec.channel = Some("terminal");
+        st.audit(&shared.dirs, &rec)?;
+        let g = st.grants.get_mut(pos).ok_or(Error::Internal(144))?;
         g.state = GState::Approved;
         // the approved grant waits for its run for at most another queue lifetime
         g.created = super::clock::Deadline::after(grant::QUEUE_LIFE);
@@ -520,10 +540,18 @@ fn deny(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
     };
     let n = with_state(shared, |st| {
         let mut n = 0u64;
+        let mut records = Vec::new();
         for g in st.grants.iter_mut().filter(|g| g.state == GState::Pending) {
             if target.is_none_or(|id| crypto::ct_eq(&g.id, &id)) {
                 g.state = GState::Denied;
                 n = n.saturating_add(1);
+                records.push(g.id);
+            }
+        }
+        // denial only removes capability, so a failed audit append doesn't undo it
+        for id in records {
+            if let Some(g) = st.grants.iter().find(|g| g.id == id) {
+                let _ = st.audit(&shared.dirs, &st.grant_record(g, "deny", "denied"));
             }
         }
         n
@@ -532,6 +560,29 @@ fn deny(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
         shared.decided.notify_all();
         shared.log.event(Level::Info, "grant_denied", Some(n));
         let _ = frame::write(s, ty::OK, &[]);
+    }
+}
+
+/// `AuditVerify`: check the whole chain, the anchor file and the index anchor with `K_audit` (SPEC §9).
+fn audit_verify(shared: &Shared, s: &mut UnixStream) {
+    let Some(r) = with_state(shared, |st| {
+        let key = st.vault.audit_key()?;
+        let anchor = st.vault.index.audit_anchor.as_ref().map(|a| (a.seq, a.mac));
+        crate::vault::audit::verify(&shared.dirs, &key, anchor).map_err(Error::AuditBroken)
+    }) else {
+        return;
+    };
+    match r.and_then(|n| {
+        msg::encode_u32(
+            crate::proto::tags::proto::COUNT,
+            u32::try_from(n).unwrap_or(u32::MAX),
+        )
+        .map_err(|_| Error::Internal(145))
+    }) {
+        Ok(p) => {
+            let _ = frame::write(s, ty::AUDIT_OK, &p);
+        }
+        Err(e) => send_error(s, &e),
     }
 }
 
@@ -544,20 +595,45 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
         return send_error(&mut s, &Error::RateLimited);
     };
     let job = with_state(shared, |st| {
-        let g = grant::find(&mut st.grants, &id).ok_or(Error::Policy(PolicyMsg::QueueTimeout))?;
+        let pos = st
+            .grants
+            .iter()
+            .position(|g| crypto::ct_eq(&g.id, &id))
+            .ok_or(Error::Policy(PolicyMsg::QueueTimeout))?;
+        let g = st.grants.get(pos).ok_or(Error::Internal(144))?;
         if g.created.expired() {
             return Err(Error::Policy(PolicyMsg::QueueTimeout));
         }
         if g.state != GState::Approved {
             return Err(Error::Policy(PolicyMsg::Denied(first_handle(g))));
         }
-        g.state = GState::Consumed;
-        let (bindings, handles) = (g.bindings.clone(), g.handles.clone());
+        // policy may have changed since approval (a handle denied or removed): re-check at use
+        for h in &g.handles {
+            match st.vault.index.get(h) {
+                Some(r) if r.mode != Mode::Deny => {}
+                _ => return Err(Error::Policy(PolicyMsg::NotAllowed(h.clone()))),
+            }
+        }
+        let mut env_secrets = Vec::new();
+        let mut file_secrets = Vec::new();
+        for b in &g.bindings {
+            let v = st
+                .vault
+                .read_entry(&b.handle)
+                .map_err(|_| Error::Internal(143))?;
+            if b.file {
+                file_secrets.push((b.var.clone(), v));
+            } else {
+                env_secrets.push((b.var.clone(), v));
+            }
+        }
+        // fail closed: no audit record, no run (SPEC §5.7 step 7)
+        st.audit(&shared.dirs, &st.grant_record(g, "run", "start"))?;
         let job = run::Job {
             command: g.rewritten.clone(),
             cwd: g.cwd.clone(),
-            env_secrets: Vec::new(),
-            file_secrets: Vec::new(),
+            env_secrets,
+            file_secrets,
             scripts: g
                 .scripts
                 .iter()
@@ -566,25 +642,10 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             programs: g.programs.clone(),
             max_runtime: g.max_runtime,
             redactor: st.redactor.clone(),
+            audit: (st.vault.audit_key()?, st.grant_record(g, "run", "end")),
         };
-        // policy may have changed since approval (a handle denied or removed): re-check at use
-        for h in &handles {
-            match st.vault.index.get(h) {
-                Some(r) if r.mode != Mode::Deny => {}
-                _ => return Err(Error::Policy(PolicyMsg::NotAllowed(h.clone()))),
-            }
-        }
-        let mut job = job;
-        for b in &bindings {
-            let v = st
-                .vault
-                .read_entry(&b.handle)
-                .map_err(|_| Error::Internal(143))?;
-            if b.file {
-                job.file_secrets.push((b.var.clone(), v));
-            } else {
-                job.env_secrets.push((b.var.clone(), v));
-            }
+        if let Some(g) = st.grants.get_mut(pos) {
+            g.state = GState::Consumed;
         }
         Ok(job)
     });

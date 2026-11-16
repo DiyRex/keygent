@@ -77,6 +77,10 @@ pub enum Error {
     Remote(u8, String),
     NoPending,
     AmbiguousPending,
+    /// An audit append failed: fail closed (SPEC §5.7 step 7, §9).
+    AuditUnwritable,
+    /// `audit --verify` found a broken chain at this record (0 = anchor/truncation).
+    AuditBroken(u64),
     /// The child's own exit code, passed through silently (`run`). Never displayed.
     Exit(u8),
     /// I/O or OS failure. The code is an `std::io::ErrorKind`-derived number, never a path or value.
@@ -102,6 +106,8 @@ impl Error {
             | Error::BrokerUnverified
             | Error::VersionMismatch
             | Error::RateLimited
+            | Error::AuditUnwritable
+            | Error::AuditBroken(_)
             | Error::Broker(_) => exit::BROKER,
             _ => exit::HUMAN,
         }
@@ -176,6 +182,11 @@ impl fmt::Display for Error {
             },
             Error::Remote(_, m) => f.write_str(m),
             Error::NoPending => f.write_str("keygent: no pending requests"),
+            Error::AuditUnwritable => f.write_str("keygent: audit log unwritable — run 'keygent doctor'"),
+            Error::AuditBroken(0) => {
+                f.write_str("keygent: audit log truncated or its anchor doesn't match — run 'keygent doctor'")
+            }
+            Error::AuditBroken(n) => write!(f, "keygent: audit log tampered at record {n} — run 'keygent doctor'"),
             Error::AmbiguousPending => {
                 f.write_str("keygent: several requests pending — pass an id from 'keygent pending'")
             }
@@ -269,6 +280,9 @@ mod tests {
             Error::Policy(PolicyMsg::NoRemember),
             Error::NoPending,
             Error::AmbiguousPending,
+            Error::AuditUnwritable,
+            Error::AuditBroken(0),
+            Error::AuditBroken(u64::MAX),
             Error::Io(28),
             Error::Internal(1),
         ];

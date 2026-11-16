@@ -168,6 +168,47 @@ pub fn status(a: Args) -> Result<()> {
 }
 
 /// Agent-safe listing: handles and metadata only (SPEC §5.1). Sealed → exit 78.
+/// `audit [--since 1h] [--verify]` (agent-safe): print records (they hold templates, never values) or verify the
+/// chain through the broker, which holds `K_audit`.
+pub fn audit(a: Args) -> Result<()> {
+    if !a.pos.is_empty() {
+        return Err(Error::Usage("keygent audit [--since 1h] [--verify]"));
+    }
+    let d = platform::dirs()?;
+    if a.has("--verify") {
+        let mut c = client::connect(&d, Class::Run)?;
+        let f = c.request(ty::AUDIT_VERIFY, &[])?;
+        if f.ty != ty::AUDIT_OK {
+            return Err(Error::BrokerUnverified);
+        }
+        let n = msg::decode_u32(&f.payload, crate::proto::tags::proto::COUNT)
+            .map_err(|_| Error::BrokerUnverified)?;
+        say_err(&format!("keygent: audit log intact ({n} records)"));
+        return Ok(());
+    }
+    let since = match a.value("--since") {
+        Some(v) => Some(parse_duration(v).ok_or(Error::Usage("--since: e.g. 30m, 2h, 24h"))?),
+        None => None,
+    };
+    let cutoff = since.map(|s| vault::audit::rfc3339(vault::now().saturating_sub(s.as_secs())));
+    let text = match std::fs::read_to_string(vault::audit::log_path(&d)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = std::io::stdout().lock();
+    for line in text.lines() {
+        let ts = line
+            .split_once("\"ts\":\"")
+            .and_then(|(_, r)| r.get(..20))
+            .unwrap_or_default();
+        if cutoff.as_deref().is_none_or(|c| ts >= c) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    Ok(())
+}
+
 pub fn ls(a: Args) -> Result<()> {
     if !a.pos.is_empty() {
         return Err(Error::Usage("keygent ls"));

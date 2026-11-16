@@ -270,7 +270,7 @@ pub fn spawn_broker(exe: &Path) -> Result<Child> {
 pub fn open_private_rw(path: &Path, append: bool) -> Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = std::fs::OpenOptions::new()
-        .read(!append)
+        .read(true)
         .write(!append)
         .append(append)
         .create(true)

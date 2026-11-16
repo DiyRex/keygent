@@ -22,6 +22,7 @@ keygent — let AI coding agents use secrets without seeing them
 Session:  unseal [--ttl 8h] · seal · status · ls
 Run:      run [--max-runtime 30m] -- '<command with {{keygent:<handle>}}>' · run --grant <id>
 Approve:  pending · approve [<id>] [--remember] · deny [<id> | --all]
+Audit:    audit [--since 1h] [--verify]
 Vault:    init [--own-passphrase] · passwd [--own-passphrase] · rekey · recover [--own-passphrase]
           verify · backup <file> · restore <file> [--new-machine] [--own-passphrase] · status
 Secrets:  add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]
@@ -123,6 +124,12 @@ fn run(argv: &[String]) -> Result<()> {
                 ("--dialect", true),
             ],
             "keygent run [--max-runtime 30m] -- '<command>' | run --grant <id>",
+        )?),
+        #[cfg(unix)]
+        "audit" => session::audit(Args::parse(
+            &rest,
+            &[("--since", true), ("--verify", false)],
+            "keygent audit [--since 1h] [--verify]",
         )?),
         #[cfg(unix)]
         "pending" => grants::pending(Args::parse(&rest, &[], "keygent pending")?),

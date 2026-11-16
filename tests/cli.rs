@@ -1269,3 +1269,60 @@ fn run_limits_and_containment() {
     let (code, _, _) = s.finish();
     assert_eq!(code, 130);
 }
+
+// ---------------------------------------------------------------- audit chain (Phase 2 M4)
+
+#[test]
+fn audit_chain_records_verifies_and_fails_closed() {
+    let (root, c, proj) = run_setup();
+    let mut x = cmd(&root, &["run", "--", "echo hi"]);
+    x.current_dir(&proj);
+    assert!(x.output().unwrap().status.success());
+    let (code, out, _) = run(&root, &["audit"], &[]);
+    assert_eq!(code, 0);
+    for ev in [
+        "\"event\":\"add\"",
+        "\"event\":\"unseal\"",
+        "\"event\":\"grant\"",
+        "\"decision\":\"start\"",
+        "\"exit\":0",
+    ] {
+        assert!(out.contains(ev), "missing {ev}: {out}");
+    }
+    assert!(!out.contains(&c));
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.starts_with("keygent: audit log intact ("), "{err}");
+    // an edited record is detected
+    let log = root.0.join("state/audit.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::write(
+        &log,
+        text.replacen("\"event\":\"add\"", "\"event\":\"rm\"", 1),
+    )
+    .unwrap();
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            79,
+            "keygent: audit log tampered at record 1 — run 'keygent doctor'"
+        )
+    );
+    // an unwritable log refuses runs and value changes (fail closed)
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    let mut x = cmd(&root, &["run", "--", "echo hi"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(79));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap().trim(),
+        "keygent: audit log unwritable — run 'keygent doctor'"
+    );
+    assert!(o.stdout.is_empty());
+    let (code, _, err) = add(&root, "new/one", &canary());
+    assert_eq!(code, 79, "{err}");
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(!out.contains("new/one"));
+}
