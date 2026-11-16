@@ -78,6 +78,8 @@ pub struct Grant {
     pub direct: Option<Vec<String>>,
     /// Run with an empty temp HOME and XDG dirs (rule `home = "scratch"`).
     pub scratch: bool,
+    /// `capture`: stdout is stored as this new handle, never returned.
+    pub capture: Option<String>,
     pub id: [u8; 16],
     pub key: [u8; 32],
     /// The command as requested (placeholders, never values): shown, hashed and audited.
@@ -100,6 +102,8 @@ pub struct Request<'a> {
     pub command: &'a str,
     pub cwd: &'a str,
     pub max_runtime: Option<Duration>,
+    /// `capture <handle>`: the new handle stdout will be stored as (part of the grant key, shown in the approval).
+    pub capture: Option<&'a str>,
 }
 
 /// Whole minutes, rounded up (display and the limit message).
@@ -223,6 +227,9 @@ pub fn build(
     path_var: &str,
     home: Option<&Path>,
 ) -> Result<Grant> {
+    if let Some(h) = req.capture {
+        crate::vault::names::check_handle(h)?;
+    }
     let parsed = tokenize::parse(req.command).map_err(|e| tok_err(&e))?;
     // handles must exist and not be denied
     let mut handles: Vec<String> = Vec::new();
@@ -257,7 +264,7 @@ pub fn build(
     }
     if let Some(argv) = allow::eligible(&parsed)
         && let Some(g) = allow_grant(
-            req.command,
+            req,
             &argv,
             snap,
             &cwd,
@@ -367,7 +374,10 @@ pub fn build(
         &programs,
         &scripts,
         max_runtime,
+        req.capture,
     )?;
+    let mut notes = manifest_note;
+    notes.extend(capture_note(req.capture));
     let env: Vec<(String, String)> = bindings
         .iter()
         .map(|b| (b.handle.clone(), b.var.clone()))
@@ -410,11 +420,12 @@ pub fn build(
         unbound: true,
         argv_exposed,
         max_runtime_min: minutes(max_runtime),
-        notes: &manifest_note,
+        notes: &notes,
     });
     Ok(Grant {
         direct: None,
         scratch: false,
+        capture: req.capture.map(str::to_owned),
         id: crypto::random()?,
         key,
         command: req.command.to_owned(),
@@ -508,8 +519,14 @@ fn hex8(h: &[u8; 32]) -> String {
 /// Allow-rule path (SPEC §5.7 step 4, §6.2): handles in `allow` mode whose rule matches the pinned program and argv.
 /// A matching pin pre-approves the grant (bound, no shell); a changed binary falls back to approval with a re-pin
 /// warning (the binary is never executed to describe it). `None` = no rule matched.
+fn capture_note(capture: Option<&str>) -> Option<String> {
+    capture.map(|h| {
+        format!("⚠ capture: stdout (trimmed) is stored as the new secret {h} and not shown")
+    })
+}
+
 fn allow_grant(
-    command: &str,
+    req: &Request<'_>,
     argv: &[String],
     snap: &[HandlePolicy],
     cwd: &Path,
@@ -562,7 +579,16 @@ fn allow_grant(
         path: path.clone(),
         sha256,
     }];
-    let key = grant_key(command, cwd, &handles, &programs, &[], max_runtime)?;
+    let command = req.command;
+    let key = grant_key(
+        command,
+        cwd,
+        &handles,
+        &programs,
+        &[],
+        max_runtime,
+        req.capture,
+    )?;
     let mut notes = vec![format!(
         "allow rule matched — runs {exe} directly, without a shell"
     )];
@@ -581,6 +607,7 @@ fn allow_grant(
     if scratch {
         notes.push("home: scratch (empty temp HOME and XDG dirs)".into());
     }
+    notes.extend(capture_note(req.capture));
     let env: Vec<(String, String)> = bindings
         .iter()
         .map(|b| (b.handle.clone(), b.var.clone()))
@@ -606,6 +633,7 @@ fn allow_grant(
     Ok(Some(Grant {
         direct: Some(argv.to_vec()),
         scratch,
+        capture: req.capture.map(str::to_owned),
         id: crypto::random()?,
         key,
         command: command.to_owned(),
@@ -634,6 +662,7 @@ pub fn grant_key(
     programs: &[Program],
     scripts: &[Script],
     max_runtime: Duration,
+    capture: Option<&str>,
 ) -> Result<[u8; 32]> {
     let mut fields: Vec<Vec<u8>> = vec![
         command.as_bytes().to_vec(),
@@ -662,6 +691,7 @@ pub fn grant_key(
         );
     }
     fields.push(max_runtime.as_secs().to_le_bytes().to_vec());
+    fields.push(capture.map_or_else(Vec::new, |h| format!("capture:{h}").into_bytes()));
     let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
     Ok(crypto::sha256(&crypto::enc(&refs)?))
 }
@@ -753,6 +783,7 @@ mod tests {
             command: cmd,
             cwd,
             max_runtime: None,
+            capture: None,
         }
     }
 

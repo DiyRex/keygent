@@ -1527,3 +1527,96 @@ fn manifest_needs_trust_and_any_change_untrusts_it() {
     let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
     assert_eq!(code, 0, "{err}");
 }
+
+// ---------------------------------------------------------------- capture (Phase 2 M4)
+
+#[test]
+fn capture_stores_stdout_as_a_new_handle_without_showing_it() {
+    let (root, _c, proj) = run_setup();
+    let make = "v=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \\n'); echo \"  $v\"; echo \"token=$v\" >&2";
+    let go = |args: &[&str]| {
+        let mut x = cmd(&root, args);
+        x.current_dir(&proj);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stdout).unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let (code, out, err) = go(&["capture", "new/tok", "--", make]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.is_empty(), "stdout is never returned: {out}");
+    assert!(
+        err.contains("token=‹keygent:new/tok›"),
+        "stderr redacted with the new value: {err}"
+    );
+    assert!(
+        err.ends_with("keygent: stored new/tok (env KEYGENT_NEW_TOK, mode approve)\n"),
+        "{err}"
+    );
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(out.contains("new/tok  $KEYGENT_NEW_TOK  approve"), "{out}");
+    // the stored value is usable (and redacted) like any other
+    let mut s = run_in(
+        &root,
+        &proj,
+        &[
+            "run",
+            "--",
+            "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
+        ],
+    );
+    s.expect(WAITING);
+    approve(&root);
+    let (code, out, _) = s.finish();
+    assert_eq!((code, out.as_str()), (0, "‹keygent:new/tok›"));
+    // create-only: an existing handle needs the human's rotate
+    let (code, _, err) = go(&["capture", "svc/key", "--", make]);
+    assert_eq!(
+        (code, err.lines().last().unwrap()),
+        (
+            1,
+            "keygent: this needs your passphrase — run it in your own terminal"
+        )
+    );
+    // weak values and failed commands store nothing
+    let (code, _, _) = go(&["capture", "weak/one", "--", "echo short"]);
+    assert_eq!(code, 1);
+    let (code, _, _) = go(&[
+        "capture",
+        "fail/one",
+        "--",
+        "echo abcdefghijklmnopqrstuvwxyz0123456789; exit 3",
+    ]);
+    assert_eq!(code, 3);
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(
+        !out.contains("weak/one") && !out.contains("fail/one"),
+        "{out}"
+    );
+    // a capture whose command uses a secret needs approval, and the approval says where stdout goes
+    let mut s = run_in(
+        &root,
+        &proj,
+        &[
+            "capture",
+            "derived/one",
+            "--",
+            "X={{keygent:svc/key}} sh -c 'echo \"$X\"'",
+        ],
+    );
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("⚠ capture: stdout (trimmed) is stored as the new secret derived/one"),
+        "{out}"
+    );
+    assert_eq!(run(&root, &["deny"], &[]).0, 0);
+    assert_eq!(s.finish().0, 75);
+    let (code, out, _) = run(&root, &["audit"], &[]);
+    assert_eq!(code, 0);
+    assert!(out.contains("\"event\":\"capture\""), "{out}");
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+}

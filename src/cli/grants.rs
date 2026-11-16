@@ -39,7 +39,30 @@ fn parse_id(s: &str) -> Result<[u8; GRANT_ID_LEN]> {
 
 const WAITING: &str = "keygent: waiting for approval — ask the user to run 'keygent approve'";
 
+/// `capture <handle> -- '<command>'` (SPEC §5.9): like `run`, but the broker stores stdout (trimmed) as a new handle
+/// and never returns it. Agent-safe: it can only create.
+pub fn capture(a: Args) -> Result<()> {
+    let Some((h, cmd)) = a.pos.split_first() else {
+        return Err(Error::Usage("keygent capture <handle> -- '<command>'"));
+    };
+    crate::vault::names::check_handle(h)?;
+    if cmd.is_empty() {
+        return Err(Error::Usage("keygent capture <handle> -- '<command>'"));
+    }
+    run_inner(&a, cmd, Some(h))?;
+    let _ = writeln!(
+        std::io::stderr(),
+        "keygent: stored {h} (env {}, mode approve)",
+        crate::vault::names::placeholder_env(h)
+    );
+    Ok(())
+}
+
 pub fn run(a: Args) -> Result<()> {
+    run_inner(&a, &a.pos, None)
+}
+
+fn run_inner(a: &Args, words: &[String], capture: Option<&String>) -> Result<()> {
     if a.value("--dialect").is_some_and(|d| d != "posix") {
         return Err(Error::Unsupported("--dialect other than posix"));
     }
@@ -52,7 +75,7 @@ pub fn run(a: Args) -> Result<()> {
             parse_id(g)?
         }
         None => {
-            if a.pos.is_empty() {
+            if words.is_empty() {
                 return Err(Error::Usage(
                     "keygent run [--max-runtime 30m] -- '<command>'",
                 ));
@@ -67,12 +90,13 @@ pub fn run(a: Args) -> Result<()> {
             };
             let cwd = std::env::current_dir()?;
             let req = GrantCreate {
-                cmd: a.pos.join(" "),
+                cmd: words.join(" "),
                 cwd: cwd
                     .to_str()
                     .ok_or(Error::Policy(PolicyMsg::BadCwd))?
                     .to_owned(),
                 max_runtime_secs,
+                capture: capture.cloned(),
             }
             .encode()
             .map_err(|_| Error::TooLarge("64 KiB command"))?;

@@ -88,6 +88,40 @@ fn prepare_data_dir(dirs: &Dirs) -> Result<()> {
     Ok(())
 }
 
+pub fn check_new_handle(ix: &Index, h: &str) -> Result<()> {
+    if ix.get(h).is_some() {
+        return Err(Error::Exists(h.to_owned()));
+    }
+    if let Some(other) = names::collision(h, ix.handles.iter().map(|r| r.handle.as_str())) {
+        return Err(Error::Collision(other.to_owned()));
+    }
+    if ix.handles.len() >= names::MAX_HANDLES {
+        return Err(Error::TooLarge("1000 secrets"));
+    }
+    Ok(())
+}
+
+/// SPEC §5.8: refuse a write that would push the redactor past its 8 MiB pattern cap (current and previous values of
+/// every handle, plus `new` values). Checked here so `unseal` never has to refuse the vault later.
+pub fn check_redactor_cap(v: &Vault, new: &[&[u8]]) -> Result<()> {
+    let mut total = 0usize;
+    for r in &v.index.handles {
+        total = total.saturating_add(crate::redact::pattern_bytes(
+            v.read_entry(&r.handle)?.expose(),
+        ));
+        if let Some(p) = &r.previous_value {
+            total = total.saturating_add(crate::redact::pattern_bytes(p.expose()));
+        }
+    }
+    for n in new {
+        total = total.saturating_add(crate::redact::pattern_bytes(n));
+    }
+    if total > crate::redact::MAX_PATTERN_BYTES {
+        return Err(Error::RedactorTooLarge);
+    }
+    Ok(())
+}
+
 /// Exclusive lock for the whole command (released on drop).
 pub struct Lock {
     _f: File,

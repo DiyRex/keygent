@@ -125,6 +125,7 @@ pub mod proto {
     pub const GRANT: u16 = 0x104b;
     pub const UNBOUND: u16 = 0x104c;
     pub const COUNT: u16 = 0x104d;
+    pub const CAPTURE: u16 = 0x104e;
 }
 
 /// Unseal handoff over the inherited pipe (CLI → `keygent broker`), little-endian TLV. Range `0x20xx`.

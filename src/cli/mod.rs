@@ -25,6 +25,7 @@ keygent — let AI coding agents use secrets without seeing them
 
 Session:  unseal [--ttl 8h] · seal · status · ls
 Run:      run [--max-runtime 30m] -- '<command with {{keygent:<handle>}}>' · run --grant <id>
+          capture <handle> -- '<command>'   (stores the command's stdout as a new secret)
 Approve:  pending · approve [<id>] [--remember] · deny [<id> | --all]
 Rules:    rule add <handle> [--home scratch] -- <program> [args… | * | ** --flag --value-flag=]
           rule ls <handle> · rule rm <handle> <n>
@@ -147,6 +148,12 @@ fn run(argv: &[String]) -> Result<()> {
             &rest,
             &[("--since", true), ("--verify", false)],
             "keygent audit [--since 1h] [--verify]",
+        )?),
+        #[cfg(unix)]
+        "capture" => grants::capture(Args::parse(
+            &rest,
+            &[("--max-runtime", true)],
+            "keygent capture <handle> -- '<command>'",
         )?),
         #[cfg(unix)]
         "pending" => grants::pending(Args::parse(&rest, &[], "keygent pending")?),

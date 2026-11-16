@@ -91,6 +91,7 @@ pub fn untrust(a: Args) -> Result<()> {
         cmd: String::new(),
         cwd: cwd.to_str().ok_or(Error::NoManifest)?.to_owned(),
         max_runtime_secs: None,
+        capture: None,
     }
     .encode()
     .map_err(|_| Error::Internal(155))?;

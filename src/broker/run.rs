@@ -149,6 +149,8 @@ pub struct Job {
     pub direct: Option<(PathBuf, [u8; 32], Vec<String>)>,
     /// Empty temp HOME + XDG dirs for this run.
     pub scratch: bool,
+    /// `capture <handle>`: stdout is stored as this new handle (never sent); stderr is held and redacted at the end.
+    pub capture: Option<String>,
     pub max_runtime: Duration,
     pub redactor: Arc<Redactor>,
     /// `K_audit` and the run's end record (exit, redaction count and duration are filled in at the end).
@@ -290,6 +292,48 @@ fn send_data(w: &Mutex<UnixStream>, t: u8, data: &[u8]) -> bool {
 const STOP_NONE: u8 = 0;
 const STOP_LIMIT: u8 = 1;
 const STOP_GONE: u8 = 2;
+/// Captured stdout exceeded the 64 KiB value limit.
+const STOP_TOO_BIG: u8 = 3;
+/// Captured stdout cap (values are ≤ 64 KiB after trimming; a little slack for surrounding whitespace).
+const CAPTURE_MAX: usize = 64 * 1024 + 1024;
+/// Held stderr of a capture run; the rest is dropped.
+const CAPTURE_STDERR_MAX: usize = 1024 * 1024;
+
+/// Capture mode: keep raw bytes in the broker. Over `cap`: stop the run (`hard`) or drop the rest.
+fn collect(
+    mut src: impl Read,
+    buf: &Mutex<Zeroizing<Vec<u8>>>,
+    cap: usize,
+    hard: bool,
+    sid: i32,
+    flags: &Flags,
+) {
+    let mut chunk = Zeroizing::new(vec![0u8; CHUNK]);
+    loop {
+        let n = match src.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let Ok(mut b) = buf.lock() else { break };
+        if b.len().saturating_add(n) > cap {
+            if hard {
+                drop(b);
+                flags.stop(STOP_TOO_BIG, sid);
+                break;
+            }
+            continue;
+        }
+        if b.len().saturating_add(n) > b.capacity() {
+            // grow without leaving partial copies of the value behind
+            let mut grown = Zeroizing::new(Vec::with_capacity(
+                cap.min(b.len().saturating_add(n).saturating_mul(2)),
+            ));
+            grown.extend_from_slice(&b);
+            *b = grown;
+        }
+        b.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    }
+}
 
 struct Flags {
     done: AtomicBool,
@@ -452,6 +496,8 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     let cap = (job.max_runtime <= FOREGROUND).then_some(OUTPUT_CAP);
     let (tx, rx) = mpsc::channel::<()>();
     let mut pumps = 0u8;
+    let held_out = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
+    let held_err = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
     for (src, t) in [
         (
             child
@@ -475,10 +521,25 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
             flags.clone(),
             tx.clone(),
         );
+        let held = if t == ty::STDOUT {
+            held_out.clone()
+        } else {
+            held_err.clone()
+        };
+        let capturing = job.capture.is_some();
         if std::thread::Builder::new()
             .stack_size(super::THREAD_STACK)
             .spawn(move || {
-                pump(src, t, &red, &w, cap, sid, &f);
+                if capturing {
+                    let (limit, hard) = if t == ty::STDOUT {
+                        (CAPTURE_MAX, true)
+                    } else {
+                        (CAPTURE_STDERR_MAX, false)
+                    };
+                    collect(src, &held, limit, hard, sid, &f);
+                } else {
+                    pump(src, t, &red, &w, cap, sid, &f);
+                }
                 let _ = tx.send(());
             })
             .is_ok()
@@ -551,6 +612,31 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         }
         Err(_) => 1,
     };
+    // capture: store on success, then release stderr redacted with the session redactor and the new value
+    let mut outcome: Option<Error> = None;
+    if let Some(h) = &job.capture
+        && flags.stop.load(Ordering::SeqCst) != STOP_GONE
+    {
+        let raw = held_out.lock().map(|b| b.to_vec()).unwrap_or_default();
+        let value = Secret::from_slice(raw.trim_ascii());
+        drop(raw);
+        let stderr_raw = held_err.lock().map(|b| b.to_vec()).unwrap_or_default();
+        let (mut err_out, hits) = job.redactor.redact_all(&stderr_raw);
+        drop(stderr_raw);
+        let mut extra = hits;
+        if let Ok(r) = Redactor::new(std::iter::once((h.as_str(), value.expose()))) {
+            let (again, n) = r.redact_all(&err_out);
+            err_out = again;
+            extra = extra.saturating_add(n);
+        }
+        flags.hits.fetch_add(extra, Ordering::SeqCst);
+        let _ = send_data(&writer, ty::STDERR, &err_out);
+        if flags.stop.load(Ordering::SeqCst) == STOP_TOO_BIG {
+            outcome = Some(Error::ValueSize);
+        } else if code == 0 && flags.stop.load(Ordering::SeqCst) == STOP_NONE {
+            outcome = super::server::store_capture(shared, h, &value).err();
+        }
+    }
     let (key, mut end) = job.audit;
     end.exit = Some(code);
     end.redactions = Some(flags.hits.load(Ordering::SeqCst));
@@ -558,6 +644,9 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     end.decision = Some(match flags.stop.load(Ordering::SeqCst) {
         STOP_LIMIT => "limit",
         STOP_GONE => "client_gone",
+        STOP_TOO_BIG => "capture_too_big",
+        _ if job.capture.is_some() && code == 0 && outcome.is_none() => "captured",
+        _ if job.capture.is_some() && code == 0 => "capture_refused",
         _ => "end",
     });
     // the run already happened; a failed end record is logged, not hidden
@@ -576,6 +665,11 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
             }
         }
         STOP_GONE => shared.log.event(Level::Info, "run_client_gone", None),
+        _ if outcome.is_some() => {
+            if let (Ok(mut w), Some(e)) = (writer.lock(), &outcome) {
+                super::server::send_error(&mut w, e);
+            }
+        }
         _ => {
             shared.log.event(
                 Level::Info,

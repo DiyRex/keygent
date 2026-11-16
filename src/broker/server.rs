@@ -91,6 +91,7 @@ pub fn send_error(s: &mut UnixStream, e: &Error) {
             crate::error::exit::POLICY => code::POLICY_DENIED,
             crate::error::exit::RUN_LIMIT => code::RUN_LIMIT,
             crate::error::exit::USAGE => code::BAD_REQUEST,
+            crate::error::exit::HUMAN => code::FAILED,
             _ => code::INTERNAL,
         },
     };
@@ -360,6 +361,7 @@ fn grant_create(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
             command: &gc.cmd,
             cwd: &gc.cwd,
             max_runtime: gc.max_runtime_secs.map(std::time::Duration::from_secs),
+            capture: gc.capture.as_deref(),
         },
         &snap,
         &trusted,
@@ -642,6 +644,40 @@ fn audit_verify(shared: &Shared, s: &mut UnixStream) {
     }
 }
 
+/// Store a captured value as a **new** handle (SPEC §5.9): create-only (an existing handle needs the human's
+/// `rotate`), default env name `KEYGENT_<HANDLE>`, mode `approve`, origin `capture`, same value rules as `add`.
+pub fn store_capture(shared: &Shared, h: &str, value: &crate::crypto::Secret) -> Result<(), Error> {
+    use crate::vault::{self, index, names, strength};
+    let r = with_state(shared, |st| {
+        if st.vault.index.get(h).is_some() {
+            return Err(Error::NeedsAuth);
+        }
+        vault::check_new_handle(&st.vault.index, h)?;
+        if value.expose().is_empty() {
+            return Err(Error::ValueSize);
+        }
+        strength::check_secret(value.expose())?;
+        vault::check_redactor_cap(&st.vault, &[value.expose()])?;
+        let mut rec = crate::vault::audit::Record::new("capture");
+        rec.handles = vec![h.to_owned()];
+        rec.decision = Some("stored");
+        shared.write_vault(st, &rec, |v| {
+            let mut r = index::new_handle(
+                h,
+                &names::placeholder_env(h),
+                "",
+                Mode::Approve,
+                vault::now(),
+            );
+            r.origin = index::Origin::Capture;
+            v.index.handles.push(r);
+            v.put_entry(h, 1, value)?;
+            Ok(vault::Prev::Keep)
+        })
+    });
+    r.unwrap_or(Err(Error::Sealed))
+}
+
 /// `Run{grant_id}`: consume an approved grant and execute the command stored in it.
 fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
     let Ok((id, _)) = msg::decode_grant(payload, false) else {
@@ -704,6 +740,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
                 (None, _) => None,
             },
             scratch: g.scratch,
+            capture: g.capture.clone(),
             max_runtime: g.max_runtime,
             redactor: st.redactor.clone(),
             audit: (st.vault.audit_key()?, st.grant_record(g, "run", "end")),

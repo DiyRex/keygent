@@ -46,6 +46,8 @@ pub mod code {
     pub const RUN_LIMIT: u16 = 11;
     /// The audit log couldn't be written or failed verification; the message is the canonical line (exit 79).
     pub const AUDIT: u16 = 12;
+    /// A human-facing failure (exit 1, e.g. a captured value too weak); the message is the canonical line.
+    pub const FAILED: u16 = 13;
 }
 
 fn enc() -> Encoder {
@@ -292,6 +294,8 @@ pub struct GrantCreate {
     pub cmd: String,
     pub cwd: String,
     pub max_runtime_secs: Option<u64>,
+    /// `capture <handle>`: stdout is stored as this new handle instead of being returned (SPEC §5.9).
+    pub capture: Option<String>,
 }
 
 impl GrantCreate {
@@ -301,6 +305,9 @@ impl GrantCreate {
         e.utf8(t::CWD, &self.cwd)?;
         if let Some(m) = self.max_runtime_secs {
             e.u64(t::MAX_RUNTIME, m)?;
+        }
+        if let Some(h) = &self.capture {
+            e.utf8(t::CAPTURE, h)?;
         }
         Ok(done(e))
     }
@@ -317,11 +324,16 @@ impl GrantCreate {
             Some(v) => Some(d.as_u64(t::MAX_RUNTIME, v)?),
             None => None,
         };
+        let capture = match d.opt(t::CAPTURE)? {
+            Some(v) => Some(string(&d, t::CAPTURE, v)?),
+            None => None,
+        };
         d.finish()?;
         Ok(GrantCreate {
             cmd,
             cwd,
             max_runtime_secs,
+            capture,
         })
     }
 }
@@ -560,6 +572,7 @@ mod tests {
             cmd: "X={{keygent:a}} t".into(),
             cwd: "/p".into(),
             max_runtime_secs: Some(60),
+            capture: Some("new/tok".into()),
         };
         assert_eq!(GrantCreate::decode(&g.encode().unwrap()).unwrap(), g);
         let id = [7; GRANT_ID_LEN];
