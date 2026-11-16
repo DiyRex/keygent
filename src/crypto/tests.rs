@@ -37,10 +37,10 @@ fn golden_derivations() {
     let argon = argon2id(pass.expose(), &SALT, KDF_DEFAULT).unwrap();
     assert_eq!(hex(argon.expose()), golden("argon2id_m65536_t3_p4"));
     let kek = kek_passphrase(&UUID, &argon, &pepper).unwrap();
-    assert_eq!(hex(&kek.0), golden("kek_passphrase"));
+    assert_eq!(hex(kek.expose()), golden("kek_passphrase"));
     let rk = Secret::from_slice(&[9u8; 32]);
     assert_eq!(
-        hex(&kek_recovery(&UUID, &rk).unwrap().0),
+        hex(kek_recovery(&UUID, &rk).unwrap().expose()),
         golden("kek_recovery")
     );
     let dek = Dek::from_bytes([1u8; 32]);
@@ -53,7 +53,7 @@ fn golden_derivations() {
         (label::BROKER, "k_broker"),
     ] {
         assert_eq!(
-            hex(&subkey(&UUID, &dek, lbl).unwrap().0),
+            hex(subkey(&UUID, &dek, lbl).unwrap().expose()),
             golden(name),
             "{name}"
         );
@@ -65,7 +65,7 @@ fn pepper_changes_kek() {
     let argon = Secret::from_slice(&[3u8; 32]);
     let a = kek_passphrase(&UUID, &argon, &Secret::from_slice(&[1u8; 32])).unwrap();
     let b = kek_passphrase(&UUID, &argon, &Secret::from_slice(&[2u8; 32])).unwrap();
-    assert_ne!(a.0, b.0);
+    assert_ne!(a.expose(), b.expose());
 }
 
 #[test]

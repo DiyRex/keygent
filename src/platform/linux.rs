@@ -7,7 +7,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub(super) fn dirs(home: &Path) -> Dirs {
+    let state = home.join(".local").join("state").join("keygent");
     Dirs {
+        run: super::ipc::runtime_dir(&state),
         data: home.join(".local").join("share").join("keygent"),
         config: home.join(".config").join("keygent"),
         state: home.join(".local").join("state").join("keygent"),

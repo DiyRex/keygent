@@ -25,6 +25,20 @@ fn dirs() -> Result<Dirs> {
     platform::dirs()
 }
 
+/// Factor changes and restores first seal a running broker and wait for it to exit (SPEC §5.2, ADR 0012).
+fn seal_broker(d: &Dirs) -> Result<()> {
+    #[cfg(unix)]
+    if super::client::seal_if_running(d)? {
+        let _ = writeln!(
+            std::io::stderr(),
+            "keygent: sealed the running broker first — run 'keygent unseal' afterwards"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = d;
+    Ok(())
+}
+
 fn one_handle(a: &Args, usage: &'static str) -> Result<String> {
     match a.pos.as_slice() {
         [h] => {
@@ -36,6 +50,10 @@ fn one_handle(a: &Args, usage: &'static str) -> Result<String> {
 }
 
 /// Ask for the passphrase (3 attempts) and open the vault. A rolled-back vault needs an explicit confirmation.
+pub(super) fn unlock_vault(con: &mut Console, d: &Dirs, l: &Lock) -> Result<Vault> {
+    unlock(con, d, l)
+}
+
 fn unlock(con: &mut Console, d: &Dirs, l: &Lock) -> Result<Vault> {
     if !Vault::exists(d) {
         return Err(Error::NoVault);
@@ -196,20 +214,6 @@ fn check_description(d: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- vault commands
 
-pub fn status(a: Args) -> Result<()> {
-    if !a.pos.is_empty() {
-        return Err(Error::Usage("keygent status"));
-    }
-    let d = dirs()?;
-    let msg = if Vault::exists(&d) {
-        "vault sealed"
-    } else {
-        "no vault — run 'keygent init'"
-    };
-    let _ = writeln!(std::io::stdout(), "keygent: {msg}");
-    Ok(())
-}
-
 pub fn init(a: Args) -> Result<()> {
     if !a.pos.is_empty() {
         return Err(Error::Usage("keygent init [--own-passphrase]"));
@@ -233,6 +237,7 @@ pub fn passwd(a: Args) -> Result<()> {
         return Err(Error::Usage("keygent passwd [--own-passphrase]"));
     }
     let d = dirs()?;
+    seal_broker(&d)?;
     let l = vault::lock(&d)?;
     let mut con = Console::open()?;
     let mut v = unlock(&mut con, &d, &l)?;
@@ -249,6 +254,7 @@ pub fn rekey(a: Args) -> Result<()> {
         return Err(Error::Usage("keygent rekey"));
     }
     let d = dirs()?;
+    seal_broker(&d)?;
     let l = vault::lock(&d)?;
     let mut con = Console::open()?;
     if !Vault::exists(&d) {
@@ -271,6 +277,7 @@ pub fn recover(a: Args) -> Result<()> {
         return Err(Error::Usage("keygent recover [--own-passphrase]"));
     }
     let d = dirs()?;
+    seal_broker(&d)?;
     let l = vault::lock(&d)?;
     if !Vault::exists(&d) {
         return Err(Error::NoVault);
@@ -399,6 +406,7 @@ pub fn restore(a: Args) -> Result<()> {
         return Err(Error::Usage("keygent restore <file> [--new-machine]"));
     };
     let d = dirs()?;
+    seal_broker(&d)?;
     let l = vault::lock(&d)?;
     let src = PathBuf::from(src);
     let max = usize::try_from(format::MAX_FILE_LEN).unwrap_or(usize::MAX);
@@ -458,14 +466,6 @@ fn restore_new_machine(con: &mut Console, d: &Dirs, bytes: Vec<u8>, own: bool) -
 }
 
 // ---------------------------------------------------------------- secret commands
-
-pub fn ls(a: Args) -> Result<()> {
-    if !a.pos.is_empty() {
-        return Err(Error::Usage("keygent ls"));
-    }
-    // SPEC §5.1: `ls` while sealed exits 78. Phase 1 has no broker, so the vault is always sealed.
-    Err(Error::Sealed)
-}
 
 pub fn add(a: Args) -> Result<()> {
     let usage = "keygent add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]";

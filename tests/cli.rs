@@ -58,6 +58,8 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
+        // never leave a broker running after a test (even a failed one)
+        let _ = cmd(self, &["seal"]).stdin(Stdio::null()).output();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -725,4 +727,253 @@ fn disk_full_leaves_vault_intact() {
     drop(filler);
     std::fs::remove_file(root.0.join("filler")).unwrap();
     assert_eq!(run(&root, &["verify"], &[PASS]).0, 0);
+}
+
+// ---------------------------------------------------------------- broker (Phase 2)
+
+fn unseal(root: &Root, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec!["unseal"];
+    args.extend_from_slice(extra);
+    run(root, &args, &[PASS])
+}
+
+fn broker_pid(root: &Root) -> i32 {
+    let s = std::fs::read_to_string(root.0.join("run/broker.lock")).unwrap();
+    s.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(10) {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn unseal_status_ls_seal() {
+    let root = Root::new();
+    init(&root);
+    let c = canary();
+    assert_eq!(add(&root, "a/b", &c).0, 0);
+    let (code, out, err) = unseal(&root, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.is_empty() && err.contains("keygent: unsealed for 8h00m"),
+        "{err}"
+    );
+    // a second unseal is a no-op
+    let (code, _, err) = run(&root, &["unseal"], &[]);
+    assert_eq!((code, err.trim()), (0, "keygent: already unsealed"));
+    let (code, out, _) = run(&root, &["status"], &[]);
+    assert_eq!(code, 0);
+    assert!(
+        out.starts_with("keygent: unsealed — 7h59m left")
+            || out.starts_with("keygent: unsealed — 8h00m left"),
+        "{out}"
+    );
+    assert!(
+        out.contains("1 secret(s)") && out.contains("hardening on"),
+        "{out}"
+    );
+    let (code, out, err) = run(&root, &["ls"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "a/b  $A_B  approve\n");
+    // a CLI write while unsealed is picked up by the broker (ADR 0012 reload)
+    assert_eq!(add(&root, "c/d", &canary()).0, 0);
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert_eq!(out, "a/b  $A_B  approve\nc/d  $C_D  approve\n");
+    // runtime files are owner-only; the broker log never contains the value
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(root.0.join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(root.0.join("run/broker.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let pid = broker_pid(&root);
+    let (code, _, err) = run(&root, &["seal"], &[]);
+    assert_eq!((code, err.trim()), (0, "keygent: sealed"));
+    assert!(wait_until(|| std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)));
+    let (code, _, err) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            78,
+            "keygent: vault sealed — ask the user to run 'keygent unseal'"
+        )
+    );
+    let (_, out, _) = run(&root, &["status"], &[]);
+    assert_eq!(out.trim(), "keygent: vault sealed");
+    assert_no_plaintext(&root, &c);
+}
+
+#[test]
+fn broker_seals_on_ttl_signal_and_tamper() {
+    let root = Root::new();
+    init(&root);
+    assert_eq!(add(&root, "a/b", &canary()).0, 0);
+    // TTL
+    assert_eq!(unseal(&root, &["--ttl", "2s"]).0, 0);
+    assert!(wait_until(|| run(&root, &["ls"], &[]).0 == 78), "TTL seal");
+    // SIGTERM
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let pid = broker_pid(&root);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        wait_until(|| run(&root, &["ls"], &[]).0 == 78),
+        "SIGTERM seal"
+    );
+    // tampered vault (MAC fails on reload) → the broker seals instead of serving stale or forged data
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let p = root.data().join("vault.kgt");
+    let mut b = std::fs::read(&p).unwrap();
+    b[22] ^= 1; // generation: forces a reload, and breaks the header MAC
+    std::fs::write(&p, b).unwrap();
+    let (code, _, _) = run(&root, &["ls"], &[]);
+    assert_ne!(code, 0);
+    assert!(
+        wait_until(|| run(&root, &["ls"], &[]).0 == 78),
+        "tamper seal"
+    );
+}
+
+#[test]
+fn fake_broker_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new();
+    init(&root);
+    let run_dir = root.0.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // an agent squats the endpoint with its own listener (no held lock, wrong pid, wrong binary)
+    let l = std::os::unix::net::UnixListener::bind(run_dir.join("broker.sock")).unwrap();
+    let t = std::thread::spawn(move || {
+        for s in l.incoming().take(2).flatten() {
+            let mut s = s;
+            let _ = s.write_all(b"\x00\x00\x00\x02\x01\x02");
+        }
+    });
+    let (code, out, err) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        (code, out.as_str(), err.trim()),
+        (
+            79,
+            "",
+            "keygent: broker could not be verified — run 'keygent doctor'"
+        )
+    );
+    // even with a forged broker.lock naming this process and holding the lock
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(run_dir.join("broker.lock"))
+        .unwrap();
+    std::fs::set_permissions(
+        run_dir.join("broker.lock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    (&lock)
+        .write_all(
+            format!(
+                "v1 {} 1 {}\n",
+                std::process::id(),
+                std::env::current_exe().unwrap().display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    let (code, _, err) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            79,
+            "keygent: broker could not be verified — run 'keygent doctor'"
+        )
+    );
+    // unseal refuses to hand a DEK to a squatter
+    let (code, _, _) = run(&root, &["unseal"], &[PASS]);
+    assert_eq!(code, 79);
+    drop(lock);
+    let _ = std::os::unix::net::UnixStream::connect(run_dir.join("broker.sock"));
+    let _ = t.join();
+}
+
+#[test]
+fn stale_socket_after_crash_is_recovered() {
+    let root = Root::new();
+    init(&root);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let pid = broker_pid(&root);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(wait_until(|| std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)));
+    assert!(
+        root.0.join("run/broker.sock").exists(),
+        "socket left behind by the crash"
+    );
+    // the lock is free and nothing answers, so the endpoint reads as sealed, and a new unseal rebinds it
+    assert_eq!(
+        run(&root, &["ls"], &[]).0,
+        78,
+        "a dead endpoint reads as sealed"
+    );
+    let (code, _, err) = unseal(&root, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(run(&root, &["ls"], &[]).0, 0);
+}
+
+#[test]
+fn passwd_seals_the_broker_first() {
+    let root = Root::new();
+    init(&root);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let (code, _, err) = run(
+        &root,
+        &["passwd", "--own-passphrase"],
+        &[PASS, PASS2, PASS2],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("keygent: sealed the running broker first"),
+        "{err}"
+    );
+    assert_eq!(run(&root, &["ls"], &[]).0, 78);
 }

@@ -87,3 +87,35 @@ pub mod config_seen {
     pub const SHA256: u16 = 0x0a03;
     pub const APPROVED_AT: u16 = 0x0a04;
 }
+
+/// Broker protocol payload tags (ADR 0004, big-endian TLV). Range `0x10xx`–`0x1fxx`.
+pub mod proto {
+    pub const BUILD_ID: u16 = 0x1001;
+    pub const NONCE: u16 = 0x1002;
+    pub const CLASS: u16 = 0x1003;
+    pub const PROOF: u16 = 0x1004;
+    pub const CODE: u16 = 0x1005;
+    pub const MESSAGE: u16 = 0x1006;
+    pub const PID: u16 = 0x1010;
+    pub const TTL_LEFT: u16 = 0x1011;
+    pub const IDLE_LEFT: u16 = 0x1012;
+    pub const HANDLE_COUNT: u16 = 0x1013;
+    pub const NO_DUMPS: u16 = 0x1014;
+    pub const MLOCKALL: u16 = 0x1015;
+    pub const ENTRY: u16 = 0x1020;
+    pub const E_HANDLE: u16 = 0x1021;
+    pub const E_ENV: u16 = 0x1022;
+    pub const E_MODE: u16 = 0x1023;
+    pub const E_BINDING: u16 = 0x1024;
+    pub const E_EXPOSED: u16 = 0x1025;
+    pub const E_DESCRIPTION: u16 = 0x1026;
+}
+
+/// Unseal handoff over the inherited pipe (CLI → `keygent broker`), little-endian TLV. Range `0x20xx`.
+pub mod handoff {
+    pub const DEK: u16 = 0x2001;
+    pub const TTL: u16 = 0x2002;
+    pub const IDLE: u16 = 0x2003;
+    pub const LOG_LEVEL: u16 = 0x2004;
+    pub const PATH: u16 = 0x2005;
+}

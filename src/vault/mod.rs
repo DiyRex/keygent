@@ -256,9 +256,21 @@ impl Vault {
 
     /// Open vault bytes from anywhere (the live file or a backup for `restore`).
     pub fn open_bytes(dirs: &Dirs, bytes: Vec<u8>, how: Unlock<'_>) -> Result<Vault> {
-        let (file, header_len) = format::parse(&bytes)?;
+        let (file, _) = format::parse(&bytes)?;
         let keystore = Keystore::new(&dirs.state)?;
         let dek = unwrap(&file, &keystore, how)?;
+        Self::with_dek(dirs, bytes, dek)
+    }
+
+    /// Open the live vault with a DEK handed over at unseal (the broker). Header MAC and index are verified.
+    pub fn open_with_dek(dirs: &Dirs, dek: Dek) -> Result<Vault> {
+        let bytes = read_file(&Self::path(dirs))?.ok_or(Error::NoVault)?;
+        Self::with_dek(dirs, bytes, dek)
+    }
+
+    fn with_dek(dirs: &Dirs, bytes: Vec<u8>, dek: Dek) -> Result<Vault> {
+        let (file, header_len) = format::parse(&bytes)?;
+        let keystore = Keystore::new(&dirs.state)?;
         let keys = Keys::derive(&file.uuid, dek)?;
         let hdr = bytes.get(..header_len).ok_or(Error::Damaged)?;
         if !crypto::hmac_verify(&keys.hdr, hdr, &file.header_mac) {
@@ -362,6 +374,23 @@ impl Vault {
             r.previous_version_until = None;
         }
         Ok(())
+    }
+
+    /// The broker's handshake proof for this vault (ADR 0004).
+    pub fn broker_proof(&self, nc: &[u8], nb: &[u8]) -> Result<[u8; 32]> {
+        let kb = crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::BROKER)?;
+        crypto::proof_broker(&kb, nc, nb)
+    }
+
+    /// A copy of the DEK for reopening (the broker's reload). Lives in the locked arena when active.
+    pub fn dek_copy(&self) -> Dek {
+        Dek::from_bytes(*self.keys.dek.expose())
+    }
+
+    /// Generation of the file on disk right now (header only; no keys needed). The broker reloads when it differs.
+    pub fn generation_on_disk(dirs: &Dirs) -> Result<u64> {
+        let bytes = read_file(&Self::path(dirs))?.ok_or(Error::NoVault)?;
+        Ok(format::parse(&bytes)?.0.generation)
     }
 
     pub fn keystore(&self) -> &Keystore {

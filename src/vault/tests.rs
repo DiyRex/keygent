@@ -22,6 +22,7 @@ fn tmp() -> (Tmp, Dirs) {
         data: root.join("data"),
         config: root.join("config"),
         state: root.join("state"),
+        run: root.join("run"),
     };
     (Tmp(root), dirs)
 }

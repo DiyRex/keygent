@@ -44,6 +44,12 @@ pub enum Error {
     NothingToUndo(String),
     UuidMismatch,
     Unsupported(&'static str),
+    /// The process behind the endpoint is not the verified keygent broker (SPEC §5.4). Fail closed.
+    BrokerUnverified,
+    VersionMismatch,
+    RateLimited,
+    /// A protocol error code from the broker (ADR 0004), never request contents.
+    Broker(u16),
     /// I/O or OS failure. The code is an `std::io::ErrorKind`-derived number, never a path or value.
     Io(i32),
     /// Internal invariant failure (crypto/RNG). The code identifies the site.
@@ -55,7 +61,12 @@ impl Error {
         match self {
             Error::Usage(_) | Error::InvalidHandle | Error::InvalidEnvName => exit::USAGE,
             Error::Sealed => exit::SEALED,
-            Error::TooLarge(_) | Error::Internal(_) => exit::BROKER,
+            Error::TooLarge(_)
+            | Error::Internal(_)
+            | Error::BrokerUnverified
+            | Error::VersionMismatch
+            | Error::RateLimited
+            | Error::Broker(_) => exit::BROKER,
             _ => exit::HUMAN,
         }
     }
@@ -102,6 +113,14 @@ impl fmt::Display for Error {
             Error::NothingToUndo(h) => write!(f, "keygent: nothing to undo for {} (only within 24 h of a rotate)", short(h)),
             Error::UuidMismatch => f.write_str("keygent: backup belongs to a different vault — use 'restore --new-machine'"),
             Error::Unsupported(what) => write!(f, "keygent: {what} is not supported on this platform yet"),
+            Error::BrokerUnverified => {
+                f.write_str("keygent: broker could not be verified — run 'keygent doctor'")
+            }
+            Error::VersionMismatch => {
+                f.write_str("keygent: updated — run 'keygent seal' then 'keygent unseal'")
+            }
+            Error::RateLimited => f.write_str("keygent: too many requests — retry in a few seconds"),
+            Error::Broker(code) => write!(f, "keygent: broker error {code} — run 'keygent doctor'"),
             Error::Io(code) => write!(f, "keygent: file error {code} — run 'keygent doctor'"),
             Error::Internal(code) => write!(f, "keygent: internal error {code} — run 'keygent doctor'"),
         }
@@ -168,6 +187,10 @@ mod tests {
             Error::NothingToUndo(long.clone()),
             Error::UuidMismatch,
             Error::Unsupported("clipboard"),
+            Error::BrokerUnverified,
+            Error::VersionMismatch,
+            Error::RateLimited,
+            Error::Broker(10),
             Error::Io(28),
             Error::Internal(1),
         ];

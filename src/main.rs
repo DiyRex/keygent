@@ -3,6 +3,7 @@
 #![forbid(clippy::dbg_macro)]
 
 mod adapter;
+#[cfg(unix)]
 mod broker;
 mod cli;
 mod crypto;
@@ -15,6 +16,10 @@ mod redact;
 mod vault;
 
 use std::process::ExitCode;
+
+/// Freed heap is wiped before reuse (SPEC §5.4).
+#[global_allocator]
+static ALLOC: platform::alloc::ZeroOnFree = platform::alloc::ZeroOnFree;
 
 fn main() -> ExitCode {
     // panic = "abort" in release; the hook prints a fixed string only, never the payload (BUILD_PROMPT §5).

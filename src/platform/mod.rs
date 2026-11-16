@@ -13,6 +13,11 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod alloc;
+#[cfg(unix)]
+pub mod arena;
+#[cfg(unix)]
+pub mod ipc;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -36,6 +41,8 @@ pub struct Dirs {
     #[allow(dead_code)]
     pub config: PathBuf,
     pub state: PathBuf,
+    /// Broker runtime dir (socket, `broker.lock`): fixed per user, owner-only.
+    pub run: PathBuf,
 }
 
 /// RAII guard that restores the terminal mode on drop.
@@ -92,6 +99,7 @@ pub fn dirs() -> Result<Dirs> {
             data: root.join("data"),
             config: root.join("config"),
             state: root.join("state"),
+            run: root.join("run"),
         });
     }
     os().default_dirs()
