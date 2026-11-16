@@ -275,3 +275,28 @@ fn throughput() {
         assert!(mbps >= 200.0, "{mbps:.0} MB/s");
     }
 }
+
+#[test]
+fn detector_hold_back_is_bounded() {
+    // an endless token-shaped stream must not be held until EOF (memory + rescans) nor leak its prefix
+    let r = red();
+    for head in [&b"ghp_"[..], b"eyJ"] {
+        let mut s = r.stream();
+        let mut out = Vec::new();
+        s.push(head, &mut out);
+        let chunk = vec![b'a'; 16 * 1024];
+        for _ in 0..64 {
+            s.push(&chunk, &mut out);
+        }
+        assert!(
+            !out.is_empty() && s.pending.len() <= MAX_DETECT + chunk.len(),
+            "held {} bytes",
+            s.pending.len()
+        );
+        assert!(contains(&out, b"\xe2\x80\xb9keygent:unknown\xe2\x80\xba"));
+        assert!(
+            !contains(&out, &[head, &b"aaaa"[..]].concat()),
+            "token prefix leaked"
+        );
+    }
+}

@@ -1246,22 +1246,24 @@ fn run_limits_and_containment() {
     assert!(o.stdout.len() <= 10 * 1024 * 1024);
     // a killed client kills its run
     let mut s = run_in(&root, &proj, &["run", "--", "echo $$; sleep 30"]);
-    let pid = loop {
-        let o = s.out.lock().unwrap().clone();
-        if o.ends_with(b"\n") {
-            break String::from_utf8(o).unwrap().trim().to_owned();
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    assert!(
+        wait_until(|| s.out.lock().unwrap().ends_with(b"\n")),
+        "run never printed its pid"
+    );
+    let pid = String::from_utf8(s.out.lock().unwrap().clone())
+        .unwrap()
+        .trim()
+        .to_owned();
     assert!(alive(&pid));
     s.child.kill().unwrap();
     let _ = s.finish();
     assert!(wait_until(|| !alive(&pid)), "run survived its client");
     // an interrupt is forwarded: sh dies of SIGINT → 130
     let s = run_in(&root, &proj, &["run", "--", "echo ready; sleep 30"]);
-    while !s.out.lock().unwrap().ends_with(b"ready\n") {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        wait_until(|| s.out.lock().unwrap().ends_with(b"ready\n")),
+        "run never got ready"
+    );
     Command::new("kill")
         .args(["-INT", &s.child.id().to_string()])
         .status()
@@ -1534,17 +1536,14 @@ fn manifest_needs_trust_and_any_change_untrusts_it() {
 fn capture_stores_stdout_as_a_new_handle_without_showing_it() {
     let (root, _c, proj) = run_setup();
     let make = "v=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \\n'); echo \"  $v\"; echo \"token=$v\" >&2";
-    let go = |args: &[&str]| {
-        let mut x = cmd(&root, args);
-        x.current_dir(&proj);
-        let o = x.output().unwrap();
-        (
-            o.status.code().unwrap(),
-            String::from_utf8(o.stdout).unwrap(),
-            String::from_utf8(o.stderr).unwrap(),
-        )
+    // every capture writes a secret, so every capture needs the human's approval (review fix)
+    let approved = |args: &[&str]| {
+        let mut s = run_in(&root, &proj, args);
+        s.expect(WAITING);
+        approve(&root);
+        s.finish()
     };
-    let (code, out, err) = go(&["capture", "new/tok", "--", make]);
+    let (code, out, err) = approved(&["capture", "new/tok", "--", make]);
     assert_eq!(code, 0, "{err}");
     assert!(out.is_empty(), "stdout is never returned: {out}");
     assert!(
@@ -1558,32 +1557,27 @@ fn capture_stores_stdout_as_a_new_handle_without_showing_it() {
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert!(out.contains("new/tok  $KEYGENT_NEW_TOK  approve"), "{out}");
     // the stored value is usable (and redacted) like any other
-    let mut s = run_in(
-        &root,
-        &proj,
-        &[
-            "run",
-            "--",
-            "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
-        ],
-    );
-    s.expect(WAITING);
-    approve(&root);
-    let (code, out, _) = s.finish();
+    let (code, out, _) = approved(&[
+        "run",
+        "--",
+        "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
+    ]);
     assert_eq!((code, out.as_str()), (0, "‹keygent:new/tok›"));
-    // create-only: an existing handle needs the human's rotate
-    let (code, _, err) = go(&["capture", "svc/key", "--", make]);
+    // create-only: an existing handle is refused before anyone is asked to approve
+    let mut x = cmd(&root, &["capture", "svc/key", "--", make]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
     assert_eq!(
-        (code, err.lines().last().unwrap()),
+        (o.status.code(), String::from_utf8(o.stderr).unwrap().trim()),
         (
-            1,
+            Some(1),
             "keygent: this needs your passphrase — run it in your own terminal"
         )
     );
     // weak values and failed commands store nothing
-    let (code, _, _) = go(&["capture", "weak/one", "--", "echo short"]);
+    let (code, _, _) = approved(&["capture", "weak/one", "--", "echo short"]);
     assert_eq!(code, 1);
-    let (code, _, _) = go(&[
+    let (code, _, _) = approved(&[
         "capture",
         "fail/one",
         "--",

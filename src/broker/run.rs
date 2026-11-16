@@ -92,13 +92,12 @@ fn base_command(job: &Job, keep: &mut Vec<i32>, held: &mut Vec<Binding>) -> Resu
     #[cfg(target_os = "linux")]
     let mut c = {
         use std::os::fd::AsRawFd;
-        let mut f = std::fs::File::open(exe)?;
-        let mut buf = Vec::new();
-        f.by_ref().take(resolve::MAX_EXE).read_to_end(&mut buf)?;
-        if !crypto::ct_eq(&crypto::sha256(&buf), sha) {
-            return Err(Error::Policy(PolicyMsg::Changed));
+        let f = std::fs::File::open(exe)?;
+        // hash through this very fd, then exec through it (no swap window)
+        match crypto::sha256_reader(&f, resolve::MAX_EXE)? {
+            Some(h) if crypto::ct_eq(&h, sha) => {}
+            _ => return Err(Error::Policy(PolicyMsg::Changed)),
         }
-        drop(buf);
         let fd = f.as_raw_fd();
         keep.push(fd);
         held.push(Binding { _fd: f });
@@ -294,6 +293,8 @@ const STOP_LIMIT: u8 = 1;
 const STOP_GONE: u8 = 2;
 /// Captured stdout exceeded the 64 KiB value limit.
 const STOP_TOO_BIG: u8 = 3;
+/// A guard thread (pump, client watcher, runtime limit) couldn't start: the run is killed (fail closed).
+const STOP_FAILED: u8 = 4;
 /// Captured stdout cap (values are ≤ 64 KiB after trimming; a little slack for surrounding whitespace).
 const CAPTURE_MAX: usize = 64 * 1024 + 1024;
 /// Held stderr of a capture run; the rest is dropped.
@@ -496,6 +497,8 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     let cap = (job.max_runtime <= FOREGROUND).then_some(OUTPUT_CAP);
     let (tx, rx) = mpsc::channel::<()>();
     let mut pumps = 0u8;
+    // every guard below must be running, or the run must not continue (review fix: fail closed)
+    let mut guards_ok = true;
     let held_out = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
     let held_err = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
     for (src, t) in [
@@ -545,12 +548,14 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
             .is_ok()
         {
             pumps = pumps.saturating_add(1);
+        } else {
+            guards_ok = false;
         }
     }
     // client frames: forwarded signals; EOF or error = the client is gone → kill now
     if let Ok(mut r) = s.try_clone() {
         let f = flags.clone();
-        let _ = std::thread::Builder::new()
+        guards_ok &= std::thread::Builder::new()
             .stack_size(super::THREAD_STACK)
             .spawn(move || {
                 loop {
@@ -572,13 +577,16 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
                         }
                     }
                 }
-            });
+            })
+            .is_ok();
+    } else {
+        guards_ok = false;
     }
     // runtime limit
     {
         let f = flags.clone();
         let deadline = super::clock::Deadline::after(job.max_runtime);
-        let _ = std::thread::Builder::new()
+        guards_ok &= std::thread::Builder::new()
             .stack_size(super::THREAD_STACK)
             .spawn(move || {
                 while !f.done.load(Ordering::SeqCst) {
@@ -588,7 +596,14 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-            });
+            })
+            .is_ok();
+    }
+    if !guards_ok {
+        shared
+            .log
+            .event(Level::Error, "run_guard_spawn_failed", None);
+        flags.stop(STOP_FAILED, sid);
     }
     let status = child.wait();
     // anything left in the session (`cmd &`, nohup) dies with the run
@@ -617,10 +632,17 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     if let Some(h) = &job.capture
         && flags.stop.load(Ordering::SeqCst) != STOP_GONE
     {
-        let raw = held_out.lock().map(|b| b.to_vec()).unwrap_or_default();
+        // move the buffers out (they stay in their wiping wrappers); never copy the value into plain memory
+        let raw: Zeroizing<Vec<u8>> = held_out
+            .lock()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default();
         let value = Secret::from_slice(raw.trim_ascii());
         drop(raw);
-        let stderr_raw = held_err.lock().map(|b| b.to_vec()).unwrap_or_default();
+        let stderr_raw: Zeroizing<Vec<u8>> = held_err
+            .lock()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default();
         let (mut err_out, hits) = job.redactor.redact_all(&stderr_raw);
         drop(stderr_raw);
         let mut extra = hits;
@@ -645,6 +667,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         STOP_LIMIT => "limit",
         STOP_GONE => "client_gone",
         STOP_TOO_BIG => "capture_too_big",
+        STOP_FAILED => "internal",
         _ if job.capture.is_some() && code == 0 && outcome.is_none() => "captured",
         _ if job.capture.is_some() && code == 0 => "capture_refused",
         _ => "end",
@@ -665,6 +688,11 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
             }
         }
         STOP_GONE => shared.log.event(Level::Info, "run_client_gone", None),
+        STOP_FAILED => {
+            if let Ok(mut w) = writer.lock() {
+                super::server::send_error(&mut w, &Error::Internal(149));
+            }
+        }
         _ if outcome.is_some() => {
             if let (Ok(mut w), Some(e)) = (writer.lock(), &outcome) {
                 super::server::send_error(&mut w, e);

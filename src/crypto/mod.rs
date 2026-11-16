@@ -207,6 +207,25 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// SHA-256 of at most `limit` bytes read from `r`, in 64 KiB steps (never the whole file in memory; executables can be
+/// hundreds of MiB and the broker's budget is 5 MB). `None` if more than `limit` bytes are available.
+pub fn sha256_reader(mut r: impl std::io::Read, limit: u64) -> std::io::Result<Option<[u8; 32]>> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(Some(h.finalize().into()));
+        }
+        total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        if total > limit {
+            return Ok(None);
+        }
+        h.update(buf.get(..n).unwrap_or_default());
+    }
+}
+
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

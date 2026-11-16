@@ -229,6 +229,10 @@ pub fn build(
 ) -> Result<Grant> {
     if let Some(h) = req.capture {
         crate::vault::names::check_handle(h)?;
+        // create-only: overwriting is the human's `rotate` (SPEC §5.9); refuse before asking anyone to approve
+        if lookup(snap, h).is_some() {
+            return Err(Error::NeedsAuth);
+        }
     }
     let parsed = tokenize::parse(req.command).map_err(|e| tok_err(&e))?;
     // handles must exist and not be denied
@@ -366,7 +370,9 @@ pub fn build(
         }
         bindings.push(b);
     }
-    let needs_approval = !parsed.placeholders.is_empty() || !handles.is_empty();
+    // a capture always needs approval: it writes a new secret into the vault (ADR 0015 §5, review fix)
+    let needs_approval =
+        !parsed.placeholders.is_empty() || !handles.is_empty() || req.capture.is_some();
     let key = grant_key(
         req.command,
         &cwd,
@@ -646,7 +652,7 @@ fn allow_grant(
         max_runtime,
         unbound: false,
         created: Deadline::after(QUEUE_LIFE),
-        state: if stale.is_empty() {
+        state: if stale.is_empty() && req.capture.is_none() {
             State::Approved
         } else {
             State::Pending

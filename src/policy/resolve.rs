@@ -3,13 +3,14 @@
 //! Results are cached by (dev, inode, size, mtime, ctime) — ctime can't be set by users.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Executables larger than this are refused (and never hashed).
 pub const MAX_EXE: u64 = 512 * 1024 * 1024;
+/// Hash cache entries (one per distinct executable/script file seen this session).
+const MAX_CACHE: usize = 4096;
 
 /// POSIX `sh` special and regular builtins we accept as command words (they have no file to pin).
 const BUILTINS: &[&str] = &[
@@ -65,11 +66,14 @@ pub fn hash_file(p: &Path) -> Option<[u8; 32]> {
     if let Some(h) = CACHE.lock().ok()?.as_ref().and_then(|c| c.get(&k)) {
         return Some(*h);
     }
-    let mut buf = Vec::with_capacity(usize::try_from(m.size()).ok()?);
-    f.take(MAX_EXE).read_to_end(&mut buf).ok()?;
-    let h = crate::crypto::sha256(&buf);
+    let h = crate::crypto::sha256_reader(&f, MAX_EXE).ok()??;
     if let Ok(mut g) = CACHE.lock() {
-        g.get_or_insert_with(HashMap::new).insert(k, h);
+        let c = g.get_or_insert_with(HashMap::new);
+        // bounded: a flood of distinct files can't grow broker memory (entries are re-hashed after a reset)
+        if c.len() >= MAX_CACHE {
+            c.clear();
+        }
+        c.insert(k, h);
     }
     Some(h)
 }

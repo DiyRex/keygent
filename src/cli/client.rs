@@ -12,7 +12,6 @@ use crate::error::{Error, Result};
 use crate::platform::{Dirs, ipc};
 use crate::proto::frame::{self, Frame, ty};
 use crate::proto::msg::{self, Class, ErrMsg, Hello, Welcome, code};
-use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -27,9 +26,7 @@ pub struct Conn {
 
 fn file_sha256(p: &Path) -> Result<[u8; 32]> {
     let f = std::fs::File::open(p)?;
-    let mut buf = Vec::new();
-    f.take(256 * 1024 * 1024).read_to_end(&mut buf)?;
-    Ok(crypto::sha256(&buf))
+    crypto::sha256_reader(f, 256 * 1024 * 1024)?.ok_or(Error::BrokerUnverified)
 }
 
 /// The peer must be the real broker: same uid, PID + start time recorded in a **held** `broker.lock`, and an

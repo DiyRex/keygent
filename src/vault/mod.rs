@@ -506,15 +506,21 @@ impl Vault {
             platform::atomic_replace(data, PREV_FILE, &self.original)?;
         }
         platform::atomic_replace(data, VAULT_FILE, &bytes)?;
-        if prev == Prev::Drop {
-            drop_old_copies(data);
-        }
-        self.keystore
-            .set_tripwire(&self.index.tripwire_id, &file.uuid, generation)?;
+        // the new vault is durable from here on: memory must follow it, and nothing below may report "unchanged"
+        let uuid = file.uuid;
         self.file = file;
         self.tripwire_gen = generation;
         self.original = bytes;
         self.rolled_back = false;
+        if prev == Prev::Drop {
+            drop_old_copies(data);
+        }
+        // Defense in depth only: a failed tripwire write leaves the previous generation recorded, which the next
+        // successful commit (or open, `max(seen, file)`) repairs. Failing here would claim the commit didn't happen
+        // after it did (e.g. `passwd` reporting an error while the new passphrase is live) — review fix.
+        let _ = self
+            .keystore
+            .set_tripwire(&self.index.tripwire_id, &uuid, generation);
         Ok(())
     }
 }

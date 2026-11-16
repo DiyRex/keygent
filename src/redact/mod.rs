@@ -395,6 +395,16 @@ fn run_len(b: &[u8], ok: impl Fn(u8) -> bool) -> usize {
     b.iter().take_while(|&&c| ok(c)).count()
 }
 
+/// A detector match still growing at the end of the buffer is held back (`Partial`) — but never past `MAX_DETECT`:
+/// beyond that the held run is redacted as one match and streaming resumes (fail closed; bounds memory and rescans).
+fn held(b: &[u8]) -> Detect {
+    if b.len() >= MAX_DETECT {
+        Detect::Full(b.len())
+    } else {
+        Detect::Partial
+    }
+}
+
 /// `prefix` then ≥ `min` chars of `class`; the token ends at the first byte outside `class`.
 fn token_rule(
     b: &[u8],
@@ -418,7 +428,7 @@ fn token_rule(
         return if exact && k >= min {
             Detect::Full(prefix.len().saturating_add(min))
         } else {
-            Detect::Partial
+            held(b)
         };
     }
     if exact {
@@ -513,7 +523,7 @@ fn jwt(b: &[u8]) -> Detect {
         }
         let k = run_len(seg, b64url);
         if k == seg.len() {
-            return Detect::Partial;
+            return held(b);
         }
         if k < 10 {
             return Detect::None;

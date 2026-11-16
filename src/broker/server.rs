@@ -288,17 +288,11 @@ fn redact(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
         );
         return;
     }
-    let (out, hits) = {
-        let Ok(mut g) = shared.state.lock() else {
-            return;
-        };
-        let Some(st) = g.as_mut() else { return };
-        if let Err(reason) = shared.reload_if_changed(st) {
-            drop(g);
-            shared.seal(reason);
-        }
-        st.redactor.redact_all(&data)
+    // take the redactor under the lock, redact outside it (up to 1 MiB must not stall other requests)
+    let Some(redactor) = with_state(shared, |st| st.redactor.clone()) else {
+        return;
     };
+    let (out, hits) = redactor.redact_all(&data);
     match msg::encode_data(&out, Some(u32::try_from(hits).unwrap_or(u32::MAX))) {
         Ok(p) => {
             let _ = frame::write(s, ty::REDACTED, &p);
@@ -318,7 +312,11 @@ fn with_state<T>(shared: &Shared, f: impl FnOnce(&mut super::State) -> T) -> Opt
         shared.seal(reason);
     }
     shared.touch(st);
-    Some(f(st))
+    let r = f(st);
+    drop(g);
+    // a seal requested under the lock (`write_vault`) happens now that the guard is gone
+    shared.seal_if_deferred();
+    Some(r)
 }
 
 fn wire_state(g: &grant::Grant) -> u8 {

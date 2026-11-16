@@ -198,9 +198,28 @@ pub struct Shared {
     /// Session ids of active runs; sealing kills them.
     pub runs: Mutex<Vec<i32>>,
     sealing: AtomicBool,
+    /// A seal requested while the state lock is held (`write_vault`): performed by `with_state` once the guard is
+    /// dropped, so `seal()` can still take the state and audit the seal.
+    deferred_seal: Mutex<Option<&'static str>>,
 }
 
 impl Shared {
+    /// Request a seal from code that holds the state lock; returns the error to propagate.
+    fn defer_seal(&self, reason: &'static str) -> Error {
+        if let Ok(mut d) = self.deferred_seal.lock() {
+            d.get_or_insert(reason);
+        }
+        Error::Internal(156)
+    }
+
+    /// Seal now if a seal was deferred. Call only without the state lock held.
+    pub fn seal_if_deferred(&self) {
+        let reason = self.deferred_seal.lock().ok().and_then(|mut d| d.take());
+        if let Some(r) = reason {
+            self.seal(r);
+        }
+    }
+
     /// Seal: drop every secret (locked blocks wipe themselves), remove the socket, exit. Runs once.
     pub fn seal(&self, reason: &'static str) -> ! {
         if self.sealing.swap(true, Ordering::SeqCst) {
@@ -211,10 +230,14 @@ impl Shared {
         }
         self.log.event(Level::Info, reason, None);
         let _ = std::fs::remove_file(&self.sock);
-        if let Ok(r) = self.runs.try_lock() {
-            for &sid in r.iter() {
-                ipc::kill_session(sid);
-            }
+        // the runs list is only ever held for a push/retain (never across a seal), so waiting is safe; every active
+        // run must die with the session (review fix: `try_lock` could skip them)
+        let sids: Vec<i32> = match self.runs.lock() {
+            Ok(r) => r.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        for sid in sids {
+            ipc::kill_session(sid);
         }
         // never block here: a caller may (wrongly) still hold the lock; exiting frees everything regardless
         if let Ok(mut g) = self.state.try_lock() {
@@ -240,7 +263,7 @@ impl Shared {
     ) -> Result<()> {
         let _lock = crate::vault::try_lock(&self.dirs)?;
         if let Err(reason) = self.reload_if_changed(st) {
-            self.seal(reason);
+            return Err(self.defer_seal(reason));
         }
         // audit first (as the CLI does): no record, no change
         let k = st.vault.audit_key()?;
@@ -249,21 +272,22 @@ impl Shared {
             Ok(p) => p,
             Err(e) => {
                 // discard any partial in-memory change by reopening what is on disk
-                match Vault::open_with_dek(&self.dirs, st.vault.dek_copy()) {
-                    Ok(v) => st.vault = v,
-                    Err(_) => self.seal("seal_reload_failed"),
-                }
-                return Err(e);
+                return match Vault::open_with_dek(&self.dirs, st.vault.dek_copy()) {
+                    Ok(v) => {
+                        st.vault = v;
+                        Err(e)
+                    }
+                    Err(_) => Err(self.defer_seal("seal_reload_failed")),
+                };
             }
         };
         st.vault.index.audit_anchor = Some(crate::vault::index::AuditAnchor { seq, mac });
         if st.vault.commit(prev).is_err() {
             // memory and disk may now disagree: fail closed
-            self.seal("seal_commit_failed");
+            return Err(self.defer_seal("seal_commit_failed"));
         }
         st.refresh_redactor()
-            .unwrap_or_else(|reason| self.seal(reason));
-        Ok(())
+            .map_err(|reason| self.defer_seal(reason))
     }
 
     /// A client request counts as activity for the idle timer.
@@ -409,22 +433,29 @@ pub fn main() -> ExitCode {
         decided: Condvar::new(),
         runs: Mutex::new(Vec::new()),
         sealing: AtomicBool::new(false),
+        deferred_seal: Mutex::new(None),
     });
-    spawn_watchers(&shared);
+    // the TTL / idle / wake / signal watchers are what seal the session: no watchers, no session (fail closed)
+    if !spawn_watchers(&shared) {
+        shared
+            .log
+            .event(Level::Error, "refuse_start_watchers", None);
+        shared.seal("seal_watchers_failed");
+    }
     server::serve(&shared, &endpoint.listener);
     shared.seal("seal_listener_closed")
 }
 
-fn spawn_watchers(shared: &Arc<Shared>) {
+fn spawn_watchers(shared: &Arc<Shared>) -> bool {
     let s = shared.clone();
-    let _ = std::thread::Builder::new()
+    let signals = std::thread::Builder::new()
         .stack_size(THREAD_STACK)
         .spawn(move || {
             let _sig = ipc::wait_term_signal();
             s.seal("seal_signal")
         });
     let s = shared.clone();
-    let _ = std::thread::Builder::new()
+    let timers = std::thread::Builder::new()
         .stack_size(THREAD_STACK)
         .spawn(move || {
             let mut watch = SuspendWatch::new();
@@ -451,6 +482,7 @@ fn spawn_watchers(shared: &Arc<Shared>) {
                 }
             }
         });
+    signals.is_ok() && timers.is_ok()
 }
 
 /// Verify the broker's handshake proof with keys the CLI derived locally (auth flows; SPEC §5.5.1).

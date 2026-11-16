@@ -158,7 +158,8 @@ pub fn matches(args: &[String], flags: &[FlagSpec], argv: &[String]) -> bool {
             (false, None) => {}
             (false, Some(_)) => return false,
             (true, Some(v)) => {
-                if v.is_empty() {
+                // same rule as the `--flag value` form: a value never looks like a flag
+                if v.is_empty() || v.starts_with('-') {
                     return false;
                 }
             }
@@ -227,6 +228,10 @@ mod tests {
         assert!(m(&["customers", "list", "acme"]));
         assert!(m(&["customers", "list", "acme", "--limit", "3", "--json"]));
         assert!(m(&["customers", "list", "acme", "--limit=3"]));
+        assert!(
+            !m(&["customers", "list", "acme", "--limit=-1"]),
+            "=value can't look like a flag"
+        );
         assert!(
             !m(&["customers", "list", "-x"]),
             "* never matches a dash argument"
