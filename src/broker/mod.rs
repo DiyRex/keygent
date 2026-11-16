@@ -229,6 +229,43 @@ impl Shared {
         std::process::exit(0)
     }
 
+    /// Broker-side vault write (ADR 0015), only for changes an agent may trigger: capability-reducing (`untrust`) or
+    /// create-only (`capture`). Takes the vault lock without waiting, reloads, applies `f`, appends the audit record,
+    /// anchors it in the index and commits. Any failure leaves the vault as it was on disk; a failed commit seals.
+    pub fn write_vault(
+        &self,
+        st: &mut State,
+        record: &crate::vault::audit::Record<'_>,
+        f: impl FnOnce(&mut Vault) -> Result<crate::vault::Prev>,
+    ) -> Result<()> {
+        let _lock = crate::vault::try_lock(&self.dirs)?;
+        if let Err(reason) = self.reload_if_changed(st) {
+            self.seal(reason);
+        }
+        // audit first (as the CLI does): no record, no change
+        let k = st.vault.audit_key()?;
+        let (seq, mac) = crate::vault::audit::append(&self.dirs, &k, record)?;
+        let prev = match f(&mut st.vault) {
+            Ok(p) => p,
+            Err(e) => {
+                // discard any partial in-memory change by reopening what is on disk
+                match Vault::open_with_dek(&self.dirs, st.vault.dek_copy()) {
+                    Ok(v) => st.vault = v,
+                    Err(_) => self.seal("seal_reload_failed"),
+                }
+                return Err(e);
+            }
+        };
+        st.vault.index.audit_anchor = Some(crate::vault::index::AuditAnchor { seq, mac });
+        if st.vault.commit(prev).is_err() {
+            // memory and disk may now disagree: fail closed
+            self.seal("seal_commit_failed");
+        }
+        st.refresh_redactor()
+            .unwrap_or_else(|reason| self.seal(reason));
+        Ok(())
+    }
+
     /// A client request counts as activity for the idle timer.
     pub fn touch(&self, st: &mut State) {
         st.idle_deadline = Deadline::after(self.idle);

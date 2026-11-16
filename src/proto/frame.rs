@@ -43,6 +43,7 @@ pub mod ty {
     pub const CHECK_REPLY: u8 = 55;
     pub const AUDIT_VERIFY: u8 = 56;
     pub const AUDIT_OK: u8 = 57;
+    pub const UNTRUST: u8 = 58;
 }
 
 #[derive(Debug, PartialEq, Eq)]

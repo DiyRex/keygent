@@ -13,6 +13,8 @@ mod recovery;
 mod rules;
 #[cfg(unix)]
 mod session;
+#[cfg(unix)]
+mod trust;
 
 use crate::error::{Error, Result};
 use std::io::Write;
@@ -26,6 +28,7 @@ Run:      run [--max-runtime 30m] -- '<command with {{keygent:<handle>}}>' · ru
 Approve:  pending · approve [<id>] [--remember] · deny [<id> | --all]
 Rules:    rule add <handle> [--home scratch] -- <program> [args… | * | ** --flag --value-flag=]
           rule ls <handle> · rule rm <handle> <n>
+Project:  trust · untrust   (.keygent.toml: version = 1, then [secrets] entries)
 Audit:    audit [--since 1h] [--verify]
 Vault:    init [--own-passphrase] · passwd [--own-passphrase] · rekey · recover [--own-passphrase]
           verify · backup <file> · restore <file> [--new-machine] [--own-passphrase] · status
@@ -135,6 +138,10 @@ fn run(argv: &[String]) -> Result<()> {
             &[("--home", true)],
             "keygent rule add|ls|rm — see 'keygent help'",
         )?),
+        #[cfg(unix)]
+        "trust" => trust::trust(Args::parse(&rest, &[], "keygent trust")?),
+        #[cfg(unix)]
+        "untrust" => trust::untrust(Args::parse(&rest, &[], "keygent untrust")?),
         #[cfg(unix)]
         "audit" => session::audit(Args::parse(
             &rest,

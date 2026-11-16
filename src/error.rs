@@ -9,6 +9,7 @@ pub mod exit {
     pub const USAGE: u8 = 64;
     pub const RUN_LIMIT: u8 = 74;
     pub const APPROVAL: u8 = 75;
+    pub const NOT_TRUSTED: u8 = 76;
     pub const POLICY: u8 = 77;
     pub const SEALED: u8 = 78;
     pub const BROKER: u8 = 79;
@@ -29,6 +30,7 @@ pub enum PolicyMsg {
     QueueTimeout,
     Limit(u64),
     NoRemember,
+    NotTrusted,
 }
 
 /// Every failure keygent itself reports. Variants hold only non-secret data (handles, env names, limits, codes).
@@ -79,6 +81,9 @@ pub enum Error {
     AmbiguousPending,
     /// An audit append failed: fail closed (SPEC §5.7 step 7, §9).
     AuditUnwritable,
+    NoManifest,
+    /// `.keygent.toml` failed to parse at this line (0 = size/encoding).
+    BadManifest(usize),
     /// `audit --verify` found a broken chain at this record (0 = anchor/truncation).
     AuditBroken(u64),
     /// The child's own exit code, passed through silently (`run`). Never displayed.
@@ -98,6 +103,7 @@ impl Error {
                 PolicyMsg::Denied(_) | PolicyMsg::QueueTimeout => exit::APPROVAL,
                 PolicyMsg::Limit(_) => exit::RUN_LIMIT,
                 PolicyMsg::Unparsable | PolicyMsg::NoRemember => exit::USAGE,
+                PolicyMsg::NotTrusted => exit::NOT_TRUSTED,
                 _ => exit::POLICY,
             },
             Error::Remote(code, _) | Error::Exit(code) => *code,
@@ -179,9 +185,13 @@ impl fmt::Display for Error {
                 PolicyMsg::QueueTimeout => f.write_str("keygent: approval timed out in the queue — retry"),
                 PolicyMsg::Limit(min) => write!(f, "keygent: run stopped at its limit ({min} min / 10 MiB) — use --max-runtime or run_in_background"),
                 PolicyMsg::NoRemember => f.write_str("keygent: --remember isn't available for this run (it runs code keygent can't fully show)"),
+                PolicyMsg::NotTrusted => f.write_str("keygent: .keygent.toml changed — ask the user to run 'keygent trust'"),
             },
             Error::Remote(_, m) => f.write_str(m),
             Error::NoPending => f.write_str("keygent: no pending requests"),
+            Error::NoManifest => f.write_str("keygent: no .keygent.toml here or above (up to the repo root)"),
+            Error::BadManifest(0) => f.write_str("keygent: .keygent.toml is too large or not UTF-8 (max 64 KiB)"),
+            Error::BadManifest(n) => write!(f, "keygent: .keygent.toml line {n} is not valid — only version and [secrets] entries"),
             Error::AuditUnwritable => f.write_str("keygent: audit log unwritable — run 'keygent doctor'"),
             Error::AuditBroken(0) => {
                 f.write_str("keygent: audit log truncated or its anchor doesn't match — run 'keygent doctor'")
@@ -278,6 +288,10 @@ mod tests {
             Error::Policy(PolicyMsg::QueueTimeout),
             Error::Policy(PolicyMsg::Limit(240)),
             Error::Policy(PolicyMsg::NoRemember),
+            Error::Policy(PolicyMsg::NotTrusted),
+            Error::NoManifest,
+            Error::BadManifest(0),
+            Error::BadManifest(usize::MAX),
             Error::NoPending,
             Error::AmbiguousPending,
             Error::AuditUnwritable,

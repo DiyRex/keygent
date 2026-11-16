@@ -87,6 +87,7 @@ pub fn send_error(s: &mut UnixStream, e: &Error) {
         Error::AuditUnwritable | Error::AuditBroken(_) => code::AUDIT,
         _ => match e.exit_code() {
             crate::error::exit::APPROVAL => code::APPROVAL_DENIED,
+            crate::error::exit::NOT_TRUSTED => code::NOT_TRUSTED,
             crate::error::exit::POLICY => code::POLICY_DENIED,
             crate::error::exit::RUN_LIMIT => code::RUN_LIMIT,
             crate::error::exit::USAGE => code::BAD_REQUEST,
@@ -175,6 +176,7 @@ fn handle(shared: &Shared, mut s: UnixStream) {
         ty::PENDING if msg::expect_empty(&req.payload).is_ok() => pending(shared, &mut s),
         ty::APPROVE => approve(shared, &mut s, &req.payload, &nb, &hello.nonce),
         ty::DENY => deny(shared, &mut s, &req.payload),
+        ty::UNTRUST => untrust(shared, &mut s, &req.payload),
         ty::AUDIT_VERIFY if msg::expect_empty(&req.payload).is_ok() => audit_verify(shared, &mut s),
         ty::RUN => run_grant(shared, s, &req.payload),
         ty::STATUS if msg::expect_empty(&req.payload).is_ok() => status(shared, &mut s),
@@ -338,7 +340,17 @@ fn grant_create(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
     let Ok(gc) = GrantCreate::decode(payload) else {
         return bad_request(s);
     };
-    let Some(snap) = with_state(shared, |st| grant::policy_snapshot(&st.vault.index)) else {
+    let Some((snap, trusted)) = with_state(shared, |st| {
+        (
+            grant::policy_snapshot(&st.vault.index),
+            st.vault
+                .index
+                .trusted_manifests
+                .iter()
+                .map(|t| (t.canonical_path.clone(), t.sha256))
+                .collect::<Vec<_>>(),
+        )
+    }) else {
         return;
     };
     // resolution and hashing happen without the state lock
@@ -350,6 +362,7 @@ fn grant_create(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
             max_runtime: gc.max_runtime_secs.map(std::time::Duration::from_secs),
         },
         &snap,
+        &trusted,
         &shared.path,
         home.as_deref(),
     );
@@ -560,6 +573,49 @@ fn deny(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
         shared.decided.notify_all();
         shared.log.event(Level::Info, "grant_denied", Some(n));
         let _ = frame::write(s, ty::OK, &[]);
+    }
+}
+
+/// `Untrust{cwd}` (agent-safe, SPEC §5.1): drop the trust record of the manifest that governs `cwd`. Only removes
+/// capability, so it needs no auth.
+fn untrust(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
+    let Ok(gc) = GrantCreate::decode(payload) else {
+        return bad_request(s);
+    };
+    let Ok(cwd) = std::fs::canonicalize(&gc.cwd) else {
+        return send_error(s, &Error::NoManifest);
+    };
+    let Some(m) = crate::policy::manifest::find(&cwd) else {
+        return send_error(s, &Error::NoManifest);
+    };
+    let path = m.path.display().to_string();
+    let r = with_state(shared, |st| {
+        if !st
+            .vault
+            .index
+            .trusted_manifests
+            .iter()
+            .any(|t| t.canonical_path == path)
+        {
+            return Ok(false);
+        }
+        let mut rec = crate::vault::audit::Record::new("untrust");
+        rec.cwd = Some(path.clone());
+        shared
+            .write_vault(st, &rec, |v| {
+                v.index
+                    .trusted_manifests
+                    .retain(|t| t.canonical_path != path);
+                Ok(crate::vault::Prev::Keep)
+            })
+            .map(|()| true)
+    });
+    match r {
+        Some(Ok(_)) => {
+            let _ = frame::write(s, ty::OK, &[]);
+        }
+        Some(Err(e)) => send_error(s, &e),
+        None => {}
     }
 }
 

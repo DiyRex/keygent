@@ -94,6 +94,16 @@ pub struct Lock {
 }
 
 pub fn lock(dirs: &Dirs) -> Result<Lock> {
+    lock_inner(dirs, true)
+}
+
+/// Non-blocking `lock` for the broker: a human command holding the lock (e.g. at its passphrase prompt) makes this
+/// fail with `RateLimited` ("retry in a few seconds") instead of stalling a broker thread.
+pub fn try_lock(dirs: &Dirs) -> Result<Lock> {
+    lock_inner(dirs, false)
+}
+
+fn lock_inner(dirs: &Dirs, wait: bool) -> Result<Lock> {
     prepare_data_dir(dirs)?;
     let p = dirs.data.join(LOCK_FILE);
     let os = platform::os();
@@ -107,7 +117,14 @@ pub fn lock(dirs: &Dirs) -> Result<Lock> {
             Err(_) => os.open_private(&p)?.ok_or(Error::UnsafePath("lock file"))?,
         },
     };
-    f.lock()?;
+    if wait {
+        f.lock()?;
+    } else {
+        f.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => Error::RateLimited,
+            std::fs::TryLockError::Error(e) => e.into(),
+        })?;
+    }
     platform::sweep_tmp(&dirs.data);
     Ok(Lock { _f: f })
 }

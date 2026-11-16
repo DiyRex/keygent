@@ -54,10 +54,19 @@ pub struct SimpleCmd {
     pub assigns: Vec<String>,
 }
 
+/// A `$NAME` / `${NAME…}` reference outside single quotes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VarRef {
+    pub name: String,
+    pub quote: Quote,
+    pub role: Role,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Parsed {
     pub commands: Vec<SimpleCmd>,
     pub placeholders: Vec<Placeholder>,
+    pub vars: Vec<VarRef>,
     /// Any operator, redirect, subshell, substitution, glob, `~` or `$` (allow rules never match these).
     pub metachar: bool,
     pub substitution: bool,
@@ -209,10 +218,34 @@ impl<'a> Lex<'a> {
         Ok(true)
     }
 
-    fn dollar(&mut self) -> Result<(), TokError> {
-        // `$` expansion of any kind: never literal. `$(…)` and `${…}` are read whole (nesting-aware).
+    /// A shell variable name starting at byte `at`.
+    fn name_at(&self, at: usize) -> Option<String> {
+        let rest = self.s.get(at..)?;
+        let first = *rest.first()?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        let n = rest
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        std::str::from_utf8(rest.get(..n)?).ok().map(str::to_owned)
+    }
+
+    fn dollar(&mut self, quote: Quote) -> Result<(), TokError> {
+        // `$` expansion of any kind: never literal. `$(…)` and `${…}` are read whole (nesting-aware). `$NAME` and
+        // `${NAME…}` are recorded (manifest env references, SPEC §5.7 step 2).
         self.out.metachar = true;
         self.taint();
+        let brace = self.peek(1) == Some(b'{');
+        let at = self.i.saturating_add(if brace { 2 } else { 1 });
+        if let Some(name) = self.name_at(at) {
+            self.out.vars.push(VarRef {
+                name,
+                quote,
+                role: self.word_role,
+            });
+        }
         match self.peek(1) {
             Some(b'(') => {
                 self.out.substitution = true;
@@ -346,7 +379,7 @@ impl<'a> Lex<'a> {
                     }
                     self.i = self.i.saturating_add(2);
                 }
-                Some(b'$') => self.dollar()?,
+                Some(b'$') => self.dollar(Quote::Double)?,
                 Some(b'`') => self.backtick()?,
                 Some(_) => {
                     if self.placeholder(Quote::Double)? {
@@ -497,7 +530,7 @@ impl<'a> Lex<'a> {
                     }
                     self.i = self.i.saturating_add(2);
                 }
-                b'$' => self.dollar()?,
+                b'$' => self.dollar(Quote::None)?,
                 b'`' => self.backtick()?,
                 b'*' | b'?' | b'[' => {
                     self.out.metachar = true;
@@ -675,6 +708,24 @@ mod tests {
         assert_eq!(
             parse(&"a".repeat(MAX_CMD + 1)).err(),
             Some(TokError::TooLong)
+        );
+    }
+
+    #[test]
+    fn variable_references() {
+        let p = parse("A=\"$TOKEN\" tool --key \"${API_KEY:-x}\" $HOME '$NOT' ${1}").unwrap();
+        let v: Vec<(&str, Quote, Role)> = p
+            .vars
+            .iter()
+            .map(|v| (v.name.as_str(), v.quote, v.role))
+            .collect();
+        assert_eq!(
+            v,
+            vec![
+                ("TOKEN", Quote::Double, Role::Assign),
+                ("API_KEY", Quote::Double, Role::Argv),
+                ("HOME", Quote::None, Role::Argv),
+            ]
         );
     }
 

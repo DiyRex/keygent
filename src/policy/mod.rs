@@ -2,6 +2,7 @@
 //! (SPEC §4.2, §5.5.2, §5.7, §6).
 
 pub mod allow;
+pub mod manifest;
 pub mod render;
 #[cfg(unix)]
 pub mod resolve;

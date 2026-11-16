@@ -1426,3 +1426,104 @@ fn allow_rules_run_pinned_tools_silently() {
     let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
     assert_eq!(code, 0, "{err}");
 }
+
+// ---------------------------------------------------------------- manifest trust (Phase 2 M4)
+
+#[test]
+fn manifest_needs_trust_and_any_change_untrusts_it() {
+    let (root, c, proj) = run_setup();
+    let mf = proj.join(".keygent.toml");
+    std::fs::write(
+        &mf,
+        "version = 1\n[secrets]\n\"svc/key\" = { env = \"SVC_TOKEN\" }\n",
+    )
+    .unwrap();
+    let use_it = "X=\"$SVC_TOKEN\" sh -c 'printf \"%s\\n\" \"$X\"'";
+    let go = |c: &str| {
+        let mut x = cmd(&root, &["run", "--", c]);
+        x.current_dir(&proj);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let not_trusted = "keygent: .keygent.toml changed — ask the user to run 'keygent trust'";
+    assert_eq!(go(use_it), (76, format!("{not_trusted}\n")));
+    // trust shows the whole file and the bindings, then needs the passphrase
+    let mut x = cmd(&root, &["trust"]);
+    x.current_dir(&proj);
+    let mut s = Session::start_cmd(x);
+    s.send(PASS);
+    let (code, _, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("  | \"svc/key\" = { env = \"SVC_TOKEN\" }"),
+        "{err}"
+    );
+    assert!(
+        err.contains("svc/key → $SVC_TOKEN") && err.contains("keygent: trusted "),
+        "{err}"
+    );
+    // now a reference is an approval-required binding; the value is injected under the manifest's name
+    let mut s = run_in(&root, &proj, &["run", "--", use_it]);
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("svc/key → $SVC_TOKEN") && out.contains("manifest: "),
+        "{out}"
+    );
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!((code, out.as_str()), (0, "‹keygent:svc/key›\n"), "{err}");
+    assert!(!out.contains(&c));
+    // the argv rule applies to $NAME too
+    let (code, err) = go("printf %s \"$SVC_TOKEN\"");
+    assert_eq!(code, 77, "{err}");
+    // unrelated variables need nothing
+    let mut x = cmd(&root, &["run", "--", "echo \"$TERM\""]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        (o.status.code(), o.stdout.as_slice()),
+        (Some(0), b"dumb\n".as_slice())
+    );
+    // any change un-trusts it
+    let mut f = std::fs::OpenOptions::new().append(true).open(&mf).unwrap();
+    f.write_all(b"# edited\n").unwrap();
+    drop(f);
+    assert_eq!(go(use_it), (76, format!("{not_trusted}\n")));
+    // untrust is agent-safe (no passphrase) and drops the trust of the current content
+    let mut x = cmd(&root, &["trust"]);
+    x.current_dir(&proj);
+    let mut s = Session::start_cmd(x);
+    s.send(PASS);
+    assert_eq!(s.finish().0, 0);
+    let mut x = cmd(&root, &["untrust"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(go(use_it), (76, format!("{not_trusted}\n")));
+    // invalid manifests can't be trusted
+    std::fs::write(
+        &mf,
+        "version = 1\n[secrets]\n\"svc/key\" = { env = \"PATH\" }\n",
+    )
+    .unwrap();
+    let mut x = cmd(&root, &["trust"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8(o.stderr)
+            .unwrap()
+            .contains("line 3 is not valid")
+    );
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+}

@@ -215,9 +215,11 @@ fn bind_script(
 
 /// Build a grant (not yet stored). Errors are agent-facing policy decisions.
 /// `snap` is the handles' policy, snapshotted under the state lock.
+/// `trusted`: (canonical manifest path, SHA-256) pairs the human trusted.
 pub fn build(
     req: &Request<'_>,
     snap: &[HandlePolicy],
+    trusted: &[(String, [u8; 32])],
     path_var: &str,
     home: Option<&Path>,
 ) -> Result<Grant> {
@@ -247,6 +249,7 @@ pub fn build(
         return Err(Error::Policy(crate::error::PolicyMsg::BadCwd));
     }
     let root = project_root(&cwd);
+    let (manifest_bindings, manifest_note) = manifest_refs(&parsed, &cwd, snap, trusted)?;
     let bind_root = root.clone().unwrap_or_else(|| cwd.clone());
     let max_runtime = req.max_runtime.unwrap_or(DEFAULT_RUNTIME);
     if max_runtime.is_zero() || max_runtime > MAX_RUNTIME {
@@ -349,6 +352,14 @@ pub fn build(
         RewriteError::SingleQuoted(_) => Error::Policy(crate::error::PolicyMsg::SingleQuoted),
         RewriteError::Overlap => Error::Policy(crate::error::PolicyMsg::Unparsable),
     })?;
+    let mut bindings = rw.bindings;
+    for b in manifest_bindings {
+        if !handles.contains(&b.handle) {
+            handles.push(b.handle.clone());
+        }
+        bindings.push(b);
+    }
+    let needs_approval = !parsed.placeholders.is_empty() || !handles.is_empty();
     let key = grant_key(
         req.command,
         &cwd,
@@ -357,8 +368,7 @@ pub fn build(
         &scripts,
         max_runtime,
     )?;
-    let env: Vec<(String, String)> = rw
-        .bindings
+    let env: Vec<(String, String)> = bindings
         .iter()
         .map(|b| (b.handle.clone(), b.var.clone()))
         .collect();
@@ -400,7 +410,7 @@ pub fn build(
         unbound: true,
         argv_exposed,
         max_runtime_min: minutes(max_runtime),
-        notes: &[],
+        notes: &manifest_note,
     });
     Ok(Grant {
         direct: None,
@@ -411,19 +421,84 @@ pub fn build(
         rewritten: rw.cmd,
         cwd,
         handles,
-        bindings: rw.bindings,
+        bindings,
         programs,
         scripts,
         max_runtime,
         unbound: true,
         created: Deadline::after(QUEUE_LIFE),
-        state: if parsed.placeholders.is_empty() {
-            State::Approved
-        } else {
+        state: if needs_approval {
             State::Pending
+        } else {
+            State::Approved
         },
         rendered,
     })
+}
+
+/// Env names from the project manifest that the command references (`$NAME`, SPEC §5.7 step 2). The manifest must be
+/// trusted with exactly this content, every referenced handle must exist and not be denied, and the argv rule applies
+/// to `$NAME` as to placeholders. Unreferenced manifest entries inject nothing.
+fn manifest_refs(
+    parsed: &tokenize::Parsed,
+    cwd: &Path,
+    snap: &[HandlePolicy],
+    trusted: &[(String, [u8; 32])],
+) -> Result<(Vec<Binding>, Vec<String>)> {
+    if parsed.vars.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let Some(m) = crate::policy::manifest::find(cwd) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let path = m.path.display().to_string();
+    let is_trusted = trusted
+        .iter()
+        .any(|(p, h)| *p == path && crypto::ct_eq(h, &m.sha256));
+    let entries = m.entries.as_ref().ok();
+    let mut out: Vec<Binding> = Vec::new();
+    for v in &parsed.vars {
+        let Some(e) = entries.and_then(|es| es.iter().find(|e| e.env == v.name)) else {
+            // a changed or broken manifest can't vouch for any name; one we can't parse fails closed below
+            if entries.is_none() && !is_trusted {
+                return Err(Error::Policy(crate::error::PolicyMsg::NotTrusted));
+            }
+            continue;
+        };
+        if !is_trusted {
+            return Err(Error::Policy(crate::error::PolicyMsg::NotTrusted));
+        }
+        let h = lookup(snap, &e.handle).ok_or_else(|| {
+            Error::Policy(crate::error::PolicyMsg::UnknownHandle(e.handle.clone()))
+        })?;
+        if h.mode == Mode::Deny {
+            return Err(Error::Policy(crate::error::PolicyMsg::NotAllowed(
+                e.handle.clone(),
+            )));
+        }
+        if !e.file
+            && matches!(v.role, tokenize::Role::Argv | tokenize::Role::Redirect)
+            && h.argv != Argv::Allow
+        {
+            return Err(Error::Policy(crate::error::PolicyMsg::ArgvSecret));
+        }
+        if !out.iter().any(|b| b.var == e.env) {
+            out.push(Binding {
+                var: e.env.clone(),
+                handle: e.handle.clone(),
+                file: e.file,
+            });
+        }
+    }
+    let note = if out.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "manifest: {path} (trusted, sha256 {})",
+            hex8(&m.sha256)
+        )]
+    };
+    Ok((out, note))
 }
 
 fn hex8(h: &[u8; 32]) -> String {
@@ -691,6 +766,7 @@ mod tests {
                 p.to_str().unwrap(),
             ),
             &policy_snapshot(&index()),
+            &[],
             "/usr/bin:/bin",
             None,
         )
@@ -712,6 +788,7 @@ mod tests {
                 p.to_str().unwrap(),
             ),
             &policy_snapshot(&index()),
+            &[],
             "/usr/bin:/bin",
             None,
         )
@@ -728,6 +805,7 @@ mod tests {
             build(
                 &req(c, cwd),
                 &policy_snapshot(&index()),
+                &[],
                 "/usr/bin:/bin",
                 None,
             )
@@ -758,6 +836,7 @@ mod tests {
         let r = build(
             &req("X={{keygent:stripe/live}} t", "/"),
             &policy_snapshot(&index()),
+            &[],
             "/usr/bin",
             None,
         );
@@ -785,6 +864,7 @@ mod tests {
             build(
                 &req(&format!("X={{{{keygent:stripe/live}}}} echo {n}"), cwd),
                 &policy_snapshot(&index()),
+                &[],
                 "/usr/bin:/bin",
                 None,
             )
@@ -805,6 +885,7 @@ mod tests {
         let g = build(
             &req("echo hi", cwd),
             &policy_snapshot(&index()),
+            &[],
             "/usr/bin:/bin",
             None,
         )
