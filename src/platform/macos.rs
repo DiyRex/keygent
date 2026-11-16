@@ -51,3 +51,57 @@ pub(super) fn is_network_fs(canon: &Path) -> Result<bool> {
     let local = s.f_flags & (libc::MNT_LOCAL as u32) != 0;
     Ok(!local || NETWORK_FS.iter().any(|n| name.starts_with(n)))
 }
+
+// ---------------------------------------------------------------- clipboard (reveal --copy)
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {}
+
+const CONCEALED: &str = "org.nspasteboard.ConcealedType";
+const PLAIN: &str = "public.utf8-plain-text";
+
+fn pasteboard() -> Result<objc2::rc::Retained<objc2::runtime::AnyObject>> {
+    let cls = objc2::runtime::AnyClass::get(c"NSPasteboard")
+        .ok_or(Error::Unsupported("reveal --copy"))?;
+    // SAFETY: +[NSPasteboard generalPasteboard] takes no arguments and returns an NSPasteboard (or nil).
+    let pb: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+        unsafe { objc2::msg_send![cls, generalPasteboard] };
+    pb.ok_or(Error::Unsupported("reveal --copy"))
+}
+
+/// NSPasteboard with the plain-text type plus `org.nspasteboard.ConcealedType`, which clipboard managers honour by
+/// not recording the item. Token = the pasteboard `changeCount` after our write.
+pub(super) fn clipboard_put(text: &str) -> Result<u64> {
+    use objc2_foundation::{NSArray, NSString};
+    let pb = pasteboard()?;
+    let plain = NSString::from_str(PLAIN);
+    let concealed = NSString::from_str(CONCEALED);
+    let value = NSString::from_str(text);
+    let types = NSArray::from_slice(&[&*plain, &*concealed]);
+    let none: Option<&objc2::runtime::AnyObject> = None;
+    // SAFETY: documented NSPasteboard selectors with matching argument and return types (NSInteger / BOOL).
+    let count: isize = unsafe {
+        let _: isize = objc2::msg_send![&*pb, clearContents];
+        let _: isize = objc2::msg_send![&*pb, declareTypes: &*types, owner: none];
+        let a: bool = objc2::msg_send![&*pb, setString: &*value, forType: &*plain];
+        let b: bool = objc2::msg_send![&*pb, setString: &*value, forType: &*concealed];
+        if !(a && b) {
+            let _: isize = objc2::msg_send![&*pb, clearContents];
+            return Err(Error::Unsupported("reveal --copy"));
+        }
+        objc2::msg_send![&*pb, changeCount]
+    };
+    u64::try_from(count).map_err(|_| Error::Internal(70))
+}
+
+pub(super) fn clipboard_clear_if_ours(token: u64, _text: &str) -> Result<()> {
+    let pb = pasteboard()?;
+    // SAFETY: -changeCount / -clearContents take no arguments and return NSInteger.
+    unsafe {
+        let now: isize = objc2::msg_send![&*pb, changeCount];
+        if u64::try_from(now).ok() == Some(token) {
+            let _: isize = objc2::msg_send![&*pb, clearContents];
+        }
+    }
+    Ok(())
+}

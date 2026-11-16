@@ -205,6 +205,30 @@ impl Platform for Os {
         Ok(Box::new(Termios { fd, saved }))
     }
 
+    fn clipboard_put(&self, text: &str) -> Result<u64> {
+        #[cfg(target_os = "macos")]
+        return super::macos::clipboard_put(text);
+        #[cfg(target_os = "linux")]
+        return super::linux::clipboard_put(text);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = text;
+            Err(Error::Unsupported("reveal --copy"))
+        }
+    }
+
+    fn clipboard_clear_if_ours(&self, token: u64, text: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        return super::macos::clipboard_clear_if_ours(token, text);
+        #[cfg(target_os = "linux")]
+        return super::linux::clipboard_clear_if_ours(token, text);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (token, text);
+            Err(Error::Unsupported("reveal --copy"))
+        }
+    }
+
     fn wait_readable(&self, f: &File, timeout: Duration) -> Result<bool> {
         let mut p = libc::pollfd {
             fd: f.as_raw_fd(),

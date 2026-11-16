@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 
 const PASSPHRASE_WORDS: usize = 6;
 const REVEAL_SECS: u64 = 20;
+const COPY_SECS: u64 = 10;
 const AUTH_ATTEMPTS: usize = 3;
 
 fn dirs() -> Result<Dirs> {
@@ -201,7 +202,7 @@ pub fn status(a: Args) -> Result<()> {
     }
     let d = dirs()?;
     let msg = if Vault::exists(&d) {
-        "sealed (Phase 1: the broker arrives in Phase 2)"
+        "vault sealed"
     } else {
         "no vault — run 'keygent init'"
     };
@@ -607,8 +608,9 @@ pub fn rename(a: Args) -> Result<()> {
 
 pub fn reveal(a: Args) -> Result<()> {
     let h = one_handle(&a, "keygent reveal <handle> [--copy]")?;
-    if a.has("--copy") {
-        return Err(Error::Unsupported("reveal --copy"));
+    if a.has("--copy") && platform::test_console() {
+        // tests must never touch the developer's real clipboard
+        return Err(Error::Unsupported("reveal --copy in test builds"));
     }
     let d = dirs()?;
     let l = vault::lock(&d)?;
@@ -618,11 +620,25 @@ pub fn reveal(a: Args) -> Result<()> {
     let value = v.read_entry(&h)?;
     drop(v);
     drop(l);
-    con.show_secret(
-        &format!("{h} (clears after {REVEAL_SECS} s or a keypress)"),
-        value.expose(),
-        Duration::from_secs(REVEAL_SECS),
-    )
+    if !a.has("--copy") {
+        return con.show_secret(
+            &format!("{h} (clears after {REVEAL_SECS} s or a keypress)"),
+            value.expose(),
+            Duration::from_secs(REVEAL_SECS),
+        );
+    }
+    // --copy: concealed clipboard, cleared after 10 s unless something else was copied meanwhile (SPEC §5.1)
+    let text = std::str::from_utf8(value.expose())
+        .map_err(|_| Error::Unsupported("reveal --copy of binary values"))?;
+    let os = platform::os();
+    let token = os.clipboard_put(text)?;
+    con.say(&format!(
+        "keygent: {h} copied — the clipboard clears in {COPY_SECS} s (keep this terminal open)"
+    ));
+    std::thread::sleep(Duration::from_secs(COPY_SECS));
+    os.clipboard_clear_if_ours(token, text)?;
+    con.say("keygent: clipboard cleared");
+    Ok(())
 }
 
 fn parse_secs(a: &Args, f: &'static str, max: u32) -> Result<Option<u32>> {

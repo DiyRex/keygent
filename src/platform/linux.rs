@@ -41,3 +41,72 @@ pub(super) fn is_network_fs(canon: &Path) -> Result<bool> {
     let t = s.f_type as i64;
     Ok(NETWORK_MAGIC.contains(&t))
 }
+
+// ---------------------------------------------------------------- clipboard (reveal --copy)
+
+/// Fixed tool paths (never PATH): Wayland `wl-copy`/`wl-paste`, else X11 `xclip`. The value goes over stdin, never argv.
+const WL_COPY: &str = "/usr/bin/wl-copy";
+const WL_PASTE: &str = "/usr/bin/wl-paste";
+const XCLIP: &str = "/usr/bin/xclip";
+
+fn tool() -> Result<(
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    &'static [&'static str],
+)> {
+    if Path::new(WL_COPY).exists() && Path::new(WL_PASTE).exists() {
+        return Ok((WL_COPY, &[], WL_PASTE, &["--no-newline"]));
+    }
+    if Path::new(XCLIP).exists() {
+        return Ok((
+            XCLIP,
+            &["-selection", "clipboard"],
+            XCLIP,
+            &["-selection", "clipboard", "-o"],
+        ));
+    }
+    Err(Error::Unsupported(
+        "reveal --copy (install wl-clipboard or xclip)",
+    ))
+}
+
+fn put(bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let (copy, args, _, _) = tool()?;
+    let mut c = Command::new(copy)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut i) = c.stdin.take() {
+        i.write_all(bytes)?;
+    }
+    if !c.wait()?.success() {
+        return Err(Error::Unsupported("reveal --copy"));
+    }
+    Ok(())
+}
+
+pub(super) fn clipboard_put(text: &str) -> Result<u64> {
+    put(text.as_bytes())?;
+    Ok(0)
+}
+
+/// Read the clipboard back and clear it only if it still holds our value (constant-time compare).
+pub(super) fn clipboard_clear_if_ours(_token: u64, text: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let (_, _, paste, pargs) = tool()?;
+    let out = Command::new(paste)
+        .args(pargs)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    let current = zeroize::Zeroizing::new(out.stdout);
+    if crate::crypto::ct_eq(&current, text.as_bytes()) {
+        put(b"")?;
+    }
+    Ok(())
+}

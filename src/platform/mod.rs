@@ -8,7 +8,7 @@
 //! - Writes that replace a file are atomic and durable (temp + full sync + rename + dir sync).
 //! - This module never holds secret values: console helpers hand raw bytes to the caller's zeroizing buffer.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,6 +66,12 @@ pub trait Platform {
     fn term_mode(&self, tty: &File, raw: bool) -> Result<Box<dyn TermGuard>>;
     /// Wait until `f` is readable or `timeout` passes. Returns true if readable.
     fn wait_readable(&self, f: &File, timeout: Duration) -> Result<bool>;
+    /// Put `text` on the clipboard, marked concealed where the OS supports it (macOS
+    /// `org.nspasteboard.ConcealedType`). Returns a token for `clipboard_clear_if_ours`. The text passes through
+    /// this call only; nothing is kept. Any same-user process can read the clipboard (known T2 gap, SPEC §5.1).
+    fn clipboard_put(&self, text: &str) -> Result<u64>;
+    /// Clear the clipboard if it still holds what `clipboard_put` placed there (never clobbers a later copy).
+    fn clipboard_clear_if_ours(&self, token: u64, text: &str) -> Result<()>;
 }
 
 /// The platform implementation for this build.
@@ -80,7 +86,7 @@ pub fn dirs() -> Result<Dirs> {
     if let Some(root) = std::env::var_os("KEYGENT_TEST_ROOT") {
         let root = PathBuf::from(root);
         if !root.is_absolute() {
-            return Err(Error::UnsafePath("test root"));
+            return Err(crate::error::Error::UnsafePath("test root"));
         }
         return Ok(Dirs {
             data: root.join("data"),

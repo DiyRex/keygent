@@ -50,4 +50,10 @@ impl Platform for Os {
     fn wait_readable(&self, _: &File, _: Duration) -> Result<bool> {
         Err(NA)
     }
+    fn clipboard_put(&self, _: &str) -> Result<u64> {
+        Err(NA)
+    }
+    fn clipboard_clear_if_ours(&self, _: u64, _: &str) -> Result<()> {
+        Err(NA)
+    }
 }
