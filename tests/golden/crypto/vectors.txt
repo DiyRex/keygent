@@ -1,0 +1,12 @@
+# crypto golden vectors (SPEC §5.2), computed independently: reference argon2 CLI + Python RFC 5869 HKDF.
+# Inputs: uuid="0123456789abcdef", slot_salt="slot-salt-000001", passphrase="correct-horse-battery-staple-orbit",
+# pepper=0x07*32, recovery_key=0x09*32, dek=0x01*32. Format: name = hex
+argon2id_m65536_t3_p4 = d559f8232520e3bece0426f88ce50b4a049c985c8d761c11f88c3465f3eb1971
+kek_passphrase = 0e23bba820d27711992c83153849f581dafb6226b0b7343d78d3b113e5ad01e1
+kek_recovery = a21b0092fc5c076f2f0d49a70ebbb4ccb5335c24ba643c7985be703427d3a3af
+k_entry = 1fff8fde9137167c4a59cc865a78be470bf018554bfb2ab0719bbf8c959dce1f
+k_index = 300c86354c5982ef83e7f7e704b544243d1df4e10f2ca93db8f67b951a6e87a7
+k_hdr = 9996bbf5091d1f6ed86d7904bd68f401754d69d5850ddfdc944aa8e3a928e233
+k_audit = 429ef449a9504ca8b2ab2f276a714e5c632e14cc707203dad356cfb70783cd57
+k_auth = fc74b8fef7add9efd8c07d75954e4f05fb204f8ebe9f560752eff16ecb28e82b
+k_broker = ca70459efe2f494ba2752141aba147a3dc25be8a7ddf4972eab653d8b8ecd329
