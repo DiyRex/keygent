@@ -2,6 +2,7 @@
 /fuzz/target
 /fuzz/artifacts
 /fuzz/corpus
+/.task
 .DS_Store
 
 # never commit secrets or vaults
