@@ -87,7 +87,7 @@ jobs:
         run: |
           name="keygent-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/keygent${{ matrix.exe }}" README.md "dist/$name/"
+          cp "target/${{ matrix.target }}/release/keygent${{ matrix.exe }}" README.md LICENSE NOTICE "dist/$name/"
           cd dist
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a -tzip "$name.zip" "$name" > /dev/null
@@ -122,6 +122,8 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4   # same version the install scripts pin for verification
       - name: sign checksums
         working-directory: dist
         run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS

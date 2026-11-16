@@ -10,6 +10,7 @@
   <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue">
   <img alt="language" src="https://img.shields.io/badge/built%20with-Rust-dea584">
   <img alt="size" src="https://img.shields.io/badge/binary-%E2%89%A42%20MB-green">
+  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
 
 > **Status:** keygent is under active development and not ready for use yet. This README describes the v1 behavior.
@@ -79,55 +80,35 @@ connections and sends no telemetry. Commands it runs are contained, so nothing t
 
 ## Install
 
-**Prebuilt binaries** (from the first release on). Static binaries for macOS (Apple Silicon, Intel), Windows (x64, ARM64)
-and Linux (x86_64, arm64) are attached to each [GitHub release](https://github.com/DiyRex/keygent/releases), with
-`SHA256SUMS` signed by Sigstore and build-provenance attestations.
-
-macOS / Linux:
+One line, no admin rights (available from the first release on):
 
 ```sh
-# pick your target: x86_64-unknown-linux-musl | aarch64-unknown-linux-musl | aarch64-apple-darwin | x86_64-apple-darwin
-VER=v0.1.0 TARGET=aarch64-apple-darwin
-curl -LO https://github.com/DiyRex/keygent/releases/download/$VER/keygent-$VER-$TARGET.tar.gz
-curl -LO https://github.com/DiyRex/keygent/releases/download/$VER/SHA256SUMS
-curl -LO https://github.com/DiyRex/keygent/releases/download/$VER/SHA256SUMS.sigstore.json
-
-# verify signature + checksum
-cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp '^https://github\.com/DiyRex/keygent/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-shasum -a 256 --ignore-missing -c SHA256SUMS
-
-tar xzf keygent-$VER-$TARGET.tar.gz && install -m 0755 keygent-$VER-$TARGET/keygent ~/.local/bin/keygent
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/DiyRex/keygent/main/install.sh | sh
 ```
-
-Windows (PowerShell, no admin needed):
 
 ```powershell
-# pick your target: x86_64-pc-windows-msvc | aarch64-pc-windows-msvc
-$Ver = "v0.1.0"; $Target = "x86_64-pc-windows-msvc"
-$Base = "https://github.com/DiyRex/keygent/releases/download/$Ver"
-Invoke-WebRequest "$Base/keygent-$Ver-$Target.zip" -OutFile keygent.zip
-Invoke-WebRequest "$Base/SHA256SUMS" -OutFile SHA256SUMS
-Invoke-WebRequest "$Base/SHA256SUMS.sigstore.json" -OutFile SHA256SUMS.sigstore.json
-
-# verify signature (cosign) + checksum
-cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json `
-  --certificate-identity-regexp '^https://github\.com/DiyRex/keygent/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' `
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-$Expected = (Select-String "keygent-$Ver-$Target.zip" SHA256SUMS).Line.Split(" ")[0]
-if ((Get-FileHash keygent.zip -Algorithm SHA256).Hash -ne $Expected) { throw "checksum mismatch" }
-
-$Dest = "$env:LOCALAPPDATA\Programs\keygent"          # stable path: hooks point here, so upgrades keep working
-Expand-Archive keygent.zip -DestinationPath "$env:TEMP\keygent-$Ver" -Force
-New-Item -ItemType Directory -Force $Dest | Out-Null
-Copy-Item "$env:TEMP\keygent-$Ver\keygent-$Ver-$Target\keygent.exe" "$Dest\keygent.exe" -Force
-
-# optional: add it to your user PATH (no admin needed)
-if ((Read-Host "Add $Dest to your user PATH? [y/N]") -eq "y") {
-  [Environment]::SetEnvironmentVariable("Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$Dest", "User")
-}
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/DiyRex/keygent/main/install.ps1 | iex
 ```
+
+The installer:
+
+1. Picks the right build for your system (macOS Apple Silicon/Intel, Linux x86_64/arm64, Windows x64/ARM64).
+2. **Verifies the download's Sigstore signature.** It must come from this repository's release workflow and a `vX.Y.Z` tag. If you don't
+   have `cosign`, the installer fetches a pinned copy into a temp folder and checks that copy's own fingerprint first.
+3. **Verifies the SHA-256 checksum** against the signed checksum list.
+4. Refuses to downgrade without `--allow-downgrade` / `-AllowDowngrade`.
+5. Installs to `~/.local/bin/keygent` (macOS/Linux) or `%LOCALAPPDATA%\Programs\keygent\keygent.exe` (Windows). It never needs `sudo`,
+   never edits your shell profile, and adds itself to the Windows user PATH only if you agree.
+
+If any check fails, nothing is installed. Options: `--version vX.Y.Z`, `--prefix <dir>` (sh) / `-Version`, `-AddToPath` (PowerShell).
+To pass options through a pipe: `curl -fsSL …/install.sh | sh -s -- --version v0.1.0`.
+
+Prefer to read the script first? Download `install.sh` / `install.ps1`, look through it, then run it. Release archives,
+`SHA256SUMS`, its Sigstore bundle and build-provenance attestations are also on every
+[GitHub release](https://github.com/DiyRex/keygent/releases) for manual verification. (macOS notarization and Windows Authenticode
+signing aren't set up yet. Downloads made by the installer aren't quarantined, so Gatekeeper doesn't block them.)
 
 **From source** (requires Rust stable):
 
@@ -511,4 +492,7 @@ Use generated canaries.
 
 ## License
 
-TBD.
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE).
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in keygent is licensed under the
+Apache-2.0 license as defined in its section 5, without any additional terms or conditions.
