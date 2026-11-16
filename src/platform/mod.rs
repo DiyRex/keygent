@@ -97,11 +97,13 @@ pub fn dirs() -> Result<Dirs> {
     os().default_dirs()
 }
 
-/// True when the test console (stdin/stderr instead of the terminal) is active. Only with `test-profile`.
+/// True when the test console (stdin/stderr instead of the terminal) is active. Only with `test-profile`;
+/// `KEYGENT_TEST_USE_TTY` keeps the isolated root but exercises the real terminal path (pty smoke test).
 pub fn test_console() -> bool {
     #[cfg(feature = "test-profile")]
     {
         std::env::var_os("KEYGENT_TEST_ROOT").is_some()
+            && std::env::var_os("KEYGENT_TEST_USE_TTY").is_none()
     }
     #[cfg(not(feature = "test-profile"))]
     {

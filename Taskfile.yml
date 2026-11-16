@@ -71,7 +71,14 @@ tasks:
       - >-
         {{.LINUX_RUN}} sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
         cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings
-        && cargo test --locked --features test-profile'
+        && cargo test --locked --features test-profile
+        && cargo build --locked --features test-profile && python3 tests/smoke/pty_smoke.py /target/debug/keygent'
+
+  smoke:tty:
+    desc: Real-terminal smoke test (pty) of echo-off input and the alternate screen
+    cmds:
+      - "{{.RUST}} cargo build --locked --features test-profile"
+      - python3 tests/smoke/pty_smoke.py target/debug/keygent
 
   linux:shell:
     desc: Interactive shell in the Linux dev container
@@ -82,6 +89,7 @@ tasks:
     desc: Local gates on macOS plus tests in the Linux container
     cmds:
       - task: preflight
+      - task: smoke:tty
       - task: linux:test
 
   clean:
