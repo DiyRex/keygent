@@ -109,6 +109,8 @@ pub mod proto {
     pub const E_BINDING: u16 = 0x1024;
     pub const E_EXPOSED: u16 = 0x1025;
     pub const E_DESCRIPTION: u16 = 0x1026;
+    pub const DATA: u16 = 0x1030;
+    pub const HITS: u16 = 0x1031;
 }
 
 /// Unseal handoff over the inherited pipe (CLI → `keygent broker`), little-endian TLV. Range `0x20xx`.

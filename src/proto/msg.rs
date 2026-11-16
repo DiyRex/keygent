@@ -254,6 +254,29 @@ pub fn decode_list(b: &[u8]) -> Result<Vec<ListEntry>, TlvError> {
     Ok(out)
 }
 
+/// `Redact{data}` request and `Redacted{data, hits}` reply. `data` ≤ 1 MiB minus framing (one frame).
+pub fn encode_data(data: &[u8], hits: Option<u32>) -> Result<Vec<u8>, TlvError> {
+    let mut e = enc();
+    e.bytes(t::DATA, data)?;
+    if let Some(h) = hits {
+        e.u32(t::HITS, h)?;
+    }
+    Ok(done(e))
+}
+
+pub fn decode_data(b: &[u8], with_hits: bool) -> Result<(Vec<u8>, u32), TlvError> {
+    let mut d = Decoder::new(b, Endian::Big)?;
+    let data = d.req(t::DATA)?.to_vec();
+    let hits = if with_hits {
+        let v = d.req(t::HITS)?;
+        d.as_u32(t::HITS, v)?
+    } else {
+        0
+    };
+    d.finish()?;
+    Ok((data, hits))
+}
+
 /// An empty payload (requests without fields). Anything else is a protocol error.
 pub fn expect_empty(b: &[u8]) -> Result<(), TlvError> {
     Decoder::new(b, Endian::Big)?.finish()

@@ -112,6 +112,8 @@ fn run(argv: &[String]) -> Result<()> {
         )?),
         #[cfg(unix)]
         "seal" => session::seal(Args::parse(&rest, &[], "keygent seal")?),
+        #[cfg(all(unix, feature = "test-profile"))]
+        "__redact" => session::test_redact(),
         #[cfg(unix)]
         "broker" => Err(Error::Usage(
             "keygent broker is started by 'keygent unseal'",

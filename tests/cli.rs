@@ -977,3 +977,50 @@ fn passwd_seals_the_broker_first() {
     );
     assert_eq!(run(&root, &["ls"], &[]).0, 78);
 }
+
+#[test]
+fn broker_redacts_values_old_values_and_detectors() {
+    let root = Root::new();
+    init(&root);
+    let (c1, c2) = (canary(), canary());
+    assert_eq!(add(&root, "svc/key", &c1).0, 0);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let redact = |input: &str| {
+        let mut c = cmd(&root, &["__redact"]);
+        let mut child = c.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    let b64 = {
+        let mut s = String::new();
+        let t = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for ch in c1.as_bytes().chunks(3) {
+            let b = [ch[0], *ch.get(1).unwrap_or(&0), *ch.get(2).unwrap_or(&0)];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for k in 0..=ch.len() {
+                s.push(t[((n >> (18 - 6 * k)) & 63) as usize] as char);
+            }
+        }
+        s
+    };
+    let out = redact(&format!("raw {c1} b64 {b64} aws AKIAIOSFODNN7EXAMPLE\n"));
+    assert!(
+        !out.contains(&c1) && !out.contains(&b64[..20]) && !out.contains("AKIAIOSFODNN7EXAMPLE"),
+        "{out}"
+    );
+    assert!(
+        out.contains("‹keygent:svc/key›") && out.contains("‹keygent:unknown›"),
+        "{out}"
+    );
+    // after a rotate (a CLI write while unsealed), the broker redacts the new value and still the old one
+    assert_eq!(run(&root, &["rotate", "svc/key"], &[PASS, &c2]).0, 0);
+    let out = redact(&format!("{c1} {c2}"));
+    assert_eq!(out, "‹keygent:svc/key› ‹keygent:svc/key›");
+}

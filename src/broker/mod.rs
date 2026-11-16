@@ -93,6 +93,42 @@ impl Handoff {
 pub struct State {
     pub vault: Vault,
     pub idle_deadline: Deadline,
+    /// Every value seen this session (current, previous, and values since rotated away): the redactor keeps old
+    /// values until seal (SPEC §5.7.5). Locked arena.
+    pub registered: Vec<(String, crate::crypto::Secret)>,
+    pub redactor: crate::redact::Redactor,
+}
+
+impl State {
+    /// Register current + previous values of every handle, then (re)build the redactor. Any failure → caller seals.
+    pub fn refresh_redactor(&mut self) -> std::result::Result<(), &'static str> {
+        for r in &self.vault.index.handles {
+            let cur = self
+                .vault
+                .read_entry(&r.handle)
+                .map_err(|_| "seal_entry_unreadable")?;
+            for v in std::iter::once(cur).chain(
+                r.previous_value
+                    .as_ref()
+                    .map(|p| crate::crypto::Secret::from_slice(p.expose())),
+            ) {
+                if !self
+                    .registered
+                    .iter()
+                    .any(|(h, s)| h == &r.handle && s.ct_eq(v.expose()))
+                {
+                    self.registered.push((r.handle.clone(), v));
+                }
+            }
+        }
+        self.redactor = crate::redact::Redactor::new(
+            self.registered
+                .iter()
+                .map(|(h, s)| (h.as_str(), s.expose())),
+        )
+        .map_err(|_| "seal_redactor_too_large")?;
+        Ok(())
+    }
 }
 
 pub struct Shared {
@@ -136,6 +172,7 @@ impl Shared {
             Ok(_) => match Vault::open_with_dek(&self.dirs, st.vault.dek_copy()) {
                 Ok(v) => {
                     st.vault = v;
+                    st.refresh_redactor()?;
                     self.log.event(Level::Info, "vault_reloaded", None);
                     Ok(())
                 }
@@ -226,11 +263,23 @@ pub fn main() -> ExitCode {
             u32::try_from(vault.index.handles.len()).unwrap_or(0),
         )),
     );
+    let mut state = State {
+        vault,
+        idle_deadline: Deadline::after(handoff.idle),
+        registered: Vec::new(),
+        redactor: match crate::redact::Redactor::new(std::iter::empty()) {
+            Ok(r) => r,
+            Err(_) => return ExitCode::from(1),
+        },
+    };
+    // SPEC §5.8: unseal refuses a vault whose secrets exceed the redactor cap
+    if let Err(reason) = state.refresh_redactor() {
+        log.event(Level::Error, reason, None);
+        let _ = std::fs::remove_file(&endpoint.sock);
+        return ExitCode::from(1);
+    }
     let shared = Arc::new(Shared {
-        state: Mutex::new(Some(State {
-            vault,
-            idle_deadline: Deadline::after(handoff.idle),
-        })),
+        state: Mutex::new(Some(state)),
         dirs,
         log,
         ttl: Deadline::after(handoff.ttl),

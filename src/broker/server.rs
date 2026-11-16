@@ -135,6 +135,7 @@ fn handle(shared: &Shared, mut s: UnixStream) {
     match req.ty {
         ty::STATUS if msg::expect_empty(&req.payload).is_ok() => status(shared, &mut s),
         ty::LIST if msg::expect_empty(&req.payload).is_ok() => list(shared, &mut s),
+        ty::REDACT => redact(shared, &mut s, &req.payload),
         ty::SEAL if msg::expect_empty(&req.payload).is_ok() => {
             let _ = frame::write(&mut s, ty::OK, &[]);
             drop(s);
@@ -193,6 +194,67 @@ fn list(shared: &Shared, s: &mut UnixStream) {
     match msg::encode_list(&entries) {
         Ok(p) => {
             let _ = frame::write(s, ty::LIST_REPLY, &p);
+        }
+        Err(_) => send_err(s, code::TOO_LARGE, "keygent: input too large (limit 1 MiB)"),
+    }
+}
+
+/// Global `Redact` budget: 64 MiB/s (SPEC §4.1). A `Redact` hit inherently confirms a candidate value; the 80-bit
+/// strength floor is the defense, the rate limit only bounds guessing throughput (THREATS known gap).
+const REDACT_BYTES_PER_SEC: f64 = 64.0 * 1024.0 * 1024.0;
+static REDACT_BUCKET: std::sync::Mutex<Option<(std::time::Instant, f64)>> =
+    std::sync::Mutex::new(None);
+
+fn redact_budget(n: usize) -> bool {
+    let Ok(mut g) = REDACT_BUCKET.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    let (last, tokens) = g.unwrap_or((now, REDACT_BYTES_PER_SEC));
+    #[allow(clippy::cast_precision_loss)]
+    let refill = (tokens + now.duration_since(last).as_secs_f64() * REDACT_BYTES_PER_SEC)
+        .min(REDACT_BYTES_PER_SEC);
+    #[allow(clippy::cast_precision_loss)]
+    let need = n as f64;
+    if refill < need {
+        *g = Some((now, refill));
+        return false;
+    }
+    *g = Some((now, refill - need));
+    true
+}
+
+fn redact(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
+    let Ok((data, _)) = msg::decode_data(payload, false) else {
+        send_err(
+            s,
+            code::BAD_REQUEST,
+            "keygent: broker error 10 — run 'keygent doctor'",
+        );
+        return;
+    };
+    if !redact_budget(data.len()) {
+        send_err(
+            s,
+            code::RATE_LIMITED,
+            "keygent: too many requests — retry in a few seconds",
+        );
+        return;
+    }
+    let (out, hits) = {
+        let Ok(mut g) = shared.state.lock() else {
+            return;
+        };
+        let Some(st) = g.as_mut() else { return };
+        if let Err(reason) = shared.reload_if_changed(st) {
+            drop(g);
+            shared.seal(reason);
+        }
+        st.redactor.redact_all(&data)
+    };
+    match msg::encode_data(&out, Some(u32::try_from(hits).unwrap_or(u32::MAX))) {
+        Ok(p) => {
+            let _ = frame::write(s, ty::REDACTED, &p);
         }
         Err(_) => send_err(s, code::TOO_LARGE, "keygent: input too large (limit 1 MiB)"),
     }

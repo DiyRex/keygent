@@ -203,6 +203,27 @@ fn check_new_handle(ix: &Index, h: &str) -> Result<()> {
     Ok(())
 }
 
+/// SPEC §5.8: refuse a write that would push the redactor past its 8 MiB pattern cap (current and previous values of
+/// every handle, plus `new` values). Checked here so `unseal` never has to refuse the vault later.
+fn check_redactor_cap(v: &Vault, new: &[&[u8]]) -> Result<()> {
+    let mut total = 0usize;
+    for r in &v.index.handles {
+        total = total.saturating_add(crate::redact::pattern_bytes(
+            v.read_entry(&r.handle)?.expose(),
+        ));
+        if let Some(p) = &r.previous_value {
+            total = total.saturating_add(crate::redact::pattern_bytes(p.expose()));
+        }
+    }
+    for n in new {
+        total = total.saturating_add(crate::redact::pattern_bytes(n));
+    }
+    if total > crate::redact::MAX_PATTERN_BYTES {
+        return Err(Error::RedactorTooLarge);
+    }
+    Ok(())
+}
+
 fn check_description(d: &str) -> Result<()> {
     if d.chars().count() > names::MAX_DESCRIPTION_CHARS || d.chars().any(char::is_control) {
         return Err(Error::Usage(
@@ -525,6 +546,7 @@ pub fn rotate(a: Args) -> Result<()> {
         if n.ct_eq(current.expose()) {
             return Err(Error::Usage("the new value equals the current one"));
         }
+        check_redactor_cap(&v, &[n.expose()])?;
         (n, src)
     };
     let rec = v
@@ -931,6 +953,7 @@ pub fn import(a: Args) -> Result<()> {
     {
         return Err(Error::TooLarge("1000 secrets"));
     }
+    check_redactor_cap(&v, &plan.iter().map(|p| p.2.expose()).collect::<Vec<_>>())?;
     if !con.confirm(&format!("Import {} secret(s)?", plan.len()))? {
         return Err(Error::Cancelled);
     }

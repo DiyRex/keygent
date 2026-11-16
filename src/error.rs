@@ -46,6 +46,8 @@ pub enum Error {
     Unsupported(&'static str),
     /// The process behind the endpoint is not the verified keygent broker (SPEC §5.4). Fail closed.
     BrokerUnverified,
+    /// The redactor's 8 MiB pattern cap would be exceeded (SPEC §5.8).
+    RedactorTooLarge,
     VersionMismatch,
     RateLimited,
     /// A protocol error code from the broker (ADR 0004), never request contents.
@@ -120,6 +122,9 @@ impl fmt::Display for Error {
                 f.write_str("keygent: updated — run 'keygent seal' then 'keygent unseal'")
             }
             Error::RateLimited => f.write_str("keygent: too many requests — retry in a few seconds"),
+            Error::RedactorTooLarge => {
+                f.write_str("keygent: too many or too large secrets to redact safely — remove some or split vaults")
+            }
             Error::Broker(code) => write!(f, "keygent: broker error {code} — run 'keygent doctor'"),
             Error::Io(code) => write!(f, "keygent: file error {code} — run 'keygent doctor'"),
             Error::Internal(code) => write!(f, "keygent: internal error {code} — run 'keygent doctor'"),
@@ -188,6 +193,7 @@ mod tests {
             Error::UuidMismatch,
             Error::Unsupported("clipboard"),
             Error::BrokerUnverified,
+            Error::RedactorTooLarge,
             Error::VersionMismatch,
             Error::RateLimited,
             Error::Broker(10),

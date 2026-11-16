@@ -198,6 +198,21 @@ pub fn ls(a: Args) -> Result<()> {
     Ok(())
 }
 
+/// Test-profile only: pipe stdin through the broker's `Redact` (exercises the real broker path in tests).
+#[cfg(feature = "test-profile")]
+pub fn test_redact() -> Result<()> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    std::io::stdin().take(512 * 1024).read_to_end(&mut data)?;
+    let d = platform::dirs()?;
+    let mut c = client::connect(&d, Class::Hook)?;
+    let payload = msg::encode_data(&data, None).map_err(|_| Error::TooLarge("1 MiB"))?;
+    let f = c.request(ty::REDACT, &payload)?;
+    let (out, _) = msg::decode_data(&f.payload, true).map_err(|_| Error::BrokerUnverified)?;
+    let _ = std::io::stdout().write_all(&out);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
