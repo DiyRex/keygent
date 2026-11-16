@@ -43,6 +43,78 @@ const DRAIN: Duration = Duration::from_secs(2);
 const FORWARDABLE: &[i32] = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 /// Prefix of private binding files in the run dir (swept at broker start).
 const BINDING_PREFIX: &str = "b-";
+/// Prefix of scratch HOME dirs in the run dir (swept at broker start).
+const SCRATCH_PREFIX: &str = "h-";
+
+/// A scratch HOME (rule `home = "scratch"`), removed on drop.
+struct Scratch(PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch_home(run_dir: &Path, cmd: &mut Command) -> Result<Scratch, Error> {
+    use std::os::unix::fs::DirBuilderExt;
+    let name: String = crypto::random::<12>()?
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let root = run_dir.join(format!("{SCRATCH_PREFIX}{name}"));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let s = Scratch(root.clone());
+    for (var, sub) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_STATE_HOME", "state"),
+    ] {
+        let d = root.join(sub);
+        std::fs::DirBuilder::new().mode(0o700).create(&d)?;
+        cmd.env(var, d);
+    }
+    Ok(s)
+}
+
+/// The command to spawn: `/bin/sh -c <stored command>`, or (allow-rule path) the pinned program itself. On Linux the
+/// program is opened once, hashed from that descriptor and exec'd through it (`/dev/fd/N`), so it can't be swapped
+/// between the check and the exec; macOS has no `fexecve`, so it is hashed and then exec'd by path (a same-user race,
+/// documented T2 residual).
+fn base_command(job: &Job, keep: &mut Vec<i32>, held: &mut Vec<Binding>) -> Result<Command, Error> {
+    let Some((exe, sha, argv)) = &job.direct else {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg(&job.command);
+        return Ok(c);
+    };
+    use std::os::unix::process::CommandExt;
+    let arg0 = argv.first().cloned().unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let mut c = {
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::File::open(exe)?;
+        let mut buf = Vec::new();
+        f.by_ref().take(resolve::MAX_EXE).read_to_end(&mut buf)?;
+        if !crypto::ct_eq(&crypto::sha256(&buf), sha) {
+            return Err(Error::Policy(PolicyMsg::Changed));
+        }
+        drop(buf);
+        let fd = f.as_raw_fd();
+        keep.push(fd);
+        held.push(Binding { _fd: f });
+        Command::new(format!("/dev/fd/{fd}"))
+    };
+    #[cfg(target_os = "macos")]
+    let mut c = {
+        let _ = (keep, held);
+        if resolve::hash_file(exe).is_none_or(|h| !crypto::ct_eq(&h, sha)) {
+            return Err(Error::Policy(PolicyMsg::Changed));
+        }
+        Command::new(exe)
+    };
+    c.arg0(arg0).args(argv.iter().skip(1));
+    Ok(c)
+}
 
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
@@ -73,6 +145,10 @@ pub struct Job {
     /// (env var, bytes) of bound scripts: the var gets the private copy's path.
     pub scripts: Vec<(String, Vec<u8>)>,
     pub programs: Vec<Program>,
+    /// Allow-rule path: exec this pinned program with this argv, no shell (`command` is unused).
+    pub direct: Option<(PathBuf, [u8; 32], Vec<String>)>,
+    /// Empty temp HOME + XDG dirs for this run.
+    pub scratch: bool,
     pub max_runtime: Duration,
     pub redactor: Arc<Redactor>,
     /// `K_audit` and the run's end record (exit, redaction count and duration are filled in at the end).
@@ -137,8 +213,11 @@ fn bind(
 pub fn sweep_bindings(run_dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(run_dir) {
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with(BINDING_PREFIX) {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(BINDING_PREFIX) {
                 let _ = std::fs::remove_file(e.path());
+            } else if n.starts_with(SCRATCH_PREFIX) {
+                let _ = std::fs::remove_dir_all(e.path());
             }
         }
     }
@@ -282,11 +361,32 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     // 2. private bindings and the command
     let mut keep = Vec::new();
     let mut bindings = Vec::new();
-    let mut cmd = Command::new("/bin/sh");
+    let mut cmd = match base_command(&job, &mut keep, &mut bindings) {
+        Ok(c) => c,
+        Err(e @ Error::Policy(_)) => {
+            send_err(&mut s, &e);
+            return;
+        }
+        Err(_) => {
+            send_err(&mut s, &Error::Internal(146));
+            return;
+        }
+    };
     if base_env(&mut cmd, &shared.path).is_err() {
         send_err(&mut s, &Error::Internal(140));
         return;
     }
+    let _scratch = if job.scratch {
+        match scratch_home(&shared.dirs.run, &mut cmd) {
+            Ok(h) => Some(h),
+            Err(_) => {
+                send_err(&mut s, &Error::Internal(147));
+                return;
+            }
+        }
+    } else {
+        None
+    };
     for (var, value) in &job.file_secrets {
         match bind(value.expose(), false, &shared.dirs.run, &mut keep) {
             Ok((b, p)) => {
@@ -314,9 +414,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     for (var, value) in &job.env_secrets {
         cmd.env(var, OsStr::from_bytes(value.expose()));
     }
-    cmd.arg("-c")
-        .arg(&job.command)
-        .current_dir(&job.cwd)
+    cmd.current_dir(&job.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

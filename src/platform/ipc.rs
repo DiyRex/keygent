@@ -367,22 +367,33 @@ pub fn signal_group(pgid: i32, sig: i32) {
 }
 
 /// Kill every process of a run (ADR 0009): the process group, then every pid whose session id is the run's session
-/// (catches `&`/`nohup` survivors, Apple binaries included), and reap any that reparented to us (Linux subreaper).
-/// A survivor that called `setsid()` itself escapes this sweep (documented best effort).
+/// (catches `&`/`nohup` survivors, Apple binaries included). Orphans reparented to the broker (Linux subreaper) are
+/// reaped here, retrying for up to 1 s until nothing but the leader is left; the leader itself is reaped by its
+/// `Child::wait`. A survivor that called `setsid()` itself escapes this sweep (documented best effort).
 pub fn kill_session(sid: i32) {
     if sid <= 1 {
         return;
     }
     signal_group(sid, libc::SIGKILL);
     let me = i32::try_from(std::process::id()).unwrap_or(0);
-    for pid in all_pids() {
-        // SAFETY: getsid/kill on a pid value; no memory involved.
-        if pid > 1 && pid != me && unsafe { libc::getsid(pid) } == sid {
-            // SAFETY: as above.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            // SAFETY: non-blocking reap of a pid that may have been reparented to us.
-            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    for _ in 0..100 {
+        let mut left = false;
+        for pid in all_pids() {
+            // SAFETY: getsid/kill/waitpid on a pid value; no memory involved (null status pointer is allowed).
+            if pid > 1 && pid != me && unsafe { libc::getsid(pid) } == sid {
+                // SAFETY: as above.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                if pid != sid {
+                    // SAFETY: as above.
+                    unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+                    left = true;
+                }
+            }
         }
+        if !left {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

@@ -23,7 +23,7 @@ const AUTH_ATTEMPTS: usize = 3;
 
 /// Append the audit record, anchor it in the index, then commit (SPEC §9: anchored on every vault write). An audit
 /// failure leaves the vault unchanged.
-fn audited_commit(
+pub(super) fn audited_commit(
     v: &mut Vault,
     d: &Dirs,
     prev: Prev,
@@ -71,7 +71,7 @@ pub(super) fn unlock_vault(con: &mut Console, d: &Dirs, l: &Lock) -> Result<Vaul
     unlock(con, d, l)
 }
 
-fn unlock(con: &mut Console, d: &Dirs, l: &Lock) -> Result<Vault> {
+pub(super) fn unlock(con: &mut Console, d: &Dirs, l: &Lock) -> Result<Vault> {
     if !Vault::exists(d) {
         return Err(Error::NoVault);
     }

@@ -10,6 +10,8 @@ mod dotenv;
 mod grants;
 mod recovery;
 #[cfg(unix)]
+mod rules;
+#[cfg(unix)]
 mod session;
 
 use crate::error::{Error, Result};
@@ -22,6 +24,8 @@ keygent — let AI coding agents use secrets without seeing them
 Session:  unseal [--ttl 8h] · seal · status · ls
 Run:      run [--max-runtime 30m] -- '<command with {{keygent:<handle>}}>' · run --grant <id>
 Approve:  pending · approve [<id>] [--remember] · deny [<id> | --all]
+Rules:    rule add <handle> [--home scratch] -- <program> [args… | * | ** --flag --value-flag=]
+          rule ls <handle> · rule rm <handle> <n>
 Audit:    audit [--since 1h] [--verify]
 Vault:    init [--own-passphrase] · passwd [--own-passphrase] · rekey · recover [--own-passphrase]
           verify · backup <file> · restore <file> [--new-machine] [--own-passphrase] · status
@@ -124,6 +128,12 @@ fn run(argv: &[String]) -> Result<()> {
                 ("--dialect", true),
             ],
             "keygent run [--max-runtime 30m] -- '<command>' | run --grant <id>",
+        )?),
+        #[cfg(unix)]
+        "rule" => rules::rule(Args::parse(
+            &rest,
+            &[("--home", true)],
+            "keygent rule add|ls|rm — see 'keygent help'",
         )?),
         #[cfg(unix)]
         "audit" => session::audit(Args::parse(

@@ -1326,3 +1326,103 @@ fn audit_chain_records_verifies_and_fails_closed() {
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert!(!out.contains("new/one"));
 }
+
+// ---------------------------------------------------------------- allow rules (Phase 2 M4)
+
+#[test]
+fn allow_rules_run_pinned_tools_silently() {
+    let (root, c, proj) = run_setup();
+    let tool = proj.join("tool");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$SVC_KEY\" \"$*\" \"$HOME\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // shapes that can never be rules
+    let mut x = cmd(&root, &["rule", "add", "svc/key", "--", "/bin/sh", "*"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(64));
+    let mut x = cmd(&root, &["rule", "add", "svc/key", "--", "./tool", "**"]);
+    x.current_dir(&proj);
+    assert_eq!(
+        x.output().unwrap().status.code(),
+        Some(64),
+        "** needs flags"
+    );
+    // add a rule (passphrase), then switch the handle to allow mode
+    let mut x = cmd(
+        &root,
+        &[
+            "rule", "add", "svc/key", "--home", "scratch", "--", "./tool", "list", "*", "**",
+            "--limit=",
+        ],
+    );
+    x.current_dir(&proj);
+    let mut s = Session::start_cmd(x);
+    s.send(PASS);
+    let (code, _, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("rules apply only in 'allow'"), "{err}");
+    let (code, _, err) = run(&root, &["edit", "svc/key", "--mode", "allow"], &[PASS, "y"]);
+    assert_eq!(code, 0, "{err}");
+    let go = |c: &str| {
+        let mut x = cmd(&root, &["run", "--", c]);
+        x.current_dir(&proj);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stdout).unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    // a matching command runs at once, no approval, value injected under the handle's env name, redacted output,
+    // scratch HOME
+    let (code, out, err) = go("./tool list acme --limit 3");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.is_empty(), "silent: {err}");
+    assert!(
+        out.starts_with("‹keygent:svc/key›|list acme --limit 3|"),
+        "{out}"
+    );
+    assert!(
+        out.contains("/h-") && out.trim_end().ends_with("/home"),
+        "scratch home: {out}"
+    );
+    assert!(!out.contains(&c));
+    // non-matching shapes get no secret (no rule → plain run without injection)
+    let (code, out, _) = go("./tool list acme --other 1");
+    assert_eq!(
+        (code, out.starts_with("|list acme --other 1|")),
+        (0, true),
+        "{out}"
+    );
+    let (_, out, _) = go("./tool list -x");
+    assert!(out.starts_with("|list -x|"), "{out}");
+    // a changed binary falls back to approval with a re-pin warning
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tool)
+        .unwrap();
+    f.write_all(b"# changed\n").unwrap();
+    drop(f);
+    let mut s = run_in(&root, &proj, &["run", "--", "./tool list acme"]);
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("⚠ re-pin:") && out.contains("allow rule matched"),
+        "{out}"
+    );
+    assert!(!out.contains("⚠ unbound"), "a rule run is bound: {out}");
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("‹keygent:svc/key›|list acme|"), "{out}");
+    // the audit trail shows the silent run
+    let (_, out, _) = run(&root, &["audit"], &[]);
+    assert!(out.contains("\"decision\":\"auto\""), "{out}");
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+}

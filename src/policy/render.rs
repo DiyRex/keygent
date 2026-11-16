@@ -31,6 +31,8 @@ pub struct RenderInput<'a> {
     pub unbound: bool,
     pub argv_exposed: bool,
     pub max_runtime_min: u64,
+    /// Extra broker-written lines (allow-rule match, re-pin warning, scratch home).
+    pub notes: &'a [String],
 }
 
 fn hex8(h: &[u8; 32]) -> String {
@@ -114,6 +116,17 @@ pub fn render_for_approval(r: &RenderInput<'_>) -> String {
         );
     }
     let _ = writeln!(o, "limit:    {} min", r.max_runtime_min);
+    for n in r.notes {
+        let _ = writeln!(
+            o,
+            "{}",
+            escape(n)
+                .0
+                .replace("\\u{2192}", "→")
+                .replace("\\u{26a0}", "⚠")
+                .replace("\\u{2014}", "—")
+        );
+    }
     if r.unbound {
         let _ = writeln!(o, "{UNBOUND_WARNING}");
     }
@@ -194,6 +207,7 @@ mod tests {
             unbound: true,
             argv_exposed: false,
             max_runtime_min: 30,
+            notes: &[],
         });
         for want in [
             "[grant abababab]",

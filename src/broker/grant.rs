@@ -11,28 +11,43 @@
 use super::clock::Deadline;
 use crate::crypto;
 use crate::error::{Error, Result};
+use crate::policy::allow::{self, FlagSpec};
 use crate::policy::render::{self, ProgramLine, RenderInput, ScriptView};
 use crate::policy::resolve::{self, Program};
 use crate::policy::rewrite::{self, Binding, RewriteError};
 use crate::policy::tokenize::{self, TokError};
-use crate::vault::index::{Argv, Index, Mode};
+use crate::vault::index::{AllowRule, Argv, Binding as IxBinding, Home, Index, Mode};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Snapshot of `(handle, mode, argv)` for `build` without holding the state lock.
-pub fn policy_snapshot(index: &Index) -> Vec<(String, Mode, Argv)> {
+/// What `build` needs to know about each handle, snapshotted under the state lock (no values).
+pub struct HandlePolicy {
+    pub handle: String,
+    pub env_name: String,
+    pub mode: Mode,
+    pub argv: Argv,
+    pub file: bool,
+    pub rules: Vec<AllowRule>,
+}
+
+pub fn policy_snapshot(index: &Index) -> Vec<HandlePolicy> {
     index
         .handles
         .iter()
-        .map(|r| (r.handle.clone(), r.mode, r.argv))
+        .map(|r| HandlePolicy {
+            handle: r.handle.clone(),
+            env_name: r.env_name.clone(),
+            mode: r.mode,
+            argv: r.argv,
+            file: r.binding == IxBinding::File,
+            rules: r.allow_rules.clone(),
+        })
         .collect()
 }
 
-pub fn lookup_in(snap: &[(String, Mode, Argv)], h: &str) -> Option<(Mode, Argv)> {
-    snap.iter()
-        .find(|(x, _, _)| x == h)
-        .map(|(_, m, a)| (*m, *a))
+fn lookup<'a>(snap: &'a [HandlePolicy], h: &str) -> Option<&'a HandlePolicy> {
+    snap.iter().find(|x| x.handle == h)
 }
-use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub const MAX_PENDING: usize = 16;
 pub const MAX_PER_CWD: usize = 4;
@@ -59,6 +74,10 @@ pub struct Script {
 }
 
 pub struct Grant {
+    /// Allow-rule path (§5.7): exec the pinned program (`programs[0]`) with this argv, without a shell.
+    pub direct: Option<Vec<String>>,
+    /// Run with an empty temp HOME and XDG dirs (rule `home = "scratch"`).
+    pub scratch: bool,
     pub id: [u8; 16],
     pub key: [u8; 32],
     /// The command as requested (placeholders, never values): shown, hashed and audited.
@@ -195,10 +214,10 @@ fn bind_script(
 }
 
 /// Build a grant (not yet stored). Errors are agent-facing policy decisions.
-/// `lookup(handle)` returns the handle's mode and argv policy (a snapshot taken under the state lock).
+/// `snap` is the handles' policy, snapshotted under the state lock.
 pub fn build(
     req: &Request<'_>,
-    lookup: impl Fn(&str) -> Option<(Mode, Argv)>,
+    snap: &[HandlePolicy],
     path_var: &str,
     home: Option<&Path>,
 ) -> Result<Grant> {
@@ -206,9 +225,9 @@ pub fn build(
     // handles must exist and not be denied
     let mut handles: Vec<String> = Vec::new();
     for p in &parsed.placeholders {
-        let (mode, _) = lookup(&p.handle).ok_or_else(|| {
-            Error::Policy(crate::error::PolicyMsg::UnknownHandle(p.handle.clone()))
-        })?;
+        let mode = lookup(snap, &p.handle)
+            .ok_or_else(|| Error::Policy(crate::error::PolicyMsg::UnknownHandle(p.handle.clone())))?
+            .mode;
         if mode == Mode::Deny {
             return Err(Error::Policy(crate::error::PolicyMsg::NotAllowed(
                 p.handle.clone(),
@@ -232,6 +251,19 @@ pub fn build(
     let max_runtime = req.max_runtime.unwrap_or(DEFAULT_RUNTIME);
     if max_runtime.is_zero() || max_runtime > MAX_RUNTIME {
         return Err(Error::Usage("--max-runtime: 1s … 4h"));
+    }
+    if let Some(argv) = allow::eligible(&parsed)
+        && let Some(g) = allow_grant(
+            req.command,
+            &argv,
+            snap,
+            &cwd,
+            root.as_deref(),
+            path_var,
+            max_runtime,
+        )?
+    {
+        return Ok(g);
     }
     // programs and scripts
     let mut programs = Vec::new();
@@ -309,7 +341,7 @@ pub fn build(
     let rw = rewrite::rewrite(
         req.command,
         &parsed,
-        |h| lookup(h).is_some_and(|(_, a)| a == Argv::Allow),
+        |h| lookup(snap, h).is_some_and(|x| x.argv == Argv::Allow),
         &edits,
     )
     .map_err(|e| match e {
@@ -368,8 +400,11 @@ pub fn build(
         unbound: true,
         argv_exposed,
         max_runtime_min: minutes(max_runtime),
+        notes: &[],
     });
     Ok(Grant {
+        direct: None,
+        scratch: false,
         id: crypto::random()?,
         key,
         command: req.command.to_owned(),
@@ -389,6 +424,132 @@ pub fn build(
         },
         rendered,
     })
+}
+
+fn hex8(h: &[u8; 32]) -> String {
+    h.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Allow-rule path (SPEC §5.7 step 4, §6.2): handles in `allow` mode whose rule matches the pinned program and argv.
+/// A matching pin pre-approves the grant (bound, no shell); a changed binary falls back to approval with a re-pin
+/// warning (the binary is never executed to describe it). `None` = no rule matched.
+fn allow_grant(
+    command: &str,
+    argv: &[String],
+    snap: &[HandlePolicy],
+    cwd: &Path,
+    root: Option<&Path>,
+    path_var: &str,
+    max_runtime: Duration,
+) -> Result<Option<Grant>> {
+    let Program::File { path, sha256 } =
+        resolve::resolve(argv.first().map(String::as_str), cwd, path_var)
+    else {
+        return Ok(None);
+    };
+    let Some(exe) = path.to_str() else {
+        return Ok(None);
+    };
+    let rest = argv.get(1..).unwrap_or_default();
+    let mut bindings = Vec::new();
+    let mut handles = Vec::new();
+    let mut stale: Vec<[u8; 32]> = Vec::new();
+    let mut scratch = false;
+    for h in snap.iter().filter(|h| h.mode == Mode::Allow) {
+        let hit = h.rules.iter().find(|r| {
+            let flags: Vec<FlagSpec> = r
+                .flags
+                .iter()
+                .map(|f| FlagSpec {
+                    name: f.name.clone(),
+                    takes_value: f.takes_value,
+                })
+                .collect();
+            r.exe == exe && allow::matches(&r.args, &flags, rest)
+        });
+        if let Some(r) = hit {
+            if !crypto::ct_eq(&r.sha256, &sha256) {
+                stale.push(r.sha256);
+            }
+            scratch |= r.home == Home::Scratch;
+            handles.push(h.handle.clone());
+            bindings.push(Binding {
+                var: h.env_name.clone(),
+                handle: h.handle.clone(),
+                file: h.file,
+            });
+        }
+    }
+    if handles.is_empty() {
+        return Ok(None);
+    }
+    let programs = vec![Program::File {
+        path: path.clone(),
+        sha256,
+    }];
+    let key = grant_key(command, cwd, &handles, &programs, &[], max_runtime)?;
+    let mut notes = vec![format!(
+        "allow rule matched — runs {exe} directly, without a shell"
+    )];
+    for old in &stale {
+        let m = std::fs::metadata(&path).ok();
+        notes.push(format!(
+            "⚠ re-pin: {exe} changed since the rule was approved (sha256 {} → {}, {} B, mtime {})",
+            hex8(old),
+            hex8(&sha256),
+            m.as_ref().map_or(0, std::fs::Metadata::len),
+            m.and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs())
+        ));
+    }
+    if scratch {
+        notes.push("home: scratch (empty temp HOME and XDG dirs)".into());
+    }
+    let env: Vec<(String, String)> = bindings
+        .iter()
+        .map(|b| (b.handle.clone(), b.var.clone()))
+        .collect();
+    let cwd_s = cwd.display().to_string();
+    let root_s = root.map(|r| r.display().to_string());
+    let rendered = render::render_for_approval(&RenderInput {
+        grant_key: &key,
+        command,
+        cwd: &cwd_s,
+        project_root: root_s.as_deref(),
+        env: &env,
+        programs: &[ProgramLine {
+            path: exe.to_owned(),
+            sha256: Some(sha256),
+        }],
+        scripts: &[],
+        unbound: false,
+        argv_exposed: false,
+        max_runtime_min: minutes(max_runtime),
+        notes: &notes,
+    });
+    Ok(Some(Grant {
+        direct: Some(argv.to_vec()),
+        scratch,
+        id: crypto::random()?,
+        key,
+        command: command.to_owned(),
+        rewritten: String::new(),
+        cwd: cwd.to_path_buf(),
+        handles,
+        bindings,
+        programs,
+        scripts: Vec::new(),
+        max_runtime,
+        unbound: false,
+        created: Deadline::after(QUEUE_LIFE),
+        state: if stale.is_empty() {
+            State::Approved
+        } else {
+            State::Pending
+        },
+        rendered,
+    }))
 }
 
 pub fn grant_key(
@@ -529,7 +690,7 @@ mod tests {
                 "STRIPE_API_KEY={{keygent:stripe/live}} sh ./x.sh",
                 p.to_str().unwrap(),
             ),
-            |h| lookup_in(&policy_snapshot(&index()), h),
+            &policy_snapshot(&index()),
             "/usr/bin:/bin",
             None,
         )
@@ -550,7 +711,7 @@ mod tests {
                 "STRIPE_API_KEY={{keygent:stripe/live}} sh ./x.sh",
                 p.to_str().unwrap(),
             ),
-            |h| lookup_in(&policy_snapshot(&index()), h),
+            &policy_snapshot(&index()),
             "/usr/bin:/bin",
             None,
         )
@@ -566,7 +727,7 @@ mod tests {
         let e = |c: &str| {
             build(
                 &req(c, cwd),
-                |h| lookup_in(&policy_snapshot(&index()), h),
+                &policy_snapshot(&index()),
                 "/usr/bin:/bin",
                 None,
             )
@@ -596,7 +757,7 @@ mod tests {
         // forbidden cwd
         let r = build(
             &req("X={{keygent:stripe/live}} t", "/"),
-            |h| lookup_in(&policy_snapshot(&index()), h),
+            &policy_snapshot(&index()),
             "/usr/bin",
             None,
         );
@@ -623,7 +784,7 @@ mod tests {
         let mk = |n: usize| {
             build(
                 &req(&format!("X={{{{keygent:stripe/live}}}} echo {n}"), cwd),
-                |h| lookup_in(&policy_snapshot(&index()), h),
+                &policy_snapshot(&index()),
                 "/usr/bin:/bin",
                 None,
             )
@@ -643,7 +804,7 @@ mod tests {
         // a command without placeholders needs no approval
         let g = build(
             &req("echo hi", cwd),
-            |h| lookup_in(&policy_snapshot(&index()), h),
+            &policy_snapshot(&index()),
             "/usr/bin:/bin",
             None,
         )

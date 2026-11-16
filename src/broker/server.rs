@@ -349,7 +349,7 @@ fn grant_create(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
             cwd: &gc.cwd,
             max_runtime: gc.max_runtime_secs.map(std::time::Duration::from_secs),
         },
-        |h| grant::lookup_in(&snap, h),
+        &snap,
         &shared.path,
         home.as_deref(),
     );
@@ -640,6 +640,14 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
                 .map(|x| (x.var.clone(), x.content.clone()))
                 .collect(),
             programs: g.programs.clone(),
+            direct: match (&g.direct, g.programs.first()) {
+                (Some(argv), Some(crate::policy::resolve::Program::File { path, sha256 })) => {
+                    Some((path.clone(), *sha256, argv.clone()))
+                }
+                (Some(_), _) => return Err(Error::Internal(148)),
+                (None, _) => None,
+            },
+            scratch: g.scratch,
             max_runtime: g.max_runtime,
             redactor: st.redactor.clone(),
             audit: (st.vault.audit_key()?, st.grant_record(g, "run", "end")),
