@@ -354,3 +354,13 @@ fn locks_are_exclusive() {
         .unwrap();
     assert!(f.try_lock().is_err());
 }
+
+#[test]
+fn symlinked_lock_file_refused() {
+    let (_t, dirs) = tmp();
+    drop(lock(&dirs).unwrap());
+    let p = dirs.data.join(LOCK_FILE);
+    std::fs::remove_file(&p).unwrap();
+    std::os::unix::fs::symlink(dirs.data.join("elsewhere"), &p).unwrap();
+    assert!(lock(&dirs).is_err());
+}

@@ -96,14 +96,15 @@ pub fn lock(dirs: &Dirs) -> Result<Lock> {
     prepare_data_dir(dirs)?;
     let p = dirs.data.join(LOCK_FILE);
     let os = platform::os();
-    let f = match os.create_private(&p) {
-        Ok(f) => f,
-        Err(_) => {
-            // exists: reopen without following symlinks, owner/mode checked
-            let f = os.open_private(&p)?.ok_or(Error::UnsafePath("lock file"))?;
-            drop(f);
-            std::fs::OpenOptions::new().write(true).open(&p)?
-        }
+    // Lock the very handle whose owner/mode was verified (O_NOFOLLOW); never reopen by path. flock works on a
+    // read-only descriptor.
+    let f = match os.open_private(&p)? {
+        Some(f) => f,
+        None => match os.create_private(&p) {
+            Ok(f) => f,
+            // lost a creation race: the other process's file must pass the same checks
+            Err(_) => os.open_private(&p)?.ok_or(Error::UnsafePath("lock file"))?,
+        },
     };
     f.lock()?;
     platform::sweep_tmp(&dirs.data);
