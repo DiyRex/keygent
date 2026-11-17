@@ -115,8 +115,13 @@ signing aren't set up yet. Downloads made by the installer aren't quarantined, s
 ```sh
 git clone https://github.com/DiyRex/keygent.git && cd keygent
 cargo build --release --locked
+mkdir -p ~/.local/bin
 install -m 0755 target/release/keygent ~/.local/bin/keygent      # Windows: copy target\release\keygent.exe onto your PATH
 ```
+
+Until the first release, `main` builds a **placeholder**: every command prints one `keygent: pre-alpha placeholder build…` line and
+exits `64`. The commands below start working as each phase in [`docs/ROADMAP.md`](docs/ROADMAP.md) is merged. If your shell says
+`command not found` right after installing, run `hash -r` or open a new terminal.
 
 ## Quickstart (60 seconds)
 
