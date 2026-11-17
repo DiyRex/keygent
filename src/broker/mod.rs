@@ -26,7 +26,7 @@ use log::{Level, Log};
 use std::io::Read;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -198,26 +198,55 @@ pub struct Shared {
     /// Session ids of active runs; sealing kills them.
     pub runs: Mutex<Vec<i32>>,
     sealing: AtomicBool,
-    /// A seal requested while the state lock is held (`write_vault`): performed by `with_state` once the guard is
-    /// dropped, so `seal()` can still take the state and audit the seal.
-    deferred_seal: Mutex<Option<&'static str>>,
+    /// A seal requested while the state lock is held (`write_vault`). Every later state-lock holder sees it
+    /// (`lock_state`) and seals first, so nothing can use the state in between; first reason wins.
+    deferred_seal: OnceLock<&'static str>,
+}
+
+/// Lock without poison handling: the release profile is `panic = "abort"`, so a poisoned lock can't be observed there,
+/// and in tests the data is still the best state we have.
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Shared {
     /// Request a seal from code that holds the state lock; returns the error to propagate.
     fn defer_seal(&self, reason: &'static str) -> Error {
-        if let Ok(mut d) = self.deferred_seal.lock() {
-            d.get_or_insert(reason);
-        }
+        let _ = self.deferred_seal.set(reason);
         Error::Internal(156)
     }
 
     /// Seal now if a seal was deferred. Call only without the state lock held.
     pub fn seal_if_deferred(&self) {
-        let reason = self.deferred_seal.lock().ok().and_then(|mut d| d.take());
-        if let Some(r) = reason {
+        if let Some(r) = self.deferred_seal.get() {
             self.seal(r);
         }
+    }
+
+    /// Has a seal been deferred (and not yet performed)?
+    pub fn is_seal_pending(&self) -> bool {
+        self.deferred_seal.get().is_some()
+    }
+
+    /// Is a seal under way? A run registered after the seal copied the run list must kill itself.
+    pub fn is_sealing(&self) -> bool {
+        self.sealing.load(Ordering::SeqCst)
+    }
+
+    /// The state lock, but never handed out once a seal was deferred: the would-be holder seals instead (review fix:
+    /// a waiter could otherwise take the lock between `defer_seal` and `seal_if_deferred` and act on an inconsistent
+    /// vault). `None` when sealed.
+    pub fn lock_state(&self) -> Option<MutexGuard<'_, Option<State>>> {
+        let g = lock(&self.state);
+        if self.deferred_seal.get().is_some() {
+            drop(g);
+            self.seal_if_deferred();
+            return None;
+        }
+        if g.is_none() {
+            return None;
+        }
+        Some(g)
     }
 
     /// Seal: drop every secret (locked blocks wipe themselves), remove the socket, exit. Runs once.
@@ -232,10 +261,7 @@ impl Shared {
         let _ = std::fs::remove_file(&self.sock);
         // the runs list is only ever held for a push/retain (never across a seal), so waiting is safe; every active
         // run must die with the session (review fix: `try_lock` could skip them)
-        let sids: Vec<i32> = match self.runs.lock() {
-            Ok(r) => r.clone(),
-            Err(p) => p.into_inner().clone(),
-        };
+        let sids: Vec<i32> = lock(&self.runs).clone();
         for sid in sids {
             ipc::kill_session(sid);
         }
@@ -433,14 +459,16 @@ pub fn main() -> ExitCode {
         decided: Condvar::new(),
         runs: Mutex::new(Vec::new()),
         sealing: AtomicBool::new(false),
-        deferred_seal: Mutex::new(None),
+        deferred_seal: OnceLock::new(),
     });
     // the TTL / idle / wake / signal watchers are what seal the session: no watchers, no session (fail closed)
     if !spawn_watchers(&shared) {
+        // startup refused (exit 1, per this function's contract); dropping `shared` wipes the state
         shared
             .log
             .event(Level::Error, "refuse_start_watchers", None);
-        shared.seal("seal_watchers_failed");
+        let _ = std::fs::remove_file(&endpoint.sock);
+        return ExitCode::from(1);
     }
     server::serve(&shared, &endpoint.listener);
     shared.seal("seal_listener_closed")
@@ -461,6 +489,8 @@ fn spawn_watchers(shared: &Arc<Shared>) -> bool {
             let mut watch = SuspendWatch::new();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
+                // backstop for a seal deferred under the state lock
+                s.seal_if_deferred();
                 if s.ttl.expired() {
                     s.seal("seal_ttl");
                 }

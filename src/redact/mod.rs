@@ -244,6 +244,7 @@ impl Redactor {
             r: self,
             pending: Zeroizing::new(Vec::new()),
             hits: 0,
+            swallow: false,
         }
     }
 
@@ -262,6 +263,9 @@ pub struct Stream<'r> {
     r: &'r Redactor,
     pending: Zeroizing<Vec<u8>>,
     pub hits: u64,
+    /// A detector token hit the `MAX_DETECT` hold cap and was redacted at the buffer end: its continuation in the
+    /// next chunks is swallowed too, until a non-token byte (fail closed, not "redact 64 KiB then leak the rest").
+    swallow: bool,
 }
 
 impl Stream<'_> {
@@ -294,6 +298,14 @@ impl Stream<'_> {
         let buf = &self.pending;
         let mut i = 0usize;
         let mut run = 0usize;
+        if self.swallow {
+            // the rest of a capped token: dropped (it was already replaced by one redaction token)
+            i = run_len(buf, token_byte);
+            run = i;
+            if i < buf.len() {
+                self.swallow = false;
+            }
+        }
         while i < buf.len() {
             // fast skip: a position needs the full matcher only if its 4-byte filter bit is set, it can start a generic
             // detector, or it is too close to the end to tell (the last 7 bytes)
@@ -320,6 +332,9 @@ impl Stream<'_> {
                     self.hits = self.hits.saturating_add(1);
                     i = i.saturating_add(l);
                     run = i;
+                    if h.is_none() && !eof && l >= MAX_DETECT && i == buf.len() {
+                        self.swallow = true;
+                    }
                 }
                 Hit::Partial { vault, handle: h } => {
                     if !eof {
@@ -443,6 +458,11 @@ fn token_rule(
     } else {
         Detect::None
     }
+}
+
+/// Bytes that can continue any generic-detector token (`ghp_…`, `xoxb-…`, JWT segments and dots).
+fn token_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')
 }
 
 fn alnum(c: u8) -> bool {

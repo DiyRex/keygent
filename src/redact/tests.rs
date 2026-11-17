@@ -293,10 +293,14 @@ fn detector_hold_back_is_bounded() {
             "held {} bytes",
             s.pending.len()
         );
+        s.push(b" tail", &mut out);
+        s.finish(&mut out);
         assert!(contains(&out, b"\xe2\x80\xb9keygent:unknown\xe2\x80\xba"));
         assert!(
             !contains(&out, &[head, &b"aaaa"[..]].concat()),
             "token prefix leaked"
         );
+        assert!(!contains(&out, b"aaaa"), "continuation past the cap leaked");
+        assert!(out.ends_with(b" tail"), "streaming resumes after the token");
     }
 }

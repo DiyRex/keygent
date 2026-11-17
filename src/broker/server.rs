@@ -143,7 +143,7 @@ fn handle(shared: &Shared, mut s: UnixStream) {
         return;
     };
     let proof = {
-        let Ok(g) = shared.state.lock() else { return };
+        let Some(g) = shared.lock_state() else { return };
         let Some(st) = g.as_ref() else { return };
         match st.vault.broker_proof(&hello.nonce, &nb) {
             Ok(p) => p,
@@ -198,7 +198,7 @@ fn handle(shared: &Shared, mut s: UnixStream) {
 
 fn status(shared: &Shared, s: &mut UnixStream) {
     let reply = {
-        let Ok(g) = shared.state.lock() else { return };
+        let Some(g) = shared.lock_state() else { return };
         let Some(st) = g.as_ref() else { return };
         StatusReply {
             pid: std::process::id(),
@@ -215,15 +215,7 @@ fn status(shared: &Shared, s: &mut UnixStream) {
 }
 
 fn list(shared: &Shared, s: &mut UnixStream) {
-    let entries: Vec<ListEntry> = {
-        let Ok(mut g) = shared.state.lock() else {
-            return;
-        };
-        let Some(st) = g.as_mut() else { return };
-        if let Err(reason) = shared.reload_if_changed(st) {
-            drop(g);
-            shared.seal(reason);
-        }
+    let Some(entries) = with_state(shared, |st| {
         st.vault
             .index
             .handles
@@ -236,7 +228,9 @@ fn list(shared: &Shared, s: &mut UnixStream) {
                 exposed: r.exposed,
                 description: r.description.clone(),
             })
-            .collect()
+            .collect::<Vec<ListEntry>>()
+    }) else {
+        return;
     };
     match msg::encode_list(&entries) {
         Ok(p) => {
@@ -304,8 +298,9 @@ fn redact(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
 // ---------------------------------------------------------------- grants (SPEC §5.5.2)
 
 /// Lock the state, reload if the vault changed (sealing on failure), and run `f`. `None` when sealed.
+/// `Shared::write_vault` must only be called from inside `f` (its failures defer a seal to the end of this function).
 fn with_state<T>(shared: &Shared, f: impl FnOnce(&mut super::State) -> T) -> Option<T> {
-    let mut g = shared.state.lock().ok()?;
+    let mut g = shared.lock_state()?;
     let st = g.as_mut()?;
     if let Err(reason) = shared.reload_if_changed(st) {
         drop(g);
@@ -402,7 +397,7 @@ fn await_grant(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
         return bad_request(s);
     };
     let outcome: Result<(), Error> = {
-        let Ok(mut g) = shared.state.lock() else {
+        let Some(mut g) = shared.lock_state() else {
             return;
         };
         loop {
@@ -420,13 +415,17 @@ fn await_grant(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
                     GState::Pending => {}
                 },
             }
-            g = match shared
+            g = shared
                 .decided
                 .wait_timeout(g, std::time::Duration::from_secs(1))
-            {
-                Ok((g, _)) => g,
-                Err(_) => return,
-            };
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+            // a seal deferred while we waited: don't keep using the state
+            if shared.is_seal_pending() {
+                drop(g);
+                shared.seal_if_deferred();
+                return;
+            }
         }
     };
     match outcome {

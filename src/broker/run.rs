@@ -133,6 +133,25 @@ pub fn take_slot() -> Option<Slot> {
     Some(Slot)
 }
 
+/// A run's entry in `Shared::runs` (what `seal` kills), removed on every exit path including early returns.
+struct RunEntry<'a> {
+    shared: &'a Shared,
+    sid: i32,
+}
+
+impl<'a> RunEntry<'a> {
+    fn register(shared: &'a Shared, sid: i32) -> Self {
+        super::lock(&shared.runs).push(sid);
+        RunEntry { shared, sid }
+    }
+}
+
+impl Drop for RunEntry<'_> {
+    fn drop(&mut self) {
+        super::lock(&self.shared.runs).retain(|&p| p != self.sid);
+    }
+}
+
 /// Everything a run needs, taken out of the consumed grant under the state lock.
 pub struct Job {
     pub command: String,
@@ -475,8 +494,12 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
     drop(job.env_secrets);
     drop(job.file_secrets);
     let sid = i32::try_from(child.id()).unwrap_or(0);
-    if let Ok(mut r) = shared.runs.lock() {
-        r.push(sid);
+    let registered = RunEntry::register(shared, sid);
+    // a seal that copied the run list before our push must not miss us (no PDEATHSIG on macOS)
+    if shared.is_sealing() {
+        ipc::kill_session(sid);
+        let _ = child.wait();
+        return;
     }
     shared.log.event(Level::Info, "run_started", None);
     let flags = Arc::new(Flags {
@@ -614,9 +637,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         }
     }
     flags.done.store(true, Ordering::SeqCst);
-    if let Ok(mut r) = shared.runs.lock() {
-        r.retain(|&p| p != sid);
-    }
+    drop(registered);
     drop(bindings);
     let code: i32 = match status {
         Ok(st) => {

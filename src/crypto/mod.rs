@@ -214,7 +214,11 @@ pub fn sha256_reader(mut r: impl std::io::Read, limit: u64) -> std::io::Result<O
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
-        let n = r.read(&mut buf)?;
+        let n = match r.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(Some(h.finalize().into()));
         }
