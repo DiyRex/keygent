@@ -39,10 +39,10 @@ These are hard rules. A pull request that breaks one isn't merged.
   `keygent:` error line. Never fall back to running without the protection.
 - **Assume the agent is the same OS user.** Hooks, TTY checks and environment markers are UX, not security
   boundaries. Anything that matters is enforced in the broker.
-- **Name the attacker tier.** Every security claim names its tier:
-  - **T1:** the agent follows instructions;
-  - **T2:** the agent actively tries to get around keygent using its own tools;
-  - **T3:** arbitrary code running as the same user.
+- **Name the attacker tier** ([`docs/THREATS.md`](docs/THREATS.md)). Every security claim names its tier:
+  - **T1:** a well-meaning agent making mistakes;
+  - **T2:** a prompt-injected agent using generic exfiltration, including forged hook calls and file edits;
+  - **T3:** an adaptive agent targeting keygent itself. Out of scope for v1; detected and documented.
 
 ### Engineering rules
 
@@ -59,6 +59,24 @@ These are hard rules. A pull request that breaks one isn't merged.
 
 Never run keygent's integration against your real `~/.claude` or other agent settings while developing. Point
 `HOME` and `KEYGENT_TEST_ROOT` at a temp directory.
+
+## Design documents
+
+Read these before changing anything security-relevant:
+
+| Document | What it covers |
+|---|---|
+| [`docs/SPEC.md`](docs/SPEC.md) | The full specification, and the source of truth |
+| [`docs/THREATS.md`](docs/THREATS.md) | Assets, attacker tiers, controls, and known gaps |
+| [`docs/adr/`](docs/adr/) | Architecture decisions. A change to the design needs a new ADR |
+| [`docs/FORMATS.md`](docs/FORMATS.md) | Vault, index, manifest, audit and protocol formats |
+| [`docs/ERRORS.md`](docs/ERRORS.md) | Every user- and agent-facing error line and exit code |
+| [`docs/PLATFORMS.md`](docs/PLATFORMS.md) | Per-OS mechanisms |
+| [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) | Every crate, with its size and why std isn't enough |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phases and status |
+| [`AGENTS.md`](AGENTS.md) | Rules for AI coding agents working in this repo |
+
+If the spec is wrong or unsafe, say so in an issue and propose an ADR. Never deviate silently.
 
 ## Development setup
 
