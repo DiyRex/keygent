@@ -8,6 +8,7 @@
 use super::Args;
 use super::cmds::{audited_commit, unlock};
 use super::console::Console;
+use crate::crypto::hex;
 use crate::error::{Error, Result};
 use crate::platform;
 use crate::policy::allow::{self, FlagSpec};
@@ -18,10 +19,6 @@ use std::path::{Path, PathBuf};
 
 const USAGE: &str =
     "keygent rule add <handle> [--home scratch] -- <program> [args…] [** --flag --value-flag=]";
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
 
 /// Resolve the program the human named, on their own PATH (they see the result before confirming).
 fn resolve_exe(name: &str) -> Result<PathBuf> {

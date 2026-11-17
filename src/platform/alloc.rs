@@ -1,7 +1,10 @@
 //! Zero-on-free global allocator (SPEC §5.4 "Everything else is freed through a zero-on-free allocator").
 //! Every deallocation (and the old block of every reallocation) is wiped with volatile writes before it returns
 //! to the system allocator, so freed heap never keeps stale plaintext for the next allocation to see.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "platform layer: the only FFI in the crate; every block carries a SAFETY comment"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use zeroize::Zeroize;

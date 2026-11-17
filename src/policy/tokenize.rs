@@ -585,7 +585,8 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
-        clippy::cast_possible_truncation
+        clippy::cast_possible_truncation,
+        reason = "tests: a panic is the failure report"
     )]
     use super::*;
 

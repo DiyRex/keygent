@@ -8,8 +8,11 @@ pub const VERSION: u8 = 1;
 pub const MAX_FRAME: usize = 1024 * 1024;
 
 /// Message types. Values are stable wire constants; never reuse a number. The registry is complete on purpose;
-/// grant/run/capture/redact types are wired up in the Phase 2 milestones that follow.
-#[allow(dead_code)]
+/// some numbers are reserved before their sender exists.
+#[expect(
+    dead_code,
+    reason = "wire registry (ADR 0004): AUTHED/NOTICE/CHECK* arrive with Phase 3 hooks, CAPTURE/STORED stay reserved"
+)]
 pub mod ty {
     pub const HELLO: u8 = 1;
     pub const WELCOME: u8 = 2;
@@ -105,7 +108,11 @@ pub fn read(r: &mut impl Read) -> Result<Frame, FrameError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     #[test]

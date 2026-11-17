@@ -31,7 +31,6 @@ impl Class {
 }
 
 /// Protocol error codes (ADR 0004 "Errors"); the message text is the canonical ERRORS.md line.
-#[allow(dead_code)]
 pub mod code {
     pub const APPROVAL_DENIED: u16 = 1;
     pub const NOT_TRUSTED: u16 = 2;
@@ -518,7 +517,7 @@ pub fn expect_empty(b: &[u8]) -> Result<(), TlvError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     #[test]

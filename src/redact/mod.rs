@@ -12,7 +12,7 @@ pub mod encode;
 
 use crate::crypto::Secret;
 use std::collections::{HashMap, HashSet};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MIN_PATTERN: usize = 8;
 pub const MAX_PATTERN_BYTES: usize = 8 * 1024 * 1024;
@@ -61,7 +61,10 @@ fn h4(b: &[u8]) -> usize {
 
 /// Two-byte starts of the generic detectors (`AK`/`AS`, `gh`/`gi`, `sk`/`rk`, `xo`, `ey`, `--`), as a 64 Kibit set.
 /// Normal text rarely contains them, so the full matcher runs at very few positions.
-#[allow(clippy::indexing_slicing)] // compile-time table; an out-of-range index is a build error
+#[allow(
+    clippy::indexing_slicing,
+    reason = "compile-time table; an out-of-range index is a build error"
+)]
 const DETECT2: [u64; 1024] = {
     let mut t = [0u64; 1024];
     let pairs: [[u8; 2]; 9] = [
@@ -169,11 +172,14 @@ impl Redactor {
         Ok(r)
     }
 
-    fn token(&self, h: Option<u32>) -> Vec<u8> {
+    /// Append `‹keygent:<handle>›` (or `‹keygent:unknown›` for detector hits) without a per-hit allocation.
+    fn push_token(&self, h: Option<u32>, out: &mut Vec<u8>) {
         let name = h
             .and_then(|i| self.handles.get(usize::try_from(i).ok()?))
             .map_or("unknown", String::as_str);
-        format!("‹keygent:{name}›").into_bytes()
+        out.extend_from_slice("‹keygent:".as_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice("›".as_bytes());
     }
 
     #[inline(always)]
@@ -328,7 +334,7 @@ impl Stream<'_> {
                 Hit::None => i = i.saturating_add(1),
                 Hit::Full(l, h) => {
                     out.extend_from_slice(buf.get(run..i).unwrap_or_default());
-                    out.extend_from_slice(&self.r.token(h));
+                    self.r.push_token(h, out);
                     self.hits = self.hits.saturating_add(1);
                     i = i.saturating_add(l);
                     run = i;
@@ -344,7 +350,7 @@ impl Stream<'_> {
                     let tail = buf.len().saturating_sub(i);
                     if let Some((l, hh)) = self.r.full_only(buf, i) {
                         out.extend_from_slice(buf.get(run..i).unwrap_or_default());
-                        out.extend_from_slice(&self.r.token(hh));
+                        self.r.push_token(hh, out);
                         self.hits = self.hits.saturating_add(1);
                         i = i.saturating_add(l);
                         run = i;
@@ -355,7 +361,7 @@ impl Stream<'_> {
                             >= EOF_PARTIAL_BITS
                     {
                         out.extend_from_slice(buf.get(run..i).unwrap_or_default());
-                        out.extend_from_slice(&self.r.token(h));
+                        self.r.push_token(h, out);
                         self.hits = self.hits.saturating_add(1);
                         i = buf.len();
                         run = i;
@@ -366,10 +372,14 @@ impl Stream<'_> {
             }
         }
         out.extend_from_slice(buf.get(run..i).unwrap_or_default());
-        // keep the undecided tail; drop (and wipe, via the zero-on-free allocator) the rest
-        let keep: Zeroizing<Vec<u8>> =
-            Zeroizing::new(self.pending.get(i..).unwrap_or_default().to_vec());
-        self.pending = keep;
+        // keep the undecided tail in place (no allocation per chunk); wipe the bytes the shift left behind
+        let consumed = i.min(self.pending.len());
+        let keep = self.pending.len().saturating_sub(consumed);
+        self.pending.copy_within(consumed.., 0);
+        if let Some(stale) = self.pending.get_mut(keep..) {
+            stale.zeroize();
+        }
+        self.pending.truncate(keep);
     }
 }
 

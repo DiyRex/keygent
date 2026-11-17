@@ -1,5 +1,8 @@
 //! macOS specifics: locations, F_FULLFSYNC, network-filesystem detection (PLATFORMS.md).
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "platform layer: the only FFI in the crate; every block carries a SAFETY comment"
+)]
 
 use super::Dirs;
 use crate::error::{Error, Result};

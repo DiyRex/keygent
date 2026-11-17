@@ -218,6 +218,141 @@ fn bind_script(
 }
 
 /// Build a grant (not yet stored). Errors are agent-facing policy decisions.
+/// Placeholder handles of the command: each must exist and not be denied (first-seen order, no duplicates).
+fn placeholder_handles(parsed: &tokenize::Parsed, snap: &[HandlePolicy]) -> Result<Vec<String>> {
+    let mut handles: Vec<String> = Vec::new();
+    for p in &parsed.placeholders {
+        let mode = lookup(snap, &p.handle)
+            .ok_or_else(|| Error::Policy(crate::error::PolicyMsg::UnknownHandle(p.handle.clone())))?
+            .mode;
+        if mode == Mode::Deny {
+            return Err(Error::Policy(crate::error::PolicyMsg::NotAllowed(
+                p.handle.clone(),
+            )));
+        }
+        if !handles.contains(&p.handle) {
+            handles.push(p.handle.clone());
+        }
+    }
+    Ok(handles)
+}
+
+/// What `bind_programs` pins and binds.
+struct Bound {
+    programs: Vec<Program>,
+    scripts: Vec<Script>,
+    /// `(start, end, replacement)` edits replacing each bound script word with its private copy's env var.
+    edits: Vec<(usize, usize, String)>,
+}
+
+/// Resolve and pin every command word (SPEC §5.5.2 "Executable binding") and bind every script it names
+/// ("Script binding"): `source x`, interpreter + script, or a project-local shebang script.
+fn bind_programs(
+    parsed: &tokenize::Parsed,
+    cwd: &Path,
+    bind_root: &Path,
+    path_var: &str,
+) -> Result<Bound> {
+    let mut programs = Vec::new();
+    let mut scripts = Vec::new();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for c in &parsed.commands {
+        let Some(word0) = c.argv.first() else {
+            continue;
+        };
+        let prog = resolve::resolve(word0.as_deref(), cwd, path_var);
+        // `source x` / `. x`: the sourced file is a script run by the dialect shell
+        if let Program::Builtin(b) = &prog
+            && (b == "source" || b == ".")
+            && let Some(Some(arg)) = c.argv.get(1)
+        {
+            let p = cwd.join(arg);
+            if let Some((canon, sha256, content)) = read_script(&p, bind_root)? {
+                bind_script(
+                    &mut scripts,
+                    &mut edits,
+                    c.spans.get(1),
+                    canon,
+                    sha256,
+                    content,
+                )?;
+            }
+        }
+        if let Program::File { path, .. } = &prog {
+            if resolve::is_script_interpreter(path) {
+                // first non-flag literal argument is the script (`python x.py`, `bash ./x.sh`)
+                if let Some((i, Some(arg))) = c
+                    .argv
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, a)| a.as_deref().is_none_or(|s| !s.starts_with('-')))
+                {
+                    let p = if Path::new(arg).is_absolute() {
+                        PathBuf::from(arg)
+                    } else {
+                        cwd.join(arg)
+                    };
+                    if let Some((canon, sha256, content)) = read_script(&p, bind_root)? {
+                        bind_script(
+                            &mut scripts,
+                            &mut edits,
+                            c.spans.get(i),
+                            canon,
+                            sha256,
+                            content,
+                        )?;
+                    }
+                }
+            } else if path.starts_with(bind_root) && has_shebang(path) {
+                // a project-local script: bind its bytes (compiled binaries are pinned like any program)
+                if let Some((canon, sha256, content)) = read_script(path, bind_root)?
+                    && let Some(interp) = shebang(&content, cwd, path_var)
+                {
+                    // the private copy is exec'd directly; its shebang interpreter is pinned like any program
+                    programs.push(resolve::resolve(interp.to_str(), cwd, path_var));
+                    bind_script(
+                        &mut scripts,
+                        &mut edits,
+                        c.spans.first(),
+                        canon,
+                        sha256,
+                        content,
+                    )?;
+                    continue;
+                }
+            }
+        }
+        programs.push(prog);
+    }
+    Ok(Bound {
+        programs,
+        scripts,
+        edits,
+    })
+}
+
+/// One approval line per pinned program.
+fn program_lines(programs: &[Program]) -> Vec<ProgramLine> {
+    programs
+        .iter()
+        .map(|p| match p {
+            Program::File { path, sha256 } => ProgramLine {
+                path: path.display().to_string(),
+                sha256: Some(*sha256),
+            },
+            Program::Builtin(b) => ProgramLine {
+                path: format!("{b} (shell builtin)"),
+                sha256: None,
+            },
+            Program::Unknown(w) => ProgramLine {
+                path: w.clone(),
+                sha256: None,
+            },
+        })
+        .collect()
+}
+
 /// `snap` is the handles' policy, snapshotted under the state lock.
 /// `trusted`: (canonical manifest path, SHA-256) pairs the human trusted.
 pub fn build(
@@ -235,21 +370,7 @@ pub fn build(
         }
     }
     let parsed = tokenize::parse(req.command).map_err(|e| tok_err(&e))?;
-    // handles must exist and not be denied
-    let mut handles: Vec<String> = Vec::new();
-    for p in &parsed.placeholders {
-        let mode = lookup(snap, &p.handle)
-            .ok_or_else(|| Error::Policy(crate::error::PolicyMsg::UnknownHandle(p.handle.clone())))?
-            .mode;
-        if mode == Mode::Deny {
-            return Err(Error::Policy(crate::error::PolicyMsg::NotAllowed(
-                p.handle.clone(),
-            )));
-        }
-        if !handles.contains(&p.handle) {
-            handles.push(p.handle.clone());
-        }
-    }
+    let mut handles = placeholder_handles(&parsed, snap)?;
     let argv_exposed = parsed
         .placeholders
         .iter()
@@ -279,79 +400,11 @@ pub fn build(
     {
         return Ok(g);
     }
-    // programs and scripts
-    let mut programs = Vec::new();
-    let mut scripts = Vec::new();
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    for c in &parsed.commands {
-        let Some(word0) = c.argv.first() else {
-            continue;
-        };
-        let prog = resolve::resolve(word0.as_deref(), &cwd, path_var);
-        // `source x` / `. x`: the sourced file is a script run by the dialect shell
-        if let Program::Builtin(b) = &prog
-            && (b == "source" || b == ".")
-            && let Some(Some(arg)) = c.argv.get(1)
-        {
-            let p = cwd.join(arg);
-            if let Some((canon, sha256, content)) = read_script(&p, &bind_root)? {
-                bind_script(
-                    &mut scripts,
-                    &mut edits,
-                    c.spans.get(1),
-                    canon,
-                    sha256,
-                    content,
-                )?;
-            }
-        }
-        if let Program::File { path, .. } = &prog {
-            if resolve::is_script_interpreter(path) {
-                // first non-flag literal argument is the script (`python x.py`, `bash ./x.sh`)
-                if let Some((i, Some(arg))) = c
-                    .argv
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .find(|(_, a)| a.as_deref().is_none_or(|s| !s.starts_with('-')))
-                {
-                    let p = if Path::new(arg).is_absolute() {
-                        PathBuf::from(arg)
-                    } else {
-                        cwd.join(arg)
-                    };
-                    if let Some((canon, sha256, content)) = read_script(&p, &bind_root)? {
-                        bind_script(
-                            &mut scripts,
-                            &mut edits,
-                            c.spans.get(i),
-                            canon,
-                            sha256,
-                            content,
-                        )?;
-                    }
-                }
-            } else if path.starts_with(&bind_root) && has_shebang(path) {
-                // a project-local script: bind its bytes (compiled binaries are pinned like any program)
-                if let Some((canon, sha256, content)) = read_script(path, &bind_root)?
-                    && let Some(interp) = shebang(&content, &cwd, path_var)
-                {
-                    // the private copy is exec'd directly; its shebang interpreter is pinned like any program
-                    programs.push(resolve::resolve(interp.to_str(), &cwd, path_var));
-                    bind_script(
-                        &mut scripts,
-                        &mut edits,
-                        c.spans.first(),
-                        canon,
-                        sha256,
-                        content,
-                    )?;
-                    continue;
-                }
-            }
-        }
-        programs.push(prog);
-    }
+    let Bound {
+        programs,
+        scripts,
+        edits,
+    } = bind_programs(&parsed, &cwd, &bind_root, path_var)?;
     let rw = rewrite::rewrite(
         req.command,
         &parsed,
@@ -388,23 +441,7 @@ pub fn build(
         .iter()
         .map(|b| (b.handle.clone(), b.var.clone()))
         .collect();
-    let program_lines: Vec<ProgramLine> = programs
-        .iter()
-        .map(|p| match p {
-            Program::File { path, sha256 } => ProgramLine {
-                path: path.display().to_string(),
-                sha256: Some(*sha256),
-            },
-            Program::Builtin(b) => ProgramLine {
-                path: format!("{b} (shell builtin)"),
-                sha256: None,
-            },
-            Program::Unknown(w) => ProgramLine {
-                path: w.clone(),
-                sha256: None,
-            },
-        })
-        .collect();
+    let program_lines = program_lines(&programs);
     let script_views: Vec<ScriptView> = scripts
         .iter()
         .map(|s| ScriptView {
@@ -512,14 +549,10 @@ fn manifest_refs(
     } else {
         vec![format!(
             "manifest: {path} (trusted, sha256 {})",
-            hex8(&m.sha256)
+            crypto::hex8(&m.sha256)
         )]
     };
     Ok((out, note))
-}
-
-fn hex8(h: &[u8; 32]) -> String {
-    h.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Allow-rule path (SPEC §5.7 step 4, §6.2): handles in `allow` mode whose rule matches the pinned program and argv.
@@ -602,8 +635,8 @@ fn allow_grant(
         let m = std::fs::metadata(&path).ok();
         notes.push(format!(
             "⚠ re-pin: {exe} changed since the rule was approved (sha256 {} → {}, {} B, mtime {})",
-            hex8(old),
-            hex8(&sha256),
+            crypto::hex8(old),
+            crypto::hex8(&sha256),
             m.as_ref().map_or(0, std::fs::Metadata::len),
             m.and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -753,7 +786,11 @@ pub fn find<'a>(grants: &'a mut [Grant], id: &[u8]) -> Option<&'a mut Grant> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
     use crate::vault::index::{Index, new_handle};
 
@@ -774,11 +811,7 @@ mod tests {
     fn tmp_project() -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "kg-grant-{}",
-            crate::crypto::random::<4>()
-                .unwrap()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+            crate::crypto::random_hex::<4>().unwrap()
         ));
         std::fs::create_dir_all(d.join(".git")).unwrap();
         std::fs::canonicalize(d).unwrap()

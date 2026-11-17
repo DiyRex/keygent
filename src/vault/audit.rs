@@ -9,6 +9,7 @@
 //!
 //! Known gaps (documented): rotation (10 MB × 5), the 10-min tripwire anchor and the `rekey` epoch record.
 
+use crate::crypto::hex;
 use crate::crypto::{self, Subkey};
 use crate::error::{Error, Result};
 use crate::platform::{Dirs, ipc};
@@ -48,10 +49,6 @@ impl<'a> Record<'a> {
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 fn unhex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -87,7 +84,10 @@ fn js(s: &str) -> String {
 
 /// RFC 3339 UTC from Unix seconds (civil-from-days, H. Hinnant).
 // days ≤ u64::MAX / 86 400 ≈ 2.1e14, so every intermediate below stays far inside i64.
-#[allow(clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bounded inputs, see the comment above"
+)]
 pub fn rfc3339(secs: u64) -> String {
     let days = i64::try_from(secs / 86_400).unwrap_or(0);
     let rem = secs % 86_400;
@@ -314,7 +314,7 @@ pub fn verify(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     fn dirs() -> Dirs {

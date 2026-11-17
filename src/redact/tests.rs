@@ -2,9 +2,14 @@
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    reason = "tests: a panic is the failure report"
 )]
-#![allow(clippy::cast_sign_loss, clippy::print_stderr)]
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::print_stderr,
+    reason = "tests: a panic is the failure report"
+)]
 
 use super::*;
 

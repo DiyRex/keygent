@@ -16,7 +16,6 @@ const HDR: usize = 6;
 pub enum Endian {
     Little,
     /// Broker protocol (Phase 2, ADR 0004).
-    #[allow(dead_code)]
     Big,
 }
 
@@ -328,9 +327,14 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
-        clippy::arithmetic_side_effects
+        clippy::arithmetic_side_effects,
+        reason = "tests: a panic is the failure report"
     )]
-    #![allow(clippy::cast_possible_truncation, clippy::type_complexity)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::type_complexity,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     fn sample(e: Endian) -> Vec<u8> {

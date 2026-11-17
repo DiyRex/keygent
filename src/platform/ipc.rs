@@ -1,7 +1,10 @@
 //! Unix IPC and process primitives for the broker endpoint (SPEC §5.4, PLATFORMS "IPC access", "Exclusive bind",
 //! "Broker start"): runtime dir, peer credentials, process identity (start time + executable), broker hardening,
 //! termination signals and detached spawn.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "platform layer: the only FFI in the crate; every block carries a SAFETY comment"
+)]
 
 use crate::error::{Error, Result};
 use std::os::fd::AsRawFd;

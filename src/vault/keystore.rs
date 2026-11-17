@@ -60,8 +60,7 @@ impl Keystore {
     }
 
     fn tripwire_name(id: &[u8; 16]) -> String {
-        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
-        format!("tripwire-{hex}")
+        format!("tripwire-{}", crate::crypto::hex(id))
     }
 
     /// Highest generation recorded for this vault on this device, if any.

@@ -55,7 +55,7 @@ impl Log {
         if level > self.level {
             return;
         }
-        let Ok(mut g) = self.file.lock() else { return };
+        let mut g = super::lock(&self.file);
         if g.as_ref()
             .and_then(|f| f.metadata().ok())
             .is_some_and(|m| m.len() > MAX_LOG)

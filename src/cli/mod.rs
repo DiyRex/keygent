@@ -299,7 +299,7 @@ fn fail(e: &Error) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {

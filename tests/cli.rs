@@ -9,7 +9,8 @@
     clippy::print_stderr,
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
-    clippy::type_complexity
+    clippy::type_complexity,
+    reason = "tests: a panic is the failure report"
 )]
 
 use std::hash::{BuildHasher, Hasher};

@@ -11,6 +11,7 @@
 pub mod clock;
 pub mod endpoint;
 pub mod grant;
+pub mod limits;
 pub mod log;
 pub mod run;
 mod server;
@@ -197,10 +198,38 @@ pub struct Shared {
     pub decided: Condvar,
     /// Session ids of active runs; sealing kills them.
     pub runs: Mutex<Vec<i32>>,
+    /// Connection, run, `Redact` and auth-failure limits (SPEC §4.1).
+    pub limits: Limits,
     sealing: AtomicBool,
     /// A seal requested while the state lock is held (`write_vault`). Every later state-lock holder sees it
     /// (`lock_state`) and seals first, so nothing can use the state in between; first reason wins.
     deferred_seal: OnceLock<&'static str>,
+}
+
+/// The broker's limits (SPEC §4.1).
+pub struct Limits {
+    /// All connections (cap `server::MAX_CONNS`).
+    pub conns: limits::Counter,
+    /// Connections outside the reserved auth/control pool.
+    pub general: limits::Counter,
+    /// Concurrent runs (cap `run::MAX_RUNS`).
+    pub runs: limits::Counter,
+    /// `Redact`: 64 MiB/s global.
+    pub redact: limits::ByteBucket,
+    /// Failed auth proofs: 30 per minute, then `RateLimited`.
+    pub auth_fails: limits::Window,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            conns: limits::Counter::default(),
+            general: limits::Counter::default(),
+            runs: limits::Counter::default(),
+            redact: limits::ByteBucket::new(64 * 1024 * 1024),
+            auth_fails: limits::Window::new(30, Duration::from_secs(60)),
+        }
+    }
 }
 
 /// Lock without poison handling: the release profile is `panic = "abort"`, so a poisoned lock can't be observed there,
@@ -460,6 +489,7 @@ pub fn main() -> ExitCode {
         runs: Mutex::new(Vec::new()),
         sealing: AtomicBool::new(false),
         deferred_seal: OnceLock::new(),
+        limits: Limits::default(),
     });
     // the TTL / idle / wake / signal watchers are what seal the session: no watchers, no session (fail closed)
     if !spawn_watchers(&shared) {
@@ -498,14 +528,12 @@ fn spawn_watchers(shared: &Arc<Shared>) -> bool {
                     s.seal("seal_wake");
                 }
                 // an active run is activity: it keeps the idle timer from firing (the TTL still applies)
-                let running = s.runs.lock().is_ok_and(|r| !r.is_empty());
-                let idle_expired = s.state.lock().ok().and_then(|mut g| {
-                    g.as_mut().map(|st| {
-                        if running {
-                            st.idle_deadline = Deadline::after(s.idle);
-                        }
-                        st.idle_deadline.expired()
-                    })
+                let running = !lock(&s.runs).is_empty();
+                let idle_expired = lock(&s.state).as_mut().map(|st| {
+                    if running {
+                        st.idle_deadline = Deadline::after(s.idle);
+                    }
+                    st.idle_deadline.expired()
                 });
                 if idle_expired != Some(false) {
                     s.seal("seal_idle");
@@ -523,7 +551,11 @@ pub fn expected_proof(dek: &Dek, uuid: &[u8; 16], nc: &[u8], nb: &[u8]) -> Resul
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     #[test]

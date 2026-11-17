@@ -9,6 +9,7 @@
 use super::Args;
 use super::client::{self, Conn};
 use super::console::Console;
+use crate::crypto::hex;
 use crate::error::{Error, PolicyMsg, Result};
 use crate::platform::{self, ipc};
 use crate::proto::frame::ty;
@@ -16,10 +17,6 @@ use crate::proto::msg::{self, Approve, Class, GRANT_ID_LEN, GrantCreate, Pending
 use crate::proto::tags::proto as t;
 use crate::vault;
 use std::io::Write;
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
 
 fn parse_id(s: &str) -> Result<[u8; GRANT_ID_LEN]> {
     let usage = Error::Usage("keygent run --grant <32 hex chars>");
@@ -289,7 +286,7 @@ pub fn deny(a: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     fn pg(b: u8) -> PendingGrant {

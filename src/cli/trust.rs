@@ -6,6 +6,7 @@ use super::Args;
 use super::client;
 use super::cmds::{audited_commit, unlock};
 use super::console::Console;
+use crate::crypto::hex8;
 use crate::error::{Error, Result};
 use crate::platform;
 use crate::policy::{manifest, render};
@@ -13,10 +14,6 @@ use crate::proto::frame::ty;
 use crate::proto::msg::{Class, GrantCreate};
 use crate::vault::index::TrustRec;
 use crate::vault::{self, Prev};
-
-fn hex8(h: &[u8; 32]) -> String {
-    h.iter().take(4).map(|b| format!("{b:02x}")).collect()
-}
 
 pub fn trust(a: Args) -> Result<()> {
     if !a.pos.is_empty() {

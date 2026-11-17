@@ -1,5 +1,8 @@
 //! Linux specifics: locations (passwd home, XDG env ignored), network-filesystem detection (PLATFORMS.md).
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "platform layer: the only FFI in the crate; every block carries a SAFETY comment"
+)]
 
 use super::Dirs;
 use crate::error::{Error, Result};
@@ -39,7 +42,11 @@ pub(super) fn is_network_fs(canon: &Path) -> Result<bool> {
     if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    #[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
+    #[allow(
+        clippy::unnecessary_cast,
+        clippy::cast_lossless,
+        reason = "statfs f_type width differs between libc targets"
+    )]
     let t = s.f_type as i64;
     Ok(NETWORK_MAGIC.contains(&t))
 }

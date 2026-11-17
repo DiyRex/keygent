@@ -222,7 +222,11 @@ fn multiline(v: &[u8], out: &mut Vec<Buf>) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     fn base64_full(d: &[u8]) -> String {

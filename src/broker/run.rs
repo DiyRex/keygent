@@ -26,7 +26,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,10 +56,7 @@ impl Drop for Scratch {
 
 fn scratch_home(run_dir: &Path, cmd: &mut Command) -> Result<Scratch, Error> {
     use std::os::unix::fs::DirBuilderExt;
-    let name: String = crypto::random::<12>()?
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let name: String = crypto::random_hex::<12>()?;
     let root = run_dir.join(format!("{SCRATCH_PREFIX}{name}"));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
     let s = Scratch(root.clone());
@@ -82,7 +79,12 @@ fn scratch_home(run_dir: &Path, cmd: &mut Command) -> Result<Scratch, Error> {
 /// between the check and the exec; macOS has no `fexecve`, so it is hashed and then exec'd by path (a same-user race,
 /// documented T2 residual).
 fn base_command(job: &Job, keep: &mut Vec<i32>, held: &mut Vec<Binding>) -> Result<Command, Error> {
-    let Some((exe, sha, argv)) = &job.direct else {
+    let Some(Direct {
+        exe,
+        sha256: sha,
+        argv,
+    }) = &job.direct
+    else {
         let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(&job.command);
         return Ok(c);
@@ -113,24 +115,6 @@ fn base_command(job: &Job, keep: &mut Vec<i32>, held: &mut Vec<Binding>) -> Resu
     };
     c.arg0(arg0).args(argv.iter().skip(1));
     Ok(c)
-}
-
-static RUNNING: AtomicUsize = AtomicUsize::new(0);
-
-/// A run slot (at most `MAX_RUNS`), released on drop.
-pub struct Slot;
-impl Drop for Slot {
-    fn drop(&mut self) {
-        RUNNING.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-pub fn take_slot() -> Option<Slot> {
-    if RUNNING.fetch_add(1, Ordering::SeqCst) >= MAX_RUNS {
-        RUNNING.fetch_sub(1, Ordering::SeqCst);
-        return None;
-    }
-    Some(Slot)
 }
 
 /// A run's entry in `Shared::runs` (what `seal` kills), removed on every exit path including early returns.
@@ -164,15 +148,28 @@ pub struct Job {
     pub scripts: Vec<(String, Vec<u8>)>,
     pub programs: Vec<Program>,
     /// Allow-rule path: exec this pinned program with this argv, no shell (`command` is unused).
-    pub direct: Option<(PathBuf, [u8; 32], Vec<String>)>,
+    pub direct: Option<Direct>,
     /// Empty temp HOME + XDG dirs for this run.
     pub scratch: bool,
     /// `capture <handle>`: stdout is stored as this new handle (never sent); stderr is held and redacted at the end.
     pub capture: Option<String>,
     pub max_runtime: Duration,
     pub redactor: Arc<Redactor>,
-    /// `K_audit` and the run's end record (exit, redaction count and duration are filled in at the end).
-    pub audit: (crate::crypto::Subkey, crate::vault::audit::Record<'static>),
+    /// The run's end record, completed (exit, redactions, duration, decision) and appended when the run ends.
+    pub audit: EndRecord,
+}
+
+/// The pinned program of an allow-rule run.
+pub struct Direct {
+    pub exe: PathBuf,
+    pub sha256: [u8; 32],
+    pub argv: Vec<String>,
+}
+
+/// `K_audit` plus the prepared end-of-run audit record.
+pub struct EndRecord {
+    pub key: crate::crypto::Subkey,
+    pub record: crate::vault::audit::Record<'static>,
 }
 
 /// One private binding; removed (macOS) or closed (Linux) on drop.
@@ -211,10 +208,7 @@ fn bind(
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let _ = keep;
-        let name: String = crypto::random::<12>()?
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let name: String = crypto::random_hex::<12>()?;
         let path = run_dir.join(format!("{BINDING_PREFIX}{name}"));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -282,19 +276,13 @@ fn base_env(cmd: &mut Command, path_var: &str) -> Result<(), Error> {
     ] {
         cmd.env(k, v);
     }
-    let id: String = crypto::random::<8>()?
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let id: String = crypto::random_hex::<8>()?;
     cmd.env("KEYGENT_RUN_ID", id);
     Ok(())
 }
 
 fn send(w: &Mutex<UnixStream>, t: u8, payload: &[u8]) -> bool {
-    match w.lock() {
-        Ok(mut s) => frame::write(&mut *s, t, payload).is_ok(),
-        Err(_) => false,
-    }
+    frame::write(&mut *super::lock(w), t, payload).is_ok()
 }
 
 fn send_data(w: &Mutex<UnixStream>, t: u8, data: &[u8]) -> bool {
@@ -307,17 +295,77 @@ fn send_data(w: &Mutex<UnixStream>, t: u8, data: &[u8]) -> bool {
     true
 }
 
-const STOP_NONE: u8 = 0;
-const STOP_LIMIT: u8 = 1;
-const STOP_GONE: u8 = 2;
-/// Captured stdout exceeded the 64 KiB value limit.
-const STOP_TOO_BIG: u8 = 3;
-/// A guard thread (pump, client watcher, runtime limit) couldn't start: the run is killed (fail closed).
-const STOP_FAILED: u8 = 4;
+/// Why a run ended early. Set once (first reason wins); setting it kills the session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Stop {
+    None = 0,
+    /// Runtime or output limit (exit 74).
+    Limit = 1,
+    /// The client disconnected.
+    ClientGone = 2,
+    /// Captured stdout exceeded the 64 KiB value limit.
+    TooBig = 3,
+    /// A guard thread (pump, client watcher, runtime limit) couldn't start (fail closed).
+    Failed = 4,
+}
+
+impl Stop {
+    fn from_u8(v: u8) -> Stop {
+        match v {
+            1 => Stop::Limit,
+            2 => Stop::ClientGone,
+            3 => Stop::TooBig,
+            4 => Stop::Failed,
+            _ => Stop::None,
+        }
+    }
+}
+
 /// Captured stdout cap (values are ≤ 64 KiB after trimming; a little slack for surrounding whitespace).
 const CAPTURE_MAX: usize = 64 * 1024 + 1024;
 /// Held stderr of a capture run; the rest is dropped.
 const CAPTURE_STDERR_MAX: usize = 1024 * 1024;
+
+/// State shared by a run's threads.
+struct Flags {
+    sid: i32,
+    done: AtomicBool,
+    stop: AtomicU8,
+    hits: AtomicU64,
+}
+
+impl Flags {
+    fn new(sid: i32) -> Self {
+        Flags {
+            sid,
+            done: AtomicBool::new(false),
+            stop: AtomicU8::new(Stop::None as u8),
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    /// Record why the run stops and kill its session — once, by whichever thread gets there first (a full
+    /// session sweep scans every pid, so it isn't repeated per thread).
+    fn stop(&self, why: Stop) {
+        if self
+            .stop
+            .compare_exchange(
+                Stop::None as u8,
+                why as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            ipc::kill_session(self.sid);
+        }
+    }
+
+    fn stopped(&self) -> Stop {
+        Stop::from_u8(self.stop.load(Ordering::Acquire))
+    }
+}
 
 /// Capture mode: keep raw bytes in the broker. Over `cap`: stop the run (`hard`) or drop the rest.
 fn collect(
@@ -325,7 +373,6 @@ fn collect(
     buf: &Mutex<Zeroizing<Vec<u8>>>,
     cap: usize,
     hard: bool,
-    sid: i32,
     flags: &Flags,
 ) {
     let mut chunk = Zeroizing::new(vec![0u8; CHUNK]);
@@ -334,11 +381,11 @@ fn collect(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let Ok(mut b) = buf.lock() else { break };
+        let mut b = super::lock(buf);
         if b.len().saturating_add(n) > cap {
             if hard {
                 drop(b);
-                flags.stop(STOP_TOO_BIG, sid);
+                flags.stop(Stop::TooBig);
                 break;
             }
             continue;
@@ -355,28 +402,13 @@ fn collect(
     }
 }
 
-struct Flags {
-    done: AtomicBool,
-    stop: AtomicU8,
-    hits: AtomicU64,
-}
-
-impl Flags {
-    fn stop(&self, why: u8, sid: i32) {
-        let _ = self
-            .stop
-            .compare_exchange(STOP_NONE, why, Ordering::SeqCst, Ordering::SeqCst);
-        ipc::kill_session(sid);
-    }
-}
-
+/// Stream one output pipe through its own redactor stream to the client.
 fn pump(
     mut src: impl Read,
     t: u8,
     red: &Redactor,
     w: &Mutex<UnixStream>,
     cap: Option<u64>,
-    sid: i32,
     flags: &Flags,
 ) {
     let mut st = red.stream();
@@ -390,90 +422,62 @@ fn pump(
         };
         total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
         if cap.is_some_and(|c| total > c) {
-            flags.stop(STOP_LIMIT, sid);
+            flags.stop(Stop::Limit);
             break;
         }
         out.clear();
         st.push(buf.get(..n).unwrap_or_default(), &mut out);
-        if flags.stop.load(Ordering::SeqCst) == STOP_NONE && !send_data(w, t, &out) {
-            flags.stop(STOP_GONE, sid);
+        if flags.stopped() == Stop::None && !send_data(w, t, &out) {
+            flags.stop(Stop::ClientGone);
         }
     }
     out.clear();
     st.finish(&mut out);
-    flags.hits.fetch_add(st.hits, Ordering::SeqCst);
-    if flags.stop.load(Ordering::SeqCst) == STOP_NONE {
+    flags.hits.fetch_add(st.hits, Ordering::Relaxed);
+    if flags.stopped() == Stop::None {
         let _ = send_data(w, t, &out);
     }
 }
 
-fn send_err(s: &mut UnixStream, e: &Error) {
-    super::server::send_error(s, e);
+/// A command ready to spawn, plus everything that must outlive the child.
+struct Prepared {
+    cmd: Command,
+    /// Close-on-exec fds the child alone inherits (Linux memfds and the pinned program).
+    keep: Vec<i32>,
+    bindings: Vec<Binding>,
+    scratch: Option<Scratch>,
 }
 
-/// Run `job` and stream it to `s`. Consumes the connection.
-pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
-    // 1. pins: every bound executable must still be the approved file
+/// Steps 1–2: re-check every pin, build the command, env and private bindings. Policy errors pass through; any other
+/// failure is an internal error naming its step.
+fn prepare(shared: &Shared, job: &Job) -> Result<Prepared, Error> {
+    // every bound executable must still be the approved file
     for p in &job.programs {
         if let Program::File { path, sha256 } = p
             && resolve::hash_file(path).is_none_or(|h| !crypto::ct_eq(&h, sha256))
         {
-            send_err(&mut s, &Error::Policy(PolicyMsg::Changed));
-            return;
+            return Err(Error::Policy(PolicyMsg::Changed));
         }
     }
-    // 2. private bindings and the command
     let mut keep = Vec::new();
     let mut bindings = Vec::new();
-    let mut cmd = match base_command(&job, &mut keep, &mut bindings) {
-        Ok(c) => c,
-        Err(e @ Error::Policy(_)) => {
-            send_err(&mut s, &e);
-            return;
-        }
-        Err(_) => {
-            send_err(&mut s, &Error::Internal(146));
-            return;
-        }
-    };
-    if base_env(&mut cmd, &shared.path).is_err() {
-        send_err(&mut s, &Error::Internal(140));
-        return;
-    }
-    let _scratch = if job.scratch {
-        match scratch_home(&shared.dirs.run, &mut cmd) {
-            Ok(h) => Some(h),
-            Err(_) => {
-                send_err(&mut s, &Error::Internal(147));
-                return;
-            }
-        }
+    let mut cmd = base_command(job, &mut keep, &mut bindings).map_err(|e| match e {
+        Error::Policy(_) => e,
+        _ => Error::Internal(146),
+    })?;
+    base_env(&mut cmd, &shared.path).map_err(|_| Error::Internal(140))?;
+    let scratch = if job.scratch {
+        Some(scratch_home(&shared.dirs.run, &mut cmd).map_err(|_| Error::Internal(147))?)
     } else {
         None
     };
-    for (var, value) in &job.file_secrets {
-        match bind(value.expose(), false, &shared.dirs.run, &mut keep) {
-            Ok((b, p)) => {
-                bindings.push(b);
-                cmd.env(var, p);
-            }
-            Err(_) => {
-                send_err(&mut s, &Error::Internal(141));
-                return;
-            }
-        }
-    }
-    for (var, bytes) in &job.scripts {
-        match bind(bytes, true, &shared.dirs.run, &mut keep) {
-            Ok((b, p)) => {
-                bindings.push(b);
-                cmd.env(var, p);
-            }
-            Err(_) => {
-                send_err(&mut s, &Error::Internal(141));
-                return;
-            }
-        }
+    let files = job.file_secrets.iter().map(|(v, s)| (v, s.expose(), false));
+    let scripts = job.scripts.iter().map(|(v, b)| (v, b.as_slice(), true));
+    for (var, data, exec) in files.chain(scripts) {
+        let (b, path) =
+            bind(data, exec, &shared.dirs.run, &mut keep).map_err(|_| Error::Internal(141))?;
+        bindings.push(b);
+        cmd.env(var, path);
     }
     for (var, value) in &job.env_secrets {
         cmd.env(var, OsStr::from_bytes(value.expose()));
@@ -482,49 +486,36 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // 3. spawn contained
-    let mut child = match ipc::spawn_contained(&mut cmd, keep) {
-        Ok(c) => c,
-        Err(_) => {
-            send_err(&mut s, &Error::Internal(142));
-            return;
-        }
-    };
-    drop(cmd); // the env copy holding values is freed (zeroed by the allocator) now
-    drop(job.env_secrets);
-    drop(job.file_secrets);
-    let sid = i32::try_from(child.id()).unwrap_or(0);
-    let registered = RunEntry::register(shared, sid);
-    // a seal that copied the run list before our push must not miss us (no PDEATHSIG on macOS)
-    if shared.is_sealing() {
-        ipc::kill_session(sid);
-        let _ = child.wait();
-        return;
-    }
-    shared.log.event(Level::Info, "run_started", None);
-    let flags = Arc::new(Flags {
-        done: AtomicBool::new(false),
-        stop: AtomicU8::new(STOP_NONE),
-        hits: AtomicU64::new(0),
-    });
-    let started = std::time::Instant::now();
-    let _ = s.set_read_timeout(None);
-    let writer = match s.try_clone() {
-        Ok(w) => Arc::new(Mutex::new(w)),
-        Err(_) => {
-            ipc::kill_session(sid);
-            let _ = child.wait();
-            return;
-        }
-    };
+    Ok(Prepared {
+        cmd,
+        keep,
+        bindings,
+        scratch,
+    })
+}
+
+/// Raw output held back in capture mode.
+#[derive(Default)]
+struct Held {
+    out: Arc<Mutex<Zeroizing<Vec<u8>>>>,
+    err: Arc<Mutex<Zeroizing<Vec<u8>>>>,
+}
+
+/// Start the output pumps, the client watcher (signals, disconnect) and the runtime limit. Returns the number of
+/// pumps to drain and whether every guard started (if not, the caller must stop the run: fail closed).
+fn spawn_guards(
+    child: &mut std::process::Child,
+    job: &Job,
+    s: &UnixStream,
+    writer: &Arc<Mutex<UnixStream>>,
+    flags: &Arc<Flags>,
+    held: &Held,
+    tx: &mpsc::Sender<()>,
+) -> (u8, bool) {
     let cap = (job.max_runtime <= FOREGROUND).then_some(OUTPUT_CAP);
-    let (tx, rx) = mpsc::channel::<()>();
     let mut pumps = 0u8;
-    // every guard below must be running, or the run must not continue (review fix: fail closed)
-    let mut guards_ok = true;
-    let held_out = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
-    let held_err = Arc::new(Mutex::new(Zeroizing::new(Vec::new())));
-    for (src, t) in [
+    let mut ok = true;
+    let pipes = [
         (
             child
                 .stdout
@@ -539,7 +530,8 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
                 .map(|p| Box::new(p) as Box<dyn Read + Send>),
             ty::STDERR,
         ),
-    ] {
+    ];
+    for (src, t) in pipes {
         let Some(src) = src else { continue };
         let (red, w, f, tx) = (
             job.redactor.clone(),
@@ -547,13 +539,13 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
             flags.clone(),
             tx.clone(),
         );
-        let held = if t == ty::STDOUT {
-            held_out.clone()
+        let buf = if t == ty::STDOUT {
+            held.out.clone()
         } else {
-            held_err.clone()
+            held.err.clone()
         };
         let capturing = job.capture.is_some();
-        if std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .stack_size(super::THREAD_STACK)
             .spawn(move || {
                 if capturing {
@@ -562,71 +554,199 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
                     } else {
                         (CAPTURE_STDERR_MAX, false)
                     };
-                    collect(src, &held, limit, hard, sid, &f);
+                    collect(src, &buf, limit, hard, &f);
                 } else {
-                    pump(src, t, &red, &w, cap, sid, &f);
+                    pump(src, t, &red, &w, cap, &f);
                 }
                 let _ = tx.send(());
-            })
-            .is_ok()
-        {
+            });
+        if spawned.is_ok() {
             pumps = pumps.saturating_add(1);
         } else {
-            guards_ok = false;
+            ok = false;
         }
     }
     // client frames: forwarded signals; EOF or error = the client is gone → kill now
-    if let Ok(mut r) = s.try_clone() {
-        let f = flags.clone();
-        guards_ok &= std::thread::Builder::new()
-            .stack_size(super::THREAD_STACK)
-            .spawn(move || {
-                loop {
-                    match frame::read(&mut r) {
-                        Ok(fr) if fr.ty == ty::SIGNAL => {
-                            if let Ok(n) = msg::decode_u32(&fr.payload, t::SIGNAL)
-                                && let Ok(n) = i32::try_from(n)
-                                && FORWARDABLE.contains(&n)
-                            {
-                                ipc::signal_group(sid, n);
+    match s.try_clone() {
+        Ok(mut r) => {
+            let f = flags.clone();
+            ok &= std::thread::Builder::new()
+                .stack_size(super::THREAD_STACK)
+                .spawn(move || {
+                    loop {
+                        match frame::read(&mut r) {
+                            Ok(fr) if fr.ty == ty::SIGNAL => {
+                                if let Ok(n) = msg::decode_u32(&fr.payload, t::SIGNAL)
+                                    && let Ok(n) = i32::try_from(n)
+                                    && FORWARDABLE.contains(&n)
+                                {
+                                    ipc::signal_group(f.sid, n);
+                                }
                             }
-                        }
-                        Ok(_) => {}
-                        Err(_) => {
-                            if !f.done.load(Ordering::SeqCst) {
-                                f.stop(STOP_GONE, sid);
+                            Ok(_) => {}
+                            Err(_) => {
+                                if !f.done.load(Ordering::Acquire) {
+                                    f.stop(Stop::ClientGone);
+                                }
+                                return;
                             }
-                            return;
                         }
                     }
-                }
-            })
-            .is_ok();
-    } else {
-        guards_ok = false;
+                })
+                .is_ok();
+        }
+        Err(_) => ok = false,
     }
     // runtime limit
-    {
-        let f = flags.clone();
-        let deadline = super::clock::Deadline::after(job.max_runtime);
-        guards_ok &= std::thread::Builder::new()
-            .stack_size(super::THREAD_STACK)
-            .spawn(move || {
-                while !f.done.load(Ordering::SeqCst) {
-                    if deadline.expired() {
-                        f.stop(STOP_LIMIT, sid);
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+    let f = flags.clone();
+    let deadline = super::clock::Deadline::after(job.max_runtime);
+    ok &= std::thread::Builder::new()
+        .stack_size(super::THREAD_STACK)
+        .spawn(move || {
+            while !f.done.load(Ordering::Acquire) {
+                if deadline.expired() {
+                    f.stop(Stop::Limit);
+                    return;
                 }
-            })
-            .is_ok();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+        .is_ok();
+    (pumps, ok)
+}
+
+/// Capture: store stdout as the new handle on success, then release stderr redacted with the session redactor **and**
+/// the new value. Returns the error to report instead of an exit code, if any.
+fn finish_capture(
+    shared: &Shared,
+    job: &Job,
+    h: &str,
+    code: i32,
+    held: &Held,
+    writer: &Mutex<UnixStream>,
+    flags: &Flags,
+) -> Option<Error> {
+    // move the buffers out (they stay in their wiping wrappers); never copy the value into plain memory
+    let raw: Zeroizing<Vec<u8>> = std::mem::take(&mut *super::lock(&held.out));
+    let value = Secret::from_slice(raw.trim_ascii());
+    drop(raw);
+    let stderr_raw: Zeroizing<Vec<u8>> = std::mem::take(&mut *super::lock(&held.err));
+    let (mut err_out, mut hits) = job.redactor.redact_all(&stderr_raw);
+    drop(stderr_raw);
+    if let Ok(r) = Redactor::new(std::iter::once((h, value.expose()))) {
+        let (again, n) = r.redact_all(&err_out);
+        err_out = again;
+        hits = hits.saturating_add(n);
     }
+    flags.hits.fetch_add(hits, Ordering::Relaxed);
+    let _ = send_data(writer, ty::STDERR, &err_out);
+    match flags.stopped() {
+        Stop::TooBig => Some(Error::ValueSize),
+        Stop::None if code == 0 => super::server::store_capture(shared, h, &value).err(),
+        _ => None,
+    }
+}
+
+/// Append the end record, then tell the client how the run ended (exit code or one `keygent:` line).
+fn report(
+    shared: &Shared,
+    job: Job,
+    code: i32,
+    started: std::time::Instant,
+    outcome: Option<&Error>,
+    writer: &Mutex<UnixStream>,
+    flags: &Flags,
+) {
+    let capture = job.capture.is_some();
+    let EndRecord {
+        key,
+        record: mut end,
+    } = job.audit;
+    end.exit = Some(code);
+    end.redactions = Some(flags.hits.load(Ordering::Relaxed));
+    end.dur_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    end.decision = Some(match flags.stopped() {
+        Stop::Limit => "limit",
+        Stop::ClientGone => "client_gone",
+        Stop::TooBig => "capture_too_big",
+        Stop::Failed => "internal",
+        Stop::None if capture && code == 0 && outcome.is_none() => "captured",
+        Stop::None if capture && code == 0 => "capture_refused",
+        Stop::None => "end",
+    });
+    // the run already happened; a failed end record is logged, not hidden
+    if crate::vault::audit::append(&shared.dirs, &key, &end).is_err() {
+        shared.log.event(Level::Error, "audit_append_failed", None);
+    }
+    drop(key);
+    let send_error = |e: &Error| super::server::send_error(&mut super::lock(writer), e);
+    match (flags.stopped(), outcome) {
+        (Stop::Limit, _) => {
+            shared.log.event(Level::Info, "run_limit", None);
+            send_error(&Error::Policy(PolicyMsg::Limit(super::grant::minutes(
+                job.max_runtime,
+            ))));
+        }
+        (Stop::ClientGone, _) => shared.log.event(Level::Info, "run_client_gone", None),
+        (Stop::Failed, _) => send_error(&Error::Internal(149)),
+        (_, Some(e)) => send_error(e),
+        _ => {
+            shared.log.event(
+                Level::Info,
+                "run_exit",
+                Some(u64::try_from(code).unwrap_or(0)),
+            );
+            if let Ok(p) = msg::encode_u32(t::EXIT_CODE, u32::try_from(code).unwrap_or(1)) {
+                let _ = send(writer, ty::EXIT, &p);
+            }
+        }
+    }
+}
+
+/// Run `job` and stream it to `s`. Consumes the connection.
+pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
+    let Prepared {
+        mut cmd,
+        keep,
+        bindings,
+        scratch,
+    } = match prepare(shared, &job) {
+        Ok(p) => p,
+        Err(e) => return super::server::send_error(&mut s, &e),
+    };
+    // step 3: spawn contained
+    let mut child = match ipc::spawn_contained(&mut cmd, keep) {
+        Ok(c) => c,
+        Err(_) => return super::server::send_error(&mut s, &Error::Internal(142)),
+    };
+    drop(cmd); // the env copy holding values is freed (zeroed by the allocator) now
+    drop(std::mem::take(&mut job.env_secrets));
+    drop(std::mem::take(&mut job.file_secrets));
+    let sid = i32::try_from(child.id()).unwrap_or(0);
+    let registered = RunEntry::register(shared, sid);
+    // a seal that copied the run list before our push must not miss us (no PDEATHSIG on macOS)
+    if shared.is_sealing() {
+        ipc::kill_session(sid);
+        let _ = child.wait();
+        return;
+    }
+    shared.log.event(Level::Info, "run_started", None);
+    let flags = Arc::new(Flags::new(sid));
+    let started = std::time::Instant::now();
+    let _ = s.set_read_timeout(None);
+    let Ok(writer) = s.try_clone().map(|w| Arc::new(Mutex::new(w))) else {
+        ipc::kill_session(sid);
+        let _ = child.wait();
+        return;
+    };
+    let held = Held::default();
+    let (tx, rx) = mpsc::channel::<()>();
+    let (pumps, guards_ok) = spawn_guards(&mut child, &job, &s, &writer, &flags, &held, &tx);
     if !guards_ok {
         shared
             .log
             .event(Level::Error, "run_guard_spawn_failed", None);
-        flags.stop(STOP_FAILED, sid);
+        flags.stop(Stop::Failed);
     }
     let status = child.wait();
     // anything left in the session (`cmd &`, nohup) dies with the run
@@ -636,9 +756,10 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
             break;
         }
     }
-    flags.done.store(true, Ordering::SeqCst);
+    flags.done.store(true, Ordering::Release);
     drop(registered);
     drop(bindings);
+    drop(scratch);
     let code: i32 = match status {
         Ok(st) => {
             use std::os::unix::process::ExitStatusExt;
@@ -648,87 +769,21 @@ pub fn execute(shared: &Shared, mut s: UnixStream, job: Job) {
         }
         Err(_) => 1,
     };
-    // capture: store on success, then release stderr redacted with the session redactor and the new value
-    let mut outcome: Option<Error> = None;
-    if let Some(h) = &job.capture
-        && flags.stop.load(Ordering::SeqCst) != STOP_GONE
-    {
-        // move the buffers out (they stay in their wiping wrappers); never copy the value into plain memory
-        let raw: Zeroizing<Vec<u8>> = held_out
-            .lock()
-            .map(|mut b| std::mem::take(&mut *b))
-            .unwrap_or_default();
-        let value = Secret::from_slice(raw.trim_ascii());
-        drop(raw);
-        let stderr_raw: Zeroizing<Vec<u8>> = held_err
-            .lock()
-            .map(|mut b| std::mem::take(&mut *b))
-            .unwrap_or_default();
-        let (mut err_out, hits) = job.redactor.redact_all(&stderr_raw);
-        drop(stderr_raw);
-        let mut extra = hits;
-        if let Ok(r) = Redactor::new(std::iter::once((h.as_str(), value.expose()))) {
-            let (again, n) = r.redact_all(&err_out);
-            err_out = again;
-            extra = extra.saturating_add(n);
+    let outcome = match &job.capture {
+        Some(h) if flags.stopped() != Stop::ClientGone => {
+            let h = h.clone();
+            finish_capture(shared, &job, &h, code, &held, &writer, &flags)
         }
-        flags.hits.fetch_add(extra, Ordering::SeqCst);
-        let _ = send_data(&writer, ty::STDERR, &err_out);
-        if flags.stop.load(Ordering::SeqCst) == STOP_TOO_BIG {
-            outcome = Some(Error::ValueSize);
-        } else if code == 0 && flags.stop.load(Ordering::SeqCst) == STOP_NONE {
-            outcome = super::server::store_capture(shared, h, &value).err();
-        }
-    }
-    let (key, mut end) = job.audit;
-    end.exit = Some(code);
-    end.redactions = Some(flags.hits.load(Ordering::SeqCst));
-    end.dur_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-    end.decision = Some(match flags.stop.load(Ordering::SeqCst) {
-        STOP_LIMIT => "limit",
-        STOP_GONE => "client_gone",
-        STOP_TOO_BIG => "capture_too_big",
-        STOP_FAILED => "internal",
-        _ if job.capture.is_some() && code == 0 && outcome.is_none() => "captured",
-        _ if job.capture.is_some() && code == 0 => "capture_refused",
-        _ => "end",
-    });
-    // the run already happened; a failed end record is logged, not hidden
-    if crate::vault::audit::append(&shared.dirs, &key, &end).is_err() {
-        shared.log.event(Level::Error, "audit_append_failed", None);
-    }
-    drop(key);
-    match flags.stop.load(Ordering::SeqCst) {
-        STOP_LIMIT => {
-            shared.log.event(Level::Info, "run_limit", None);
-            if let Ok(mut w) = writer.lock() {
-                super::server::send_error(
-                    &mut w,
-                    &Error::Policy(PolicyMsg::Limit(super::grant::minutes(job.max_runtime))),
-                );
-            }
-        }
-        STOP_GONE => shared.log.event(Level::Info, "run_client_gone", None),
-        STOP_FAILED => {
-            if let Ok(mut w) = writer.lock() {
-                super::server::send_error(&mut w, &Error::Internal(149));
-            }
-        }
-        _ if outcome.is_some() => {
-            if let (Ok(mut w), Some(e)) = (writer.lock(), &outcome) {
-                super::server::send_error(&mut w, e);
-            }
-        }
-        _ => {
-            shared.log.event(
-                Level::Info,
-                "run_exit",
-                Some(u64::try_from(code).unwrap_or(0)),
-            );
-            if let Ok(p) = msg::encode_u32(t::EXIT_CODE, u32::try_from(code).unwrap_or(1)) {
-                let _ = send(&writer, ty::EXIT, &p);
-            }
-        }
-    }
+        _ => None,
+    };
+    report(
+        shared,
+        job,
+        code,
+        started,
+        outcome.as_ref(),
+        &writer,
+        &flags,
+    );
     let _ = s.shutdown(std::net::Shutdown::Both);
 }

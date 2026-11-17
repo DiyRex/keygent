@@ -3,6 +3,7 @@
 //! `\u{…}` (so a request can't hide or disguise text), with a `⚠ non-ASCII` flag. Newlines are shown as `\u{a}` and
 //! then broken, so multi-line commands stay readable without hiding anything.
 
+use crate::crypto::hex8;
 use std::fmt::Write;
 
 #[derive(Debug, Clone)]
@@ -33,10 +34,6 @@ pub struct RenderInput<'a> {
     pub max_runtime_min: u64,
     /// Extra broker-written lines (allow-rule match, re-pin warning, scratch home).
     pub notes: &'a [String],
-}
-
-fn hex8(h: &[u8; 32]) -> String {
-    h.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Escape for display. Returns (text, had_escapes).

@@ -34,7 +34,6 @@ pub const KDF_DEFAULT: KdfParams = KdfParams {
 
 /// HKDF labels (SPEC §5.2). `info` strings are fixed; never derived from input.
 /// `AUDIT`, `AUTH` and `BROKER` are used from Phase 2 (audit chain, mutual auth, broker session).
-#[allow(dead_code)]
 pub mod label {
     pub const KEK_PASSPHRASE: &[u8] = b"kg/v1/kek/passphrase";
     pub const KEK_RECOVERY: &[u8] = b"kg/v1/kek/recovery";
@@ -132,7 +131,6 @@ macro_rules! key_type {
         #[doc = $doc]
         pub struct $name(Secret);
 
-        #[allow(dead_code)]
         impl $name {
             pub(crate) fn from_bytes(mut b: [u8; KEY_LEN]) -> Self {
                 let k = $name(Secret::from_slice(&b));
@@ -228,6 +226,30 @@ pub fn sha256_reader(mut r: impl std::io::Read, limit: u64) -> std::io::Result<O
         }
         h.update(buf.get(..n).unwrap_or_default());
     }
+}
+
+/// Lower-case hex of non-secret bytes (ids, hashes, nonces for names). Never for values.
+pub fn hex(b: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(b.len().saturating_mul(2));
+    for &x in b {
+        for nibble in [x >> 4, x & 0x0f] {
+            out.push(char::from(
+                DIGITS.get(usize::from(nibble)).copied().unwrap_or(b'0'),
+            ));
+        }
+    }
+    out
+}
+
+/// First 4 bytes as 8 hex chars: the short form shown to humans (grant keys, script and manifest hashes).
+pub fn hex8(h: &[u8; 32]) -> String {
+    hex(h.get(..4).unwrap_or_default())
+}
+
+/// `N` random bytes as hex: temp-file suffixes, run ids, binding names.
+pub fn random_hex<const N: usize>() -> Result<String> {
+    Ok(hex(&random::<N>()?))
 }
 
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {

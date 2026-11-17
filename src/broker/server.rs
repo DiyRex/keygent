@@ -15,7 +15,6 @@ use crate::proto::msg::{
 use crate::vault::index::Mode;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub const MAX_CONNS: usize = 32;
@@ -23,25 +22,6 @@ pub const MAX_CONNS: usize = 32;
 pub const RESERVED: usize = 5;
 const FIRST_FRAME: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(30);
-
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static GENERAL: AtomicUsize = AtomicUsize::new(0);
-
-struct Slot(&'static AtomicUsize);
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-fn take(counter: &'static AtomicUsize, cap: usize) -> Option<Slot> {
-    let prev = counter.fetch_add(1, Ordering::SeqCst);
-    if prev >= cap {
-        counter.fetch_sub(1, Ordering::SeqCst);
-        return None;
-    }
-    Some(Slot(counter))
-}
 
 pub fn serve(shared: &Arc<Shared>, listener: &UnixListener) {
     for conn in listener.incoming() {
@@ -51,7 +31,7 @@ pub fn serve(shared: &Arc<Shared>, listener: &UnixListener) {
             Ok((uid, _)) if uid == ipc::uid() => {}
             _ => continue,
         }
-        let Some(slot) = take(&ACTIVE, MAX_CONNS) else {
+        let Some(slot) = shared.limits.conns.take(MAX_CONNS) else {
             continue;
         };
         let s = shared.clone();
@@ -119,7 +99,11 @@ fn handle(shared: &Shared, mut s: UnixStream) {
     // the reserved pool: only auth/control may use the last RESERVED slots
     let _general = match hello.class {
         Class::Auth | Class::Control => None,
-        _ => match take(&GENERAL, MAX_CONNS.saturating_sub(RESERVED)) {
+        _ => match shared
+            .limits
+            .general
+            .take(MAX_CONNS.saturating_sub(RESERVED))
+        {
             Some(g) => Some(g),
             None => {
                 send_err(
@@ -240,31 +224,8 @@ fn list(shared: &Shared, s: &mut UnixStream) {
     }
 }
 
-/// Global `Redact` budget: 64 MiB/s (SPEC §4.1). A `Redact` hit inherently confirms a candidate value; the 80-bit
-/// strength floor is the defense, the rate limit only bounds guessing throughput (THREATS known gap).
-const REDACT_BYTES_PER_SEC: f64 = 64.0 * 1024.0 * 1024.0;
-static REDACT_BUCKET: std::sync::Mutex<Option<(std::time::Instant, f64)>> =
-    std::sync::Mutex::new(None);
-
-fn redact_budget(n: usize) -> bool {
-    let Ok(mut g) = REDACT_BUCKET.lock() else {
-        return false;
-    };
-    let now = std::time::Instant::now();
-    let (last, tokens) = g.unwrap_or((now, REDACT_BYTES_PER_SEC));
-    #[allow(clippy::cast_precision_loss)]
-    let refill = (tokens + now.duration_since(last).as_secs_f64() * REDACT_BYTES_PER_SEC)
-        .min(REDACT_BYTES_PER_SEC);
-    #[allow(clippy::cast_precision_loss)]
-    let need = n as f64;
-    if refill < need {
-        *g = Some((now, refill));
-        return false;
-    }
-    *g = Some((now, refill - need));
-    true
-}
-
+/// `Redact` is budgeted at 64 MiB/s (SPEC §4.1, `Limits::redact`). A `Redact` hit inherently confirms a candidate
+/// value; the 80-bit strength floor is the defense, the rate limit only bounds guessing throughput (THREATS known gap).
 fn redact(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
     let Ok((data, _)) = msg::decode_data(payload, false) else {
         send_err(
@@ -274,7 +235,7 @@ fn redact(shared: &Shared, s: &mut UnixStream, payload: &[u8]) {
         );
         return;
     };
-    if !redact_budget(data.len()) {
+    if !shared.limits.redact.spend(data.len()) {
         send_err(
             s,
             code::RATE_LIMITED,
@@ -462,25 +423,6 @@ fn pending(shared: &Shared, s: &mut UnixStream) {
     }
 }
 
-/// Failed auth proofs in the current minute (SPEC §4.1 "Auth failure": 30/min, then `RateLimited`).
-static AUTH_FAILS: std::sync::Mutex<Option<(std::time::Instant, u32)>> =
-    std::sync::Mutex::new(None);
-const AUTH_FAILS_PER_MIN: u32 = 30;
-
-/// Count a failure; `false` once over the cap.
-fn auth_failure() -> bool {
-    let Ok(mut g) = AUTH_FAILS.lock() else {
-        return false;
-    };
-    let now = std::time::Instant::now();
-    let (start, n) = match *g {
-        Some((t, n)) if now.duration_since(t) < std::time::Duration::from_secs(60) => (t, n),
-        _ => (now, 0),
-    };
-    *g = Some((start, n.saturating_add(1)));
-    n < AUTH_FAILS_PER_MIN
-}
-
 /// `Approve` needs `proof_c` over the request (grant id + the grant key the human saw), which only a holder of the
 /// DEK — i.e. someone who just typed the passphrase — can compute. A correct proof is never delayed.
 fn approve(shared: &Shared, s: &mut UnixStream, payload: &[u8], nb: &[u8], nc: &[u8]) {
@@ -498,7 +440,7 @@ fn approve(shared: &Shared, s: &mut UnixStream, payload: &[u8], nb: &[u8], nc: &
         let _ = with_state(shared, |st| {
             st.audit(&shared.dirs, &crate::vault::audit::Record::new("auth_fail"))
         });
-        if auth_failure() {
+        if shared.limits.auth_fails.hit() {
             std::thread::sleep(std::time::Duration::from_secs(1));
             send_err(
                 s,
@@ -680,7 +622,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
     let Ok((id, _)) = msg::decode_grant(payload, false) else {
         return bad_request(&mut s);
     };
-    let Some(slot) = run::take_slot() else {
+    let Some(slot) = shared.limits.runs.take(run::MAX_RUNS) else {
         return send_error(&mut s, &Error::RateLimited);
     };
     let job = with_state(shared, |st| {
@@ -731,7 +673,11 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             programs: g.programs.clone(),
             direct: match (&g.direct, g.programs.first()) {
                 (Some(argv), Some(crate::policy::resolve::Program::File { path, sha256 })) => {
-                    Some((path.clone(), *sha256, argv.clone()))
+                    Some(run::Direct {
+                        exe: path.clone(),
+                        sha256: *sha256,
+                        argv: argv.clone(),
+                    })
                 }
                 (Some(_), _) => return Err(Error::Internal(148)),
                 (None, _) => None,
@@ -740,7 +686,10 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             capture: g.capture.clone(),
             max_runtime: g.max_runtime,
             redactor: st.redactor.clone(),
-            audit: (st.vault.audit_key()?, st.grant_record(g, "run", "end")),
+            audit: run::EndRecord {
+                key: st.vault.audit_key()?,
+                record: st.grant_record(g, "run", "end"),
+            },
         };
         if let Some(g) = st.grants.get_mut(pos) {
             g.state = GState::Consumed;

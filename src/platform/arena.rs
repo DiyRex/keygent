@@ -3,7 +3,10 @@
 //! `init` fails and the broker refuses to start.
 //!
 //! First-fit free list with 16-byte granularity; the arena is sized at unseal from the vault's value sizes.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "platform layer: the only FFI in the crate; every block carries a SAFETY comment"
+)]
 
 use crate::error::{Error, Result};
 use std::ptr::NonNull;
@@ -153,7 +156,7 @@ impl Drop for LockedBuf {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     #[test]
