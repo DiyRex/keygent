@@ -28,6 +28,8 @@ pub struct HandlePolicy {
     pub argv: Argv,
     pub file: bool,
     pub rules: Vec<AllowRule>,
+    /// Env-bound handle with credential custody on (ADR 0022): the child only ever gets a dummy.
+    pub custody: bool,
 }
 
 pub fn policy_snapshot(index: &Index) -> Vec<HandlePolicy> {
@@ -41,6 +43,7 @@ pub fn policy_snapshot(index: &Index) -> Vec<HandlePolicy> {
             argv: r.argv,
             file: r.binding == IxBinding::File,
             rules: r.allow_rules.clone(),
+            custody: r.custody && r.binding == IxBinding::Env,
         })
         .collect()
 }
@@ -423,9 +426,14 @@ pub fn build(
         }
         bindings.push(b);
     }
-    // a capture always needs approval: it writes a new secret into the vault (ADR 0015 §5, review fix)
-    let needs_approval =
-        !parsed.placeholders.is_empty() || !handles.is_empty() || req.capture.is_some();
+    // custody handles reach the child only as dummies, so a command using nothing else needs no per-command approval
+    // (ADR 0022); a capture always needs approval: it writes a new secret into the vault (ADR 0015 §5, review fix)
+    let custody_only = !handles.is_empty()
+        && handles
+            .iter()
+            .all(|h| lookup(snap, h).is_some_and(|x| x.custody));
+    let needs_approval = req.capture.is_some()
+        || ((!parsed.placeholders.is_empty() || !handles.is_empty()) && !custody_only);
     let key = grant_key(
         req.command,
         &cwd,
@@ -436,6 +444,9 @@ pub fn build(
         req.capture,
     )?;
     let mut notes = manifest_note;
+    if custody_only {
+        notes.push("custody: the command gets dummies; real values go only to approved hosts via $KEYGENT_PROXY_URL".into());
+    }
     notes.extend(capture_note(req.capture));
     let env: Vec<(String, String)> = bindings
         .iter()
@@ -806,6 +817,10 @@ mod tests {
         ));
         i.handles
             .push(new_handle("deny/me", "D", "", Mode::Deny, 0));
+        // these tests cover the approval flow; custody (no prompt) has its own test
+        for h in &mut i.handles {
+            h.custody = false;
+        }
         i
     }
 
@@ -848,6 +863,7 @@ mod tests {
                 flags: Vec::new(),
                 home: Home::Inherit,
             }],
+            custody: false,
         }];
         (snap, exe)
     }

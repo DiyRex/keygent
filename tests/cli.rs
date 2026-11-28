@@ -1309,13 +1309,23 @@ fn capture_stores_stdout_as_a_new_handle_without_showing_it() {
     );
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert!(out.contains("new/tok  $KEYGENT_NEW_TOK  approve"), "{out}");
-    // the stored value is usable (and redacted) like any other
-    let (code, out, _) = approved(&[
-        "run",
-        "--",
-        "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
-    ]);
-    assert_eq!((code, out.as_str()), (0, "‹keygent:new/tok›"));
+    // a captured single-line value defaults to custody (ADR 0022): runs need no prompt and the child only ever
+    // holds a dummy with the value's shape (48 hex chars), never the value
+    let s = run_in(
+        &root,
+        &proj,
+        &[
+            "run",
+            "--",
+            "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
+        ],
+    );
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.len() == 48 && out.bytes().all(|b| b.is_ascii_hexdigit()),
+        "dummy with the value's shape: {out}"
+    );
     // create-only: an existing handle is refused before anyone is asked to approve
     let mut x = cmd(&root, &["capture", "svc/key", "--", make]);
     x.current_dir(&proj);

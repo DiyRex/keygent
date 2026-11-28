@@ -38,6 +38,9 @@ pub struct Record<'a> {
     pub exit: Option<i32>,
     pub redactions: Option<u64>,
     pub dur_ms: Option<u64>,
+    /// Custody egress (ADR 0022): the upstream host and how many requests this record summarises.
+    pub host: Option<String>,
+    pub requests: Option<u64>,
 }
 
 impl<'a> Record<'a> {
@@ -164,6 +167,12 @@ fn body(seq: u64, ts: u64, r: &Record<'_>) -> String {
     }
     if let Some(n) = r.dur_ms {
         let _ = write!(o, ",\"dur_ms\":{n}");
+    }
+    if let Some(h) = &r.host {
+        let _ = write!(o, ",\"host\":{}", js(h));
+    }
+    if let Some(n) = r.requests {
+        let _ = write!(o, ",\"requests\":{n}");
     }
     o
 }

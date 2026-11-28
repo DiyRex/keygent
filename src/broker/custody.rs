@@ -3,13 +3,6 @@
 //! The dummy keeps the value's length and the character class at every position, so tools that check a token's format
 //! accept it. It also keeps a leading public prefix (`dop_v1_`, `sk_live_`, `ghp_`, `xoxb-`) when what follows is still a
 //! strong secret on its own, so the prefix can't give away part of a password-like value. Everything else is random.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into runs in ADR 0022 step C1d; remove this then"
-    )
-)]
 
 use crate::crypto;
 use crate::error::Result;
@@ -24,6 +17,8 @@ const REST_MIN_BITS: f64 = 64.0;
 const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const DIGIT: &[u8] = b"0123456789";
+const HEX_LOWER: &[u8] = b"abcdef";
+const HEX_UPPER: &[u8] = b"ABCDEF";
 
 /// Length of the public prefix kept in the dummy: up to 3 tokens of `[A-Za-z0-9]{1,8}` that contain a letter, each
 /// followed by `_` or `-`, at most 12 bytes, and only if the rest is still strong (≥ 64 bits).
@@ -56,18 +51,38 @@ pub fn prefix_len(v: &[u8]) -> usize {
 }
 
 /// A fresh dummy for `v`: same length, same class per position (lower, upper, digit; other bytes kept as-is so
-/// separators survive), prefix kept per [`prefix_len`]. Never equal to `v`.
+/// separators survive), prefix kept per [`prefix_len`]. Never equal to `v`. If every letter after the prefix is a
+/// hex digit, letters stay hex (a token format check like "64 hex chars" still passes).
 pub fn dummy(v: &[u8]) -> Result<Vec<u8>> {
+    let keep = prefix_len(v);
+    let rest = v.get(keep..).unwrap_or_default();
+    let lower: &[u8] = if rest
+        .iter()
+        .filter(|b| b.is_ascii_lowercase())
+        .all(|b| b.is_ascii_hexdigit())
+    {
+        HEX_LOWER
+    } else {
+        LOWER
+    };
+    let upper: &[u8] = if rest
+        .iter()
+        .filter(|b| b.is_ascii_uppercase())
+        .all(|b| b.is_ascii_hexdigit())
+    {
+        HEX_UPPER
+    } else {
+        UPPER
+    };
     loop {
-        let keep = prefix_len(v);
         let mut out = Vec::with_capacity(v.len());
         for (i, &b) in v.iter().enumerate() {
             let class: Option<&[u8]> = if i < keep {
                 None
             } else if b.is_ascii_lowercase() {
-                Some(LOWER)
+                Some(lower)
             } else if b.is_ascii_uppercase() {
-                Some(UPPER)
+                Some(upper)
             } else if b.is_ascii_digit() {
                 Some(DIGIT)
             } else {
@@ -143,6 +158,28 @@ mod tests {
             // fresh per call
             assert_ne!(dummy(v).unwrap(), d);
         }
+    }
+
+    #[test]
+    fn hex_values_get_hex_dummies() {
+        let v = concat!(
+            "dop_",
+            "v1_4f9a1c0e7b2d8f3a6c5e9b1d0a7f4c2e8b3d6f9a1c4e7b0d2f5a8c1e3b6d9f0a"
+        )
+        .as_bytes();
+        for _ in 0..20 {
+            let d = dummy(v).unwrap();
+            assert!(
+                d[7..].iter().all(u8::is_ascii_hexdigit),
+                "{}",
+                String::from_utf8_lossy(&d)
+            );
+        }
+        let d = dummy(b"9F3A0C7E1B5D2F8A6C4E0B9D7F1A3C5E").unwrap();
+        assert!(
+            d.iter()
+                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b))
+        );
     }
 
     #[test]

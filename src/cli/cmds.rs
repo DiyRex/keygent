@@ -490,7 +490,8 @@ pub fn add(a: Args) -> Result<()> {
     strength::check_secret(value.expose())?;
     let now = vault::now();
     let mut rec = index::new_handle(&h, &env, &desc, v.index.security.default_mode, now);
-    rec.custody = !a.has("--no-custody");
+    // custody swaps a single-line token in headers; a multi-line value (PEM, JSON key) always uses approval
+    rec.custody = !a.has("--no-custody") && !value.expose().contains(&b'\n');
     v.index.handles.push(rec);
     v.put_entry(&h, 1, &value)?;
     drop(value);
@@ -661,7 +662,7 @@ pub fn edit(a: Args) -> Result<()> {
     if a.has("--settings") {
         return edit_settings(a);
     }
-    let usage = "keygent edit <handle> [--env N] [--description T] [--mode M] [--binding B] [--argv A] [--custody on|off]";
+    let usage = "keygent edit <handle> [--env N] [--description T] [--mode M] [--custody on|off] [--allow-host H] …";
     let h = one_handle(&a, usage)?;
     let env = a.value("--env").map(str::to_owned);
     if let Some(e) = &env {
@@ -699,12 +700,23 @@ pub fn edit(a: Args) -> Result<()> {
             _ => Err(Error::Usage("--custody on|off")),
         })
         .transpose()?;
+    let allow_host = a.value("--allow-host").map(str::to_owned);
+    let remove_host = a.value("--remove-host").map(str::to_owned);
+    for h in allow_host.iter().chain(remove_host.iter()) {
+        if !names::valid_host(h) {
+            return Err(Error::Usage(
+                "--allow-host: a lower-case host name like api.example.com",
+            ));
+        }
+    }
     if env.is_none()
         && desc.is_none()
         && mode.is_none()
         && binding.is_none()
         && argv.is_none()
         && custody.is_none()
+        && allow_host.is_none()
+        && remove_host.is_none()
     {
         return Err(Error::Usage(usage));
     }
@@ -760,6 +772,14 @@ pub fn edit(a: Args) -> Result<()> {
             );
         }
     }
+    if let Some(x) = &allow_host {
+        diff.push(format!(
+            "  hosts:       + {x}  (the value may be sent to this host through the custody proxy)"
+        ));
+    }
+    if let Some(x) = &remove_host {
+        diff.push(format!("  hosts:       − {x}"));
+    }
     con.say(&format!("Changes to {h}:"));
     for line in &diff {
         con.say(line);
@@ -767,7 +787,12 @@ pub fn edit(a: Args) -> Result<()> {
     if !con.confirm("Apply?")? {
         return Err(Error::Cancelled);
     }
-    let policy_change = mode.is_some() || binding.is_some() || argv.is_some() || custody.is_some();
+    let policy_change = mode.is_some()
+        || binding.is_some()
+        || argv.is_some()
+        || custody.is_some()
+        || allow_host.is_some()
+        || remove_host.is_some();
     let rec = v
         .index
         .get_mut(&h)
@@ -789,6 +814,14 @@ pub fn edit(a: Args) -> Result<()> {
     }
     if let Some(c) = custody {
         rec.custody = c;
+    }
+    if let Some(x) = allow_host
+        && !rec.hosts.contains(&x)
+    {
+        rec.hosts.push(x);
+    }
+    if let Some(x) = remove_host {
+        rec.hosts.retain(|y| *y != x);
     }
     audited_commit(
         &mut v,

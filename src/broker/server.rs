@@ -212,6 +212,7 @@ fn list(shared: &Shared, s: &mut UnixStream) {
                 exposed: r.exposed,
                 description: r.description.clone(),
                 custody: r.custody,
+                hosts: r.hosts.clone(),
             })
             .collect::<Vec<ListEntry>>()
     }) else {
@@ -648,13 +649,39 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
         }
         let mut env_secrets = Vec::new();
         let mut file_secrets = Vec::new();
+        let mut custody: Vec<super::proxy::Cred> = Vec::new();
         for b in &g.bindings {
             let v = st
                 .vault
                 .read_entry(&b.handle)
                 .map_err(|_| Error::Internal(143))?;
+            let rec = st.vault.index.get(&b.handle);
             if b.file {
                 file_secrets.push((b.var.clone(), v));
+            } else if let Some(rec) = rec.filter(|r| r.custody) {
+                // ADR 0022: the child gets a dummy; the value stays in the broker's proxy
+                if v.expose().contains(&b'\n') {
+                    return Err(Error::Policy(PolicyMsg::CustodyMultiline(b.handle.clone())));
+                }
+                let existing = custody
+                    .iter()
+                    .find(|c| c.handle == b.handle)
+                    .map(|c| c.dummy.clone());
+                let dummy = match existing {
+                    Some(d) => d,
+                    None => {
+                        let d =
+                            super::custody::dummy(v.expose()).map_err(|_| Error::Internal(150))?;
+                        custody.push(super::proxy::Cred {
+                            handle: b.handle.clone(),
+                            dummy: d.clone(),
+                            value: crypto::Secret::from_slice(v.expose()),
+                            hosts: rec.hosts.clone(),
+                        });
+                        d
+                    }
+                };
+                env_secrets.push((b.var.clone(), crypto::Secret::new(dummy)));
             } else {
                 env_secrets.push((b.var.clone(), v));
             }
@@ -666,6 +693,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             cwd: g.cwd.clone(),
             env_secrets,
             file_secrets,
+            custody,
             scripts: g
                 .scripts
                 .iter()
@@ -690,6 +718,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             audit: run::EndRecord {
                 key: st.vault.audit_key()?,
                 record: st.grant_record(g, "run", "end"),
+                egress: Vec::new(),
             },
         };
         if let Some(g) = st.grants.get_mut(pos) {

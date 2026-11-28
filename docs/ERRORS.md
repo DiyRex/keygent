@@ -12,6 +12,7 @@ apart. Golden tests pin every line. Exit `1` is used only by human-facing comman
 | 76 | `NotTrusted` | `keygent: .keygent.toml changed — ask the user to run 'keygent trust'` | user runs `trust` |
 | 77 | `PolicyDenied` | `keygent: <handle> is not allowed for this command — ask the user to approve or add a rule` | user decides |
 | 77 | `PolicyDenied` | `keygent: blocked — this command would print secrets` | use a handle instead |
+| 77 | `PolicyDenied` | `keygent: <handle> is multi-line — ask the user to set '--custody off' on it` | user turns custody off (ADR 0022) |
 | 78 | `Sealed` | `keygent: vault sealed — ask the user to run 'keygent unseal'` | user unseals |
 | 79 | `VersionMismatch` | `keygent: updated — run 'keygent seal' then 'keygent unseal'` | user re-unseals |
 | 79 | `Internal` | `keygent: broker error <code> — run 'keygent doctor'` | user runs doctor |

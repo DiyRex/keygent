@@ -230,6 +230,10 @@ pub fn ls(a: Args) -> Result<()> {
             line.push_str("  file");
         } else if e.custody {
             line.push_str("  custody");
+            if !e.hosts.is_empty() {
+                line.push_str(" → ");
+                line.push_str(&e.hosts.join(","));
+            }
         }
         if e.exposed {
             line.push_str("  EXPOSED — rotate it");

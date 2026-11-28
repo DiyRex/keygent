@@ -38,6 +38,7 @@ Secrets:  add <handle> [--env NAME] [--description TEXT] [--no-custody] [--multi
           rm <handle> · rename <old> <new> · ls · reveal <handle>
           edit <handle> [--env NAME] [--description TEXT] [--mode allow|confirm|approve|deny]
                         [--binding env|file] [--argv deny|allow] [--custody on|off]
+                        [--allow-host HOST] [--remove-host HOST]
           edit --settings [--ttl-max SECS] [--idle SECS] [--run-max-minutes N] [--remember on|off]
                           [--default-mode MODE]
           import <.env file> [--overwrite] [--delete]
@@ -240,6 +241,8 @@ fn run(argv: &[String]) -> Result<()> {
                 ("--binding", true),
                 ("--argv", true),
                 ("--custody", true),
+                ("--allow-host", true),
+                ("--remove-host", true),
                 ("--settings", false),
                 ("--ttl-max", true),
                 ("--idle", true),

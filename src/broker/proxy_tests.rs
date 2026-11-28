@@ -171,6 +171,16 @@ fn swaps_dummy_for_value_only_toward_the_approved_host() {
         "{resp}"
     );
     assert!(resp.contains("‹keygent:svc/key›"), "{resp}");
+    // redaction changed the body length: the stale Content-Length is dropped, the body ends at close
+    assert!(
+        !resp.to_ascii_lowercase().contains("content-length"),
+        "{resp}"
+    );
+    assert!(
+        resp.contains("Connection: close\r\n\r\nok Authorization: Bearer ‹keygent:svc/key›"),
+        "{resp}"
+    );
+    assert!(got.contains("Accept-Encoding: identity"), "{got}");
     assert_eq!(*r.dialed.lock().unwrap(), vec!["api.example.com"]);
     assert_eq!(
         r.outcomes.lock().unwrap()[0],
@@ -335,4 +345,46 @@ fn base64_roundtrip() {
         assert_eq!(b64_decode(&b64_encode(v)).unwrap(), v);
     }
     assert!(b64_decode(b"not base64!").is_none());
+}
+
+#[test]
+fn chunked_responses_are_decoded_and_redacted_across_chunks() {
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let up = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0u8; 4096];
+        let _ = s.read(&mut b);
+        // the value split across two chunks
+        let (a, z) = VALUE.split_at(10);
+        let mut resp =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n".to_vec();
+        for part in [a, z] {
+            resp.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            resp.extend_from_slice(part);
+            resp.extend_from_slice(b"\r\n");
+        }
+        resp.extend_from_slice(b"0\r\n\r\n");
+        s.write_all(&resp).unwrap();
+    });
+    let r = run(
+        vec![cred("svc/key", DUMMY, VALUE, &["api.example.com"])],
+        up,
+    );
+    let resp = send(&r, &get(&format!("/{TOKEN}/x"), &bearer(DUMMY)));
+    assert!(
+        resp.ends_with("Connection: close\r\n\r\nhello‹keygent:svc/key›"),
+        "{resp}"
+    );
+    assert!(
+        !resp.to_ascii_lowercase().contains("transfer-encoding"),
+        "{resp}"
+    );
+}
+
+#[test]
+fn system_ca_bundle_loads() {
+    // production trust comes from the OS bundle, never an embedded list or env (fails closed if absent)
+    let roots = system_roots().unwrap();
+    assert!(roots.len() > 50, "only {} roots", roots.len());
 }

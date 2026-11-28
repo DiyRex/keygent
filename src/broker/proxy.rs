@@ -10,13 +10,6 @@
 //! - One request per connection (`Connection: close`), bodies forwarded as-is (`Content-Length` or chunked).
 //! - The response streams back through the session redactor, so an approved host that echoes a header can't hand
 //!   the value to the child.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into runs in ADR 0022 step C1d; remove this then"
-    )
-)]
 
 use crate::crypto::Secret;
 use crate::redact::Redactor;
@@ -184,26 +177,104 @@ fn handle(ctx: &Ctx, client: &mut TcpStream) -> Result<(), Fail> {
         host: host.clone(),
         handles: used,
     });
-    // response: redacted on its way back (fail closed: a write error just ends the connection)
-    let mut stream = ctx.redactor.stream();
-    let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
-    let mut out = Zeroizing::new(Vec::with_capacity(CHUNK.saturating_mul(2)));
-    loop {
-        let n = match up.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+    relay_response(ctx, up, client);
+    Ok(())
+}
+
+/// Response back to the child, head and body through the redactor. Redaction can change lengths, so the length
+/// framing is dropped (chunked bodies are decoded) and the body ends when the connection closes (HTTP/1.1 §6.3).
+/// A read or write error just ends the connection (fail closed: nothing unredacted is ever written).
+fn relay_response(ctx: &Ctx, up: Box<dyn Upstream>, client: &mut TcpStream) {
+    let mut r = BufReader::with_capacity(CHUNK, up);
+    let Ok(head) = read_head(&mut r) else { return };
+    let Ok(text) = std::str::from_utf8(&head) else {
+        return;
+    };
+    let mut lines = text.split("\r\n").flat_map(|l| l.split('\n'));
+    let status = lines.next().unwrap_or_default().to_owned();
+    if !status.starts_with("HTTP/1.") {
+        return;
+    }
+    let mut out_head = format!("{status}\r\n");
+    let mut chunked = false;
+    let mut length: Option<u64> = None;
+    for l in lines.filter(|l| !l.is_empty()) {
+        let Some((n, v)) = l.split_once(':') else {
+            return;
         };
+        let v = v.trim();
+        match n.trim().to_ascii_lowercase().as_str() {
+            "transfer-encoding" => chunked = v.eq_ignore_ascii_case("chunked"),
+            "content-length" => length = v.parse().ok(),
+            "connection" | "keep-alive" => {}
+            _ => out_head.push_str(&format!("{}: {v}\r\n", n.trim())),
+        }
+    }
+    out_head.push_str("Connection: close\r\n\r\n");
+    let mut stream = ctx.redactor.stream();
+    let mut out = Zeroizing::new(Vec::with_capacity(CHUNK.saturating_mul(2)));
+    let mut emit = |data: &[u8], out: &mut Zeroizing<Vec<u8>>| -> bool {
         out.clear();
-        stream.push(buf.get(..n).unwrap_or_default(), &mut out);
-        if client.write_all(&out).is_err() {
-            return Ok(());
+        stream.push(data, out);
+        client.write_all(out).is_ok()
+    };
+    if !emit(out_head.as_bytes(), &mut out) {
+        return;
+    }
+    let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
+    if chunked {
+        loop {
+            let mut line = Vec::new();
+            if r.by_ref().take(1024).read_until(b'\n', &mut line).is_err() {
+                return;
+            }
+            let Some(size) = std::str::from_utf8(&line)
+                .ok()
+                .and_then(|l| l.split([';', '\r', '\n']).next())
+                .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
+            else {
+                return;
+            };
+            if size == 0 {
+                break;
+            }
+            let mut left = size;
+            while left > 0 {
+                let want = left.min(CHUNK);
+                let Ok(n) = r.read(buf.get_mut(..want).unwrap_or_default()) else {
+                    return;
+                };
+                if n == 0 || !emit(buf.get(..n).unwrap_or_default(), &mut out) {
+                    return;
+                }
+                left = left.saturating_sub(n);
+            }
+            let mut crlf = [0u8; 2];
+            if r.read_exact(&mut crlf).is_err() {
+                return;
+            }
+        }
+    } else {
+        let mut left = length;
+        loop {
+            let want = left.map_or(CHUNK, |l| usize::try_from(l).unwrap_or(CHUNK).min(CHUNK));
+            if want == 0 {
+                break;
+            }
+            let n = match r.read(buf.get_mut(..want).unwrap_or_default()) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if !emit(buf.get(..n).unwrap_or_default(), &mut out) {
+                return;
+            }
+            left = left.map(|l| l.saturating_sub(u64::try_from(n).unwrap_or(l)));
         }
     }
     out.clear();
     stream.finish(&mut out);
     let _ = client.write_all(&out);
     let _ = client.flush();
-    Ok(())
 }
 
 /// Bytes up to and including the blank line ending the head (≤ 64 KiB).
@@ -318,6 +389,8 @@ fn normalize_path(p: &str) -> String {
 
 const HOP_BY_HOP: &[&str] = &[
     "host",
+    // replaced by `identity`: a compressed echo would hide the value from the response redactor
+    "accept-encoding",
     "connection",
     "keep-alive",
     "proxy-connection",
@@ -347,7 +420,7 @@ fn build_head(
         out.extend_from_slice(&swapped);
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(b"Accept-Encoding: identity\r\nConnection: close\r\n\r\n");
     Ok((out, used))
 }
 
@@ -558,19 +631,53 @@ pub fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// Production connector: resolve in the broker, dial only public addresses on 443, TLS with the bundled roots,
+/// The OS CA bundle (root-owned, kept current by OS updates). Fixed paths only, never from env (SPEC §3).
+const CA_BUNDLES: &[&str] = &[
+    "/etc/ssl/cert.pem",                                 // macOS, Alpine, BSDs
+    "/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Arch
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // Fedora, RHEL
+    "/etc/pki/tls/certs/ca-bundle.crt",                  // older RHEL, CentOS
+    "/etc/ssl/ca-bundle.pem",                            // openSUSE
+];
+
+/// Parse every `CERTIFICATE` block of the first bundle found; fail closed if none yields a root.
+fn system_roots() -> io::Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    for path in CA_BUNDLES {
+        let Ok(pem) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let mut b64 = String::new();
+        let mut inside = false;
+        let mut ders = Vec::new();
+        for line in pem.lines() {
+            match line.trim() {
+                "-----BEGIN CERTIFICATE-----" => {
+                    inside = true;
+                    b64.clear();
+                }
+                "-----END CERTIFICATE-----" => {
+                    inside = false;
+                    if let Some(der) = b64_decode(b64.as_bytes()) {
+                        ders.push(rustls::pki_types::CertificateDer::from(der));
+                    }
+                }
+                l if inside => b64.push_str(l),
+                _ => {}
+            }
+        }
+        let (added, _) = roots.add_parsable_certificates(ders);
+        if added > 0 {
+            return Ok(roots);
+        }
+    }
+    Err(io::Error::other("no system CA bundle"))
+}
+
+/// Production connector: resolve in the broker, dial only public addresses on 443, TLS with the system roots,
 /// certificate checked for `host`. No redirects are ever followed (the proxy does not interpret responses).
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "unit tests use a plain-TCP connector; C1d e2e covers TLS"
-    )
-)]
-pub fn tls_connector() -> io::Result<Arc<Connect>> {
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
+fn tls_connector() -> io::Result<Arc<Connect>> {
+    let roots = system_roots()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -586,6 +693,51 @@ pub fn tls_connector() -> io::Result<Arc<Connect>> {
             let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
             tcp.set_read_timeout(Some(IO_TIMEOUT))?;
             tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+            let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+                .map_err(|_| io::Error::other("bad host"))?;
+            let conn = rustls::ClientConnection::new(cfg.clone(), name)
+                .map_err(|_| io::Error::other("tls"))?;
+            Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
+        },
+    ))
+}
+
+/// The connector for runs. With the `test-profile` feature only, `<state>/test-upstream` (`<port>`) and
+/// `<state>/test-upstream-ca.pem` redirect every host to `127.0.0.1:<port>` trusting only that CA, so end-to-end
+/// tests can stand in for a real API. Release builds never read these files.
+pub fn connector(state: &std::path::Path) -> io::Result<Arc<Connect>> {
+    #[cfg(feature = "test-profile")]
+    if let Ok(port) = std::fs::read_to_string(state.join("test-upstream")) {
+        return test_connector(port.trim(), &state.join("test-upstream-ca.pem"));
+    }
+    let _ = state;
+    tls_connector()
+}
+
+#[cfg(feature = "test-profile")]
+fn test_connector(port: &str, ca: &std::path::Path) -> io::Result<Arc<Connect>> {
+    let port: u16 = port
+        .parse()
+        .map_err(|_| io::Error::other("test-upstream port"))?;
+    let pem = std::fs::read_to_string(ca)?;
+    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = b64_decode(b64.as_bytes()).ok_or_else(|| io::Error::other("test ca"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .map_err(|_| io::Error::other("test ca"))?;
+    let cfg = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| io::Error::other("tls config"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
+    Ok(Arc::new(
+        move |host: &str| -> io::Result<Box<dyn Upstream>> {
+            let tcp = TcpStream::connect(("127.0.0.1", port))?;
             let name = rustls::pki_types::ServerName::try_from(host.to_owned())
                 .map_err(|_| io::Error::other("bad host"))?;
             let conn = rustls::ClientConnection::new(cfg.clone(), name)

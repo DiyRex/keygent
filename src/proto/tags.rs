@@ -112,6 +112,7 @@ pub mod proto {
     pub const E_EXPOSED: u16 = 0x1025;
     pub const E_DESCRIPTION: u16 = 0x1026;
     pub const E_CUSTODY: u16 = 0x1027;
+    pub const E_HOST: u16 = 0x1028;
     pub const DATA: u16 = 0x1030;
     pub const HITS: u16 = 0x1031;
     pub const CMD: u16 = 0x1040;

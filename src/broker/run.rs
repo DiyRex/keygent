@@ -144,6 +144,8 @@ pub struct Job {
     pub env_secrets: Vec<(String, Secret)>,
     /// (env var, value) for `{{keygent-file:h}}`: the var gets the binding's path.
     pub file_secrets: Vec<(String, Secret)>,
+    /// Custody credentials (ADR 0022): the env holds their dummies; this run's proxy holds the values.
+    pub custody: Vec<super::proxy::Cred>,
     /// (env var, bytes) of bound scripts: the var gets the private copy's path.
     pub scripts: Vec<(String, Vec<u8>)>,
     pub programs: Vec<Program>,
@@ -170,6 +172,8 @@ pub struct Direct {
 pub struct EndRecord {
     pub key: crate::crypto::Subkey,
     pub record: crate::vault::audit::Record<'static>,
+    /// Custody egress summaries, appended before the end record (ADR 0022).
+    pub egress: Vec<crate::vault::audit::Record<'static>>,
 }
 
 /// One private binding; removed (macOS) or closed (Linux) on drop.
@@ -450,7 +454,7 @@ struct Prepared {
 
 /// Steps 1–2: re-check every pin, build the command, env and private bindings. Policy errors pass through; any other
 /// failure is an internal error naming its step.
-fn prepare(shared: &Shared, job: &Job) -> Result<Prepared, Error> {
+fn prepare(shared: &Shared, job: &Job, proxy_url: Option<&str>) -> Result<Prepared, Error> {
     // every bound executable must still be the approved file
     for p in &job.programs {
         if let Program::File { path, sha256 } = p
@@ -481,6 +485,9 @@ fn prepare(shared: &Shared, job: &Job) -> Result<Prepared, Error> {
     }
     for (var, value) in &job.env_secrets {
         cmd.env(var, OsStr::from_bytes(value.expose()));
+    }
+    if let Some(u) = proxy_url {
+        cmd.env("KEYGENT_PROXY_URL", u);
     }
     cmd.current_dir(&job.cwd)
         .stdin(Stdio::null())
@@ -661,7 +668,13 @@ fn report(
     let EndRecord {
         key,
         record: mut end,
+        egress,
     } = job.audit;
+    for rec in egress {
+        if crate::vault::audit::append(&shared.dirs, &key, &rec).is_err() {
+            shared.log.event(Level::Error, "audit_append_failed", None);
+        }
+    }
     end.exit = Some(code);
     end.redactions = Some(flags.hits.load(Ordering::Relaxed));
     end.dur_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
@@ -705,12 +718,23 @@ fn report(
 
 /// Run `job` and stream it to `s`. Consumes the connection.
 pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
+    // ADR 0022: custody values live in this run's proxy, never in the child
+    let egress: Arc<Mutex<Vec<super::proxy::Outcome>>> = Arc::default();
+    let proxy = if job.custody.is_empty() {
+        None
+    } else {
+        match start_proxy(shared, &mut job, &egress) {
+            Ok(p) => Some(p),
+            Err(e) => return super::server::send_error(&mut s, &e),
+        }
+    };
+    let url = proxy.as_ref().map(super::proxy::Proxy::url);
     let Prepared {
         mut cmd,
         keep,
         bindings,
         scratch,
-    } = match prepare(shared, &job) {
+    } = match prepare(shared, &job, url.as_deref()) {
         Ok(p) => p,
         Err(e) => return super::server::send_error(&mut s, &e),
     };
@@ -757,6 +781,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
         }
     }
     flags.done.store(true, Ordering::Release);
+    drop(proxy); // stops the listener; in-flight requests end with their connections
     drop(registered);
     drop(bindings);
     drop(scratch);
@@ -776,6 +801,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
         }
         _ => None,
     };
+    job.audit.egress = egress_records(&super::lock(&egress));
     report(
         shared,
         job,
@@ -786,4 +812,56 @@ pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
         &flags,
     );
     let _ = s.shutdown(std::net::Shutdown::Both);
+}
+
+/// Start this run's custody proxy; the credentials move out of the job into it.
+fn start_proxy(
+    shared: &Shared,
+    job: &mut Job,
+    egress: &Arc<Mutex<Vec<super::proxy::Outcome>>>,
+) -> Result<super::proxy::Proxy, Error> {
+    let token = crypto::random_hex::<16>().map_err(|_| Error::Internal(151))?;
+    let connect = super::proxy::connector(&shared.dirs.state).map_err(|_| Error::Internal(152))?;
+    let sink = egress.clone();
+    let report: Arc<super::proxy::Report> = Arc::new(move |o| super::lock(&sink).push(o));
+    super::proxy::start(
+        token,
+        std::mem::take(&mut job.custody),
+        job.redactor.clone(),
+        connect,
+        report,
+    )
+    .map_err(|_| Error::Internal(153))
+}
+
+/// One audit record per (decision, host, handles) with its request count (ADR 0022; per-request records in ADR 0018).
+fn egress_records(outcomes: &[super::proxy::Outcome]) -> Vec<crate::vault::audit::Record<'static>> {
+    use super::proxy::Outcome;
+    let mut out: Vec<crate::vault::audit::Record<'static>> = Vec::new();
+    for o in outcomes {
+        let (decision, host, handles): (&'static str, Option<String>, Vec<String>) = match o {
+            Outcome::Forwarded { host, handles } => {
+                ("forwarded", Some(host.clone()), handles.clone())
+            }
+            Outcome::Refused {
+                reason,
+                handle,
+                host,
+            } => (reason, host.clone(), handle.iter().cloned().collect()),
+        };
+        if let Some(r) = out
+            .iter_mut()
+            .find(|r| r.decision == Some(decision) && r.host == host && r.handles == handles)
+        {
+            r.requests = Some(r.requests.unwrap_or(0).saturating_add(1));
+            continue;
+        }
+        let mut r = crate::vault::audit::Record::new("egress");
+        r.decision = Some(decision);
+        r.host = host;
+        r.handles = handles;
+        r.requests = Some(1);
+        out.push(r);
+    }
+    out
 }
