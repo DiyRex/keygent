@@ -72,6 +72,34 @@ Every phase ends with tests **on Linux, macOS and Windows**, the leak suite, and
 
 See SPEC §14.
 
+## Owner-requested tracks (2026-11-28, proposed — each lands as its own small PR, verified before the next)
+
+**DO token slice** ("make a DO droplet" without the token in chat)
+- [ ] S1 Tool binding: `keygent edit <h> --tool doctl` pins the program; the broker injects the handle's env name; e2e with a fake tool
+- [ ] S2 Claude Code `PreToolUse` hook rewrites to `keygent run --grant <id>` (contract verified per ADR 0001)
+- [ ] S3 Native Touch ID approval on macOS (LAContext, broker-rendered text)
+- [ ] S4 Web console: loopback random port, passkeys (Touch ID / Windows Hello), write-only value entry, gated reveal, approvals (ADR 0005 amendment)
+
+**Env sets** ([ADR 0019](adr/0019-env-sets.md))
+- [ ] Index `sets` table + `set add|rotate|edit|rm|ls`, dotenv paste entry, tier/aliases
+- [ ] Manifest `[sets] use = […]`, one approval per set, prod tier never `allow`
+- [ ] `run --env-file` private binding; leak tests (no value in project files, dotenv override)
+- [ ] Skill text: alias resolution, ask on ambiguity, never pick prod
+
+**Audit v2** ([ADR 0018](adr/0018-audit-log-v2.md))
+- [ ] v2 records (observed vs reported fields, agent, tool) + encrypted `x` field
+- [ ] `audit` filters/ranges, `audit stats --by …`, `--follow`, `--json`
+- [ ] Segments: rotation (4 MiB / 30 d), DEFLATE, `segments.idx`; retention (400 d / 128 MiB, 90 d floor), prune checkpoint, archive dir
+- [ ] `audit export|verify --archive`, `backup --with-audit`; alerts; console Audit page
+
+**Release** ([ADR 0017](adr/0017-release-pipeline-and-updates.md))
+- [ ] GoReleaser config + manual-only `release.yml` (snapshot/release), formula generator — branch `build/goreleaser`, verified with a local snapshot
+- [ ] Public tap `DiyRex/homebrew-tap` + `HOMEBREW_TAP_TOKEN` (owner)
+- [ ] Windows targets once `src/platform` builds there
+
+**Reviews feeding these** — [RustyVault comparison](research/rustyvault-comparison.md): revoke approved grants and `--remember`
+entries on tightening edits; Shamir (recovery key only) in Phase 6. Cedar: [ADR 0020](adr/0020-cedar-policy.md), owner decision.
+
 ## Later
 
 - **Phase 6 — Hardening:** egress proxy (T3), screen-lock seal, passkey PRF unseal, user-presence slots, Shamir, MCP
