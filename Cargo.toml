@@ -20,6 +20,8 @@ hkdf = { version = "0.13", default-features = false }
 hmac = { version = "0.13", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# TLS client for the custody proxy (ADR 0022): ring provider, TLS 1.2+1.3; roots come from the OS bundle
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", default-features = false }

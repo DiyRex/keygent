@@ -29,6 +29,22 @@ pub fn valid_handle(h: &str) -> bool {
     })
 }
 
+/// A host a custody handle may reach (ADR 0022): lower-case DNS name, labels `[a-z0-9-]{1,63}` not starting or
+/// ending with `-`, ≤ 253 chars, no trailing dot, no port, no wildcard (C1).
+pub fn valid_host(h: &str) -> bool {
+    h.len() <= 253
+        && !h.is_empty()
+        && h.split('.').all(|l| {
+            let b = l.as_bytes();
+            !b.is_empty()
+                && b.len() <= 63
+                && b.iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+                && b.first() != Some(&b'-')
+                && b.last() != Some(&b'-')
+        })
+}
+
 pub fn check_handle(h: &str) -> Result<()> {
     if valid_handle(h) {
         Ok(())

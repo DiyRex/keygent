@@ -538,11 +538,14 @@ fn unseal_status_ls_seal() {
     );
     let (code, out, err) = run(&root, &["ls"], &[]);
     assert_eq!(code, 0, "{err}");
-    assert_eq!(out, "a/b  $A_B  approve\n");
+    assert_eq!(out, "a/b  $A_B  approve  custody\n");
     // a CLI write while unsealed is picked up by the broker (ADR 0012 reload)
     assert_eq!(add(&root, "c/d", &canary()).0, 0);
     let (_, out, _) = run(&root, &["ls"], &[]);
-    assert_eq!(out, "a/b  $A_B  approve\nc/d  $C_D  approve\n");
+    assert_eq!(
+        out,
+        "a/b  $A_B  approve  custody\nc/d  $C_D  approve  custody\n"
+    );
     // the description is listed so an agent can find a handle from the user's words
     let (code, _, err) = run(
         &root,
@@ -558,7 +561,18 @@ fn unseal_status_ls_seal() {
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert_eq!(
         out,
-        "a/b  $A_B  approve\nc/d  $C_D  approve  — DigitalOcean API token (personal)\n"
+        "a/b  $A_B  approve  custody\nc/d  $C_D  approve  custody  — DigitalOcean API token (personal)\n"
+    );
+    // custody is on by default (ADR 0022); `add --no-custody` and `edit --custody off` turn it off
+    let (code, _, err) = run(&root, &["add", "e/f", "--no-custody"], &[PASS, &canary()]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = run(&root, &["edit", "a/b", "--custody", "off"], &[PASS, "y"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("custody:     on → off"), "{err}");
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        out,
+        "a/b  $A_B  approve\nc/d  $C_D  approve  custody  — DigitalOcean API token (personal)\ne/f  $E_F  approve\n"
     );
     // runtime files are owner-only; the broker log never contains the value
     use std::os::unix::fs::PermissionsExt;
@@ -1295,13 +1309,23 @@ fn capture_stores_stdout_as_a_new_handle_without_showing_it() {
     );
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert!(out.contains("new/tok  $KEYGENT_NEW_TOK  approve"), "{out}");
-    // the stored value is usable (and redacted) like any other
-    let (code, out, _) = approved(&[
-        "run",
-        "--",
-        "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
-    ]);
-    assert_eq!((code, out.as_str()), (0, "‹keygent:new/tok›"));
+    // a captured single-line value defaults to custody (ADR 0022): runs need no prompt and the child only ever
+    // holds a dummy with the value's shape (48 hex chars), never the value
+    let s = run_in(
+        &root,
+        &proj,
+        &[
+            "run",
+            "--",
+            "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
+        ],
+    );
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.len() == 48 && out.bytes().all(|b| b.is_ascii_hexdigit()),
+        "dummy with the value's shape: {out}"
+    );
     // create-only: an existing handle is refused before anyone is asked to approve
     let mut x = cmd(&root, &["capture", "svc/key", "--", make]);
     x.current_dir(&proj);

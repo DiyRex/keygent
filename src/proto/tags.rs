@@ -33,6 +33,8 @@ pub mod handle {
     pub const CONFIG_SEEN: u16 = 0x020f;
     /// The value replaced by the last `rotate`, kept for 24 h (SPEC §5.2 "previous values for 24 h").
     pub const PREVIOUS_VALUE: u16 = 0x0210;
+    /// u8 0/1, optional: credential custody (ADR 0022). Absent means on.
+    pub const CUSTODY: u16 = 0x0211;
 }
 
 pub mod allow_rule {
@@ -109,6 +111,8 @@ pub mod proto {
     pub const E_BINDING: u16 = 0x1024;
     pub const E_EXPOSED: u16 = 0x1025;
     pub const E_DESCRIPTION: u16 = 0x1026;
+    pub const E_CUSTODY: u16 = 0x1027;
+    pub const E_HOST: u16 = 0x1028;
     pub const DATA: u16 = 0x1030;
     pub const HITS: u16 = 0x1031;
     pub const CMD: u16 = 0x1040;

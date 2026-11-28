@@ -211,6 +211,8 @@ fn list(shared: &Shared, s: &mut UnixStream) {
                 binding: r.binding as u8,
                 exposed: r.exposed,
                 description: r.description.clone(),
+                custody: r.custody,
+                hosts: r.hosts.clone(),
             })
             .collect::<Vec<ListEntry>>()
     }) else {
@@ -647,6 +649,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
         }
         let mut env_secrets = Vec::new();
         let mut file_secrets = Vec::new();
+        let mut custody: Vec<super::proxy::Cred> = Vec::new();
         for b in &g.bindings {
             let v = st
                 .vault
@@ -654,6 +657,38 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
                 .map_err(|_| Error::Internal(143))?;
             if b.file {
                 file_secrets.push((b.var.clone(), v));
+            } else if g.custody.contains(&b.handle) {
+                // ADR 0022: the child gets a dummy; the value stays in the broker's proxy. Decided by the grant, never
+                // by the live flag: a grant built without a prompt must not turn into a real-value run (PR #14 review).
+                // Line breaks and other control bytes would split headers, so such values can't use custody.
+                if v.expose().iter().any(|&c| c < 0x20 || c == 0x7f) {
+                    return Err(Error::Policy(PolicyMsg::CustodyMultiline(b.handle.clone())));
+                }
+                let hosts = st
+                    .vault
+                    .index
+                    .get(&b.handle)
+                    .map(|r| r.hosts.clone())
+                    .unwrap_or_default();
+                let existing = custody
+                    .iter()
+                    .find(|c| c.handle == b.handle)
+                    .map(|c| c.dummy.clone());
+                let dummy = match existing {
+                    Some(d) => d,
+                    None => {
+                        let d =
+                            super::custody::dummy(v.expose()).map_err(|_| Error::Internal(150))?;
+                        custody.push(super::proxy::Cred {
+                            handle: b.handle.clone(),
+                            dummy: d.clone(),
+                            value: crypto::Secret::from_slice(v.expose()),
+                            hosts,
+                        });
+                        d
+                    }
+                };
+                env_secrets.push((b.var.clone(), crypto::Secret::new(dummy)));
             } else {
                 env_secrets.push((b.var.clone(), v));
             }
@@ -665,6 +700,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             cwd: g.cwd.clone(),
             env_secrets,
             file_secrets,
+            custody,
             scripts: g
                 .scripts
                 .iter()
@@ -689,6 +725,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
             audit: run::EndRecord {
                 key: st.vault.audit_key()?,
                 record: st.grant_record(g, "run", "end"),
+                egress: Vec::new(),
             },
         };
         if let Some(g) = st.grants.get_mut(pos) {

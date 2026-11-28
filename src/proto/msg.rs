@@ -210,6 +210,8 @@ pub struct ListEntry {
     pub binding: u8,
     pub exposed: bool,
     pub description: String,
+    pub custody: bool,
+    pub hosts: Vec<String>,
 }
 
 pub fn encode_list(entries: &[ListEntry]) -> Result<Vec<u8>, TlvError> {
@@ -221,7 +223,12 @@ pub fn encode_list(entries: &[ListEntry]) -> Result<Vec<u8>, TlvError> {
             e.u8(t::E_MODE, x.mode)?;
             e.u8(t::E_BINDING, x.binding)?;
             e.bool(t::E_EXPOSED, x.exposed)?;
-            e.utf8(t::E_DESCRIPTION, &x.description)
+            e.utf8(t::E_DESCRIPTION, &x.description)?;
+            e.bool(t::E_CUSTODY, x.custody)?;
+            for h in &x.hosts {
+                e.utf8(t::E_HOST, h)?;
+            }
+            Ok(())
         })?;
     }
     Ok(done(e))
@@ -244,6 +251,12 @@ pub fn decode_list(b: &[u8]) -> Result<Vec<ListEntry>, TlvError> {
         let exposed = s.as_bool(t::E_EXPOSED, v)?;
         let v = s.req(t::E_DESCRIPTION)?;
         let description = string(&s, t::E_DESCRIPTION, v)?;
+        let v = s.req(t::E_CUSTODY)?;
+        let custody = s.as_bool(t::E_CUSTODY, v)?;
+        let mut hosts = Vec::new();
+        for h in s.list(t::E_HOST)? {
+            hosts.push(string(&s, t::E_HOST, h)?);
+        }
         s.finish()?;
         out.push(ListEntry {
             handle,
@@ -252,6 +265,8 @@ pub fn decode_list(b: &[u8]) -> Result<Vec<ListEntry>, TlvError> {
             binding,
             exposed,
             description,
+            custody,
+            hosts,
         });
     }
     d.finish()?;
@@ -555,6 +570,8 @@ mod tests {
             binding: 0,
             exposed: false,
             description: "d".into(),
+            custody: true,
+            hosts: vec!["api.example.com".into()],
         }];
         assert_eq!(decode_list(&encode_list(&l).unwrap()).unwrap(), l);
         let e = ErrMsg {

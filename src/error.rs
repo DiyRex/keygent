@@ -31,6 +31,8 @@ pub enum PolicyMsg {
     Limit(u64),
     NoRemember,
     NotTrusted,
+    /// A custody handle whose value has line breaks or other control bytes (ADR 0022: custody needs a plain token).
+    CustodyMultiline(String),
 }
 
 /// Every failure keygent itself reports. Variants hold only non-secret data (handles, env names, limits, codes).
@@ -186,6 +188,7 @@ impl fmt::Display for Error {
                 PolicyMsg::Limit(min) => write!(f, "keygent: run stopped at its limit ({min} min / 10 MiB) — use --max-runtime or run_in_background"),
                 PolicyMsg::NoRemember => f.write_str("keygent: --remember isn't available for this run (it runs code keygent can't fully show)"),
                 PolicyMsg::NotTrusted => f.write_str("keygent: .keygent.toml changed — ask the user to run 'keygent trust'"),
+                PolicyMsg::CustodyMultiline(h) => write!(f, "keygent: {} has control bytes — ask the user to set '--custody off'", short(h)),
             },
             Error::Remote(_, m) => f.write_str(m),
             Error::NoPending => f.write_str("keygent: no pending requests"),
@@ -289,6 +292,7 @@ mod tests {
             Error::Policy(PolicyMsg::Limit(240)),
             Error::Policy(PolicyMsg::NoRemember),
             Error::Policy(PolicyMsg::NotTrusted),
+            Error::Policy(PolicyMsg::CustodyMultiline(long.clone())),
             Error::NoManifest,
             Error::BadManifest(0),
             Error::BadManifest(usize::MAX),

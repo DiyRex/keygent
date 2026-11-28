@@ -60,7 +60,9 @@ Entry AAD and index AAD use the length-prefixed encoding below: `enc(uuid) ‖ e
 | `tripwire_id` | 16 B | keystore item name |
 
 `handles[]` entry: `{ handle, env_name, description (≤ 200 chars), binding: env|file, mode: allow|approve|confirm|deny,
-allow_rules[], hosts[], created_at, rotated_at, version, previous_version_until?, exposed: bool, origin: human|capture }`.
+allow_rules[], hosts[], created_at, rotated_at, version, previous_version_until?, exposed: bool, origin: human|capture, custody?: bool }`.
+`custody` (tag `0x0211`, bool, last) is optional; absent means **on** (ADR 0022). `hosts[]` (tag `0x0207`) holds the hosts the human
+approved for a custody handle. `ls` entries carry `custody` as tag `0x1027`.
 
 Tag numbers: `src/proto/tags.rs` (handles `0x02xx`, allow rules `0x03xx`, …). `previous_value` (tag `0x0210`, bytes) holds the value
 replaced by the last `rotate` and is present **iff** `previous_version_until` is (ADR 0011 #3). The recovery slot uses `kdf_id 0` with
@@ -117,6 +119,8 @@ As built in Phase 2 (ADR 0015): `mac` and `grant_key` are lower-case hex (64 cha
 bytes. `audit.anchor` lines are `<seq> <hex HMAC(K_audit, enc(seq as u64 LE) ‖ enc(mac))>`. A run writes a `run` record with
 `decision:"start"` before exec (fail closed) and one with `decision:"end"|"limit"|"client_gone"`, `exit`, `redactions`, `dur_ms` after.
 Not built yet: rotation, the 10-min tripwire anchor, the `rekey` epoch record.
+Custody (ADR 0022): an `egress` record per (decision, host, handles) of a run, written before the run's `end` record:
+`{"event":"egress","handles":["do/token"],"decision":"forwarded"|"credential_endpoint_mismatch","host":"api.digitalocean.com","requests":3}`.
 
 ## 6. Hook I/O (Claude Code adapter, per ADR 0001)
 

@@ -273,7 +273,9 @@ pub fn run_setup() -> (Root, String, PathBuf) {
     let root = Root::new();
     init(&root);
     let c = canary();
-    assert_eq!(add(&root, "svc/key", &c).0, 0);
+    // the classic flow: the approved child gets the real value (custody has its own tests)
+    let (code, _, err) = run(&root, &["add", "svc/key", "--no-custody"], &[PASS, &c]);
+    assert_eq!(code, 0, "{err}");
     assert_eq!(unseal(&root, &[]).0, 0);
     let proj = root.0.join("proj");
     std::fs::create_dir_all(proj.join(".git")).unwrap();

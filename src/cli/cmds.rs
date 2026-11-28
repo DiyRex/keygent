@@ -472,7 +472,7 @@ fn restore_new_machine(con: &mut Console, d: &Dirs, bytes: Vec<u8>, own: bool) -
 // ---------------------------------------------------------------- secret commands
 
 pub fn add(a: Args) -> Result<()> {
-    let usage = "keygent add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]";
+    let usage = "keygent add <handle> [--env N] [--description T] [--no-custody] [--multiline | --from-file P [--delete]]";
     let h = one_handle(&a, usage)?;
     let env = match a.value("--env") {
         Some(e) => e.to_owned(),
@@ -489,13 +489,10 @@ pub fn add(a: Args) -> Result<()> {
     let (value, src) = read_value(&mut con, &a)?;
     strength::check_secret(value.expose())?;
     let now = vault::now();
-    v.index.handles.push(index::new_handle(
-        &h,
-        &env,
-        &desc,
-        v.index.security.default_mode,
-        now,
-    ));
+    let mut rec = index::new_handle(&h, &env, &desc, v.index.security.default_mode, now);
+    // custody swaps a plain token in headers; a value with line breaks or control bytes (PEM, JSON key) uses approval
+    rec.custody = !a.has("--no-custody") && !value.expose().iter().any(|&c| c < 0x20 || c == 0x7f);
+    v.index.handles.push(rec);
     v.put_entry(&h, 1, &value)?;
     drop(value);
     audited_commit(&mut v, &d, Prev::Keep, "add", &[&h])?;
@@ -665,7 +662,7 @@ pub fn edit(a: Args) -> Result<()> {
     if a.has("--settings") {
         return edit_settings(a);
     }
-    let usage = "keygent edit <handle> [--env NAME] [--description TEXT] [--mode M] [--binding B] [--argv A]";
+    let usage = "keygent edit <handle> [--env N] [--description T] [--mode M] [--custody on|off] [--allow-host H] …";
     let h = one_handle(&a, usage)?;
     let env = a.value("--env").map(str::to_owned);
     if let Some(e) = &env {
@@ -695,7 +692,32 @@ pub fn edit(a: Args) -> Result<()> {
             _ => Err(Error::Usage("--argv deny|allow")),
         })
         .transpose()?;
-    if env.is_none() && desc.is_none() && mode.is_none() && binding.is_none() && argv.is_none() {
+    let custody = a
+        .value("--custody")
+        .map(|c| match c {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err(Error::Usage("--custody on|off")),
+        })
+        .transpose()?;
+    let allow_host = a.value("--allow-host").map(str::to_owned);
+    let remove_host = a.value("--remove-host").map(str::to_owned);
+    for h in allow_host.iter().chain(remove_host.iter()) {
+        if !names::valid_host(h) {
+            return Err(Error::Usage(
+                "--allow-host: a lower-case host name like api.example.com",
+            ));
+        }
+    }
+    if env.is_none()
+        && desc.is_none()
+        && mode.is_none()
+        && binding.is_none()
+        && argv.is_none()
+        && custody.is_none()
+        && allow_host.is_none()
+        && remove_host.is_none()
+    {
         return Err(Error::Usage(usage));
     }
     for f in [
@@ -737,6 +759,27 @@ pub fn edit(a: Args) -> Result<()> {
             diff.push("  ⚠ argv allow: the value will be visible to other local users via the process list".into());
         }
     }
+    if let Some(c) = custody {
+        let name = |on: bool| if on { "on" } else { "off" };
+        diff.push(format!(
+            "  custody:     {} → {}",
+            name(rec.custody),
+            name(c)
+        ));
+        if c {
+            diff.push(
+                "  custody on: runs get a dummy and need no per-command approval (ADR 0022)".into(),
+            );
+        }
+    }
+    if let Some(x) = &allow_host {
+        diff.push(format!(
+            "  hosts:       + {x}  (the value may be sent to this host through the custody proxy)"
+        ));
+    }
+    if let Some(x) = &remove_host {
+        diff.push(format!("  hosts:       − {x}"));
+    }
     con.say(&format!("Changes to {h}:"));
     for line in &diff {
         con.say(line);
@@ -744,7 +787,12 @@ pub fn edit(a: Args) -> Result<()> {
     if !con.confirm("Apply?")? {
         return Err(Error::Cancelled);
     }
-    let policy_change = mode.is_some() || binding.is_some() || argv.is_some();
+    let policy_change = mode.is_some()
+        || binding.is_some()
+        || argv.is_some()
+        || custody.is_some()
+        || allow_host.is_some()
+        || remove_host.is_some();
     let rec = v
         .index
         .get_mut(&h)
@@ -763,6 +811,17 @@ pub fn edit(a: Args) -> Result<()> {
     }
     if let Some(x) = argv {
         rec.argv = x;
+    }
+    if let Some(c) = custody {
+        rec.custody = c;
+    }
+    if let Some(x) = allow_host
+        && !rec.hosts.contains(&x)
+    {
+        rec.hosts.push(x);
+    }
+    if let Some(x) = remove_host {
+        rec.hosts.retain(|y| *y != x);
     }
     audited_commit(
         &mut v,

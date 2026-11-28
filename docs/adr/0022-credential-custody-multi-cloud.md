@@ -124,3 +124,29 @@ for a provider.
   - the real value never appears in the child's env, argv, files or output;
   - a tool that ignores both routes fails closed.
 - **ADR 0021 (leases)** narrows to non-HTTP secrets and `--no-custody` handles.
+
+## As built: C1 (2026-11-28)
+
+- **Dummies are not redacted.** They aren't secret, and their kept prefix is limited by §1. This replaces "the redactor also
+  knows the dummies". When the value's letters are all hex digits, the dummy's letters are hex too, so "64 hex chars" checks
+  pass.
+- **Hosts are approved up front for now.** `keygent edit <h> --allow-host <host>` / `--remove-host` (passphrase), and
+  `keygent ls` shows `custody → host,…`. The learned-host prompt (§3) is step C1c.
+- **Response framing.** The proxy drops `Content-Length` and `Transfer-Encoding` from responses and decodes chunked bodies, then
+  ends the body at connection close (redaction can change lengths). Requests get `Accept-Encoding: identity`, because a
+  compressed echo would hide the value from the redactor.
+- **Trust.** Roots come from the OS CA bundle at fixed paths. There is no embedded list and no env override. If no bundle
+  exists, the run fails closed.
+- **Audit.** One `egress` record per (decision, host, handles) is written at run end, with a request count (FORMATS §5).
+  Per-request records come with audit v2 (ADR 0018).
+- **Size** (release, per target): x86_64-musl is 2,051,560 B, 45,592 under the cap. C2 (P-256 signing for the per-run CA)
+  needs room. The options are TLS 1.3-only (−40,792 B), a separate egress binary, or a larger cap. **Owner decision before C2.**
+- **Verified:** macOS 26 and Linux (`rust:1-bookworm`). The `tests/custody.rs` e2e test covers:
+  - the curl → proxy → local HTTPS API path;
+  - no approval prompt;
+  - the dummy in the child;
+  - the value at the API;
+  - the echo redacted;
+  - a proxy bypass sends only the dummy;
+  - egress audited;
+  - host removal stops forwarding.

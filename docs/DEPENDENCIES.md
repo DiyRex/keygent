@@ -10,6 +10,7 @@ is not enough**. Budget: total binary ≤ 2 MB (target 1.5 MB).
 | `hkdf` / `hmac` / `sha2` | 0.13 / 0.13 / 0.11 | in crypto set | key separation, header MAC; mandated | Phase 1 |
 | `zeroize` / `getrandom` | 1.9 / 0.4 | in crypto set | memory hygiene, OS RNG; mandated | Phase 1 |
 | `libc` | 0.2 (unix only) | ~2 KB | termios, poll, statfs, getpwuid_r, fcntl; std has no API for these | Phase 1 |
+| `rustls` | 0.23 (`ring`, `std`, `tls12`) | release per target with custody wired (2026-11-28): aarch64-darwin 1,497,392 · x86_64-darwin 1,756,768 · aarch64-musl 1,742,008 · **x86_64-musl 2,051,560** (45,592 under the hard cap) · armv7 1,583,600 · riscv64 1,593,048 | TLS client for the custody proxy: the broker dials the real API itself (ADR 0022); std has no TLS. Roots come from the **OS CA bundle** at fixed paths (an embedded `webpki-roots` list cost +57,792 B on x86_64-musl and was dropped). TLS 1.3-only would save another 40,792 B (owner decision). `ring` needs a C compiler for musl (zig in releases, `musl-tools` in the Linux container) | Custody C1 |
 | ~~`objc2` + `objc2-foundation`~~ | removed in Phase 2 | — | `objc2` always links Foundation (+AppKit for the pasteboard): every keygent process idled at 8.7 MB RSS (plain Rust: 1.4 MB). Replaced by `dlopen`/`dlsym` of libobjc + AppKit inside `reveal --copy` only (raw `objc_msgSend` fallback named above) | Phase 1 → removed Phase 2 |
 
 **Phase 1 release sizes:** aarch64-apple-darwin 586 096 B · x86_64-unknown-linux-musl 822 904 B · aarch64-unknown-linux-musl 724 128 B
