@@ -643,7 +643,8 @@ keystore tripwire. Truncation is detected unless the log, the anchor and the tri
   Installers **refuse downgrades** unless `--allow-downgrade` is passed. The bootstrap script itself is trust-on-first-use (fetched over HTTPS from
   the repo); this is documented, and the signed-binary path is the verifiable one. Without cosign the scripts print how to verify manually. Then install to
   the user dir. The PowerShell script asks before adding to the user PATH. Also a Homebrew tap (`brew install diyrex/tap/keygent`, macOS/Linux,
-  a formula rendered from the signed `SHA256SUMS`; ADR 0017) and `cargo install --locked`
+  a formula rendered from the signed `SHA256SUMS`; ADR 0017) and `cargo install --locked` (on Linux with `--target <arch>-unknown-linux-musl`; a glibc build
+  loses the `LD_PRELOAD` defence and exceeds the RSS budget, PLATFORMS)
   from source. winget/scoop come later. **Minimum Claude Code: 2.1.295** (`onFailure`). `integrate` and `doctor` refuse older versions.
 - **Upgrade:** replace the binary (`brew upgrade keygent`), then `keygent seal && keygent unseal`. keygent never updates itself (ADR 0017). Hooks call the stable launcher, so paths survive upgrades. `doctor` repairs
   stale hook paths.
@@ -871,3 +872,4 @@ broker unredacted. **Chain composer:** keygent wrapping another tool's hook so t
 | 175 | `mcp` listed as v1 | Marked Phase 6 (§5.1) |
 | 176 | Only a Mac available; 3-OS rule can't be met now | Windows verification deferred, compile-check only, no phase DONE until Windows runs ([ADR 0010](adr/0010-windows-verification-deferred.md)) |
 | 177 | Owner wants a Homebrew tap, auto-updates, and no automatic CI | GoReleaser on one macOS runner, manual `release.yml` (snapshot/release), formula tap, updates via `brew upgrade`/`brew autoupdate`, no self-update; Windows release asset waits for the platform layer ([ADR 0017](adr/0017-release-pipeline-and-updates.md)) |
+| 178 | Linux broker RSS 5.55 MiB on a glibc build (budget 5 MB) | Budget and injection defence apply to the static musl build that ships (2.61 MiB); source installs on Linux use the musl target (§12, PLATFORMS, README) |

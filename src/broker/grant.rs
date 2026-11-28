@@ -788,6 +788,7 @@ pub fn find<'a>(grants: &'a mut [Grant], id: &[u8]) -> Option<&'a mut Grant> {
 mod tests {
     #![allow(
         clippy::unwrap_used,
+        clippy::expect_used,
         clippy::indexing_slicing,
         reason = "tests: a panic is the failure report"
     )]
@@ -824,6 +825,73 @@ mod tests {
             max_runtime: None,
             capture: None,
         }
+    }
+
+    /// An allow-rule snapshot for `ls hi` pinned to `sha256` (the real hash, or a stale one).
+    fn ls_rule(sha256: [u8; 32]) -> (Vec<HandlePolicy>, String) {
+        let Program::File { path, .. } =
+            resolve::resolve(Some("ls"), Path::new("/"), "/bin:/usr/bin")
+        else {
+            panic!("no ls binary")
+        };
+        let exe = path.to_str().unwrap().to_owned();
+        let snap = vec![HandlePolicy {
+            handle: "svc/key".into(),
+            env_name: "SVC_KEY".into(),
+            mode: Mode::Allow,
+            argv: Argv::Deny,
+            file: false,
+            rules: vec![AllowRule {
+                exe: exe.clone(),
+                sha256,
+                args: vec!["hi".into()],
+                flags: Vec::new(),
+                home: Home::Inherit,
+            }],
+        }];
+        (snap, exe)
+    }
+
+    /// Review follow-up (PR #9): a stale pin and a capture both force approval, alone or together, and the
+    /// approval text names every reason.
+    #[test]
+    fn allow_rule_stale_pin_and_capture_each_need_approval() {
+        let p = tmp_project();
+        let cwd = p.to_str().unwrap();
+        let Program::File { sha256: real, .. } =
+            resolve::resolve(Some("ls"), Path::new("/"), "/bin:/usr/bin")
+        else {
+            panic!("no ls binary")
+        };
+        let argv = vec!["ls".to_owned(), "hi".to_owned()];
+        let grant = |sha: [u8; 32], capture: Option<&str>| {
+            let (snap, _) = ls_rule(sha);
+            let r = Request {
+                command: "ls hi",
+                cwd,
+                max_runtime: None,
+                capture,
+            };
+            allow_grant(&r, &argv, &snap, &p, None, "/bin:/usr/bin", DEFAULT_RUNTIME)
+                .unwrap()
+                .expect("rule matches")
+        };
+        let stale = [7u8; 32];
+        let fresh = grant(real, None);
+        assert_eq!(fresh.state, State::Approved);
+        for (g, repin, cap) in [
+            (grant(stale, None), true, false),
+            (grant(real, Some("new/handle")), false, true),
+            (grant(stale, Some("new/handle")), true, true),
+        ] {
+            assert_eq!(g.state, State::Pending);
+            assert_eq!(g.rendered.contains("re-pin"), repin, "{}", g.rendered);
+            assert_eq!(g.rendered.contains("new/handle"), cap, "{}", g.rendered);
+            if cap {
+                assert_ne!(g.key, fresh.key, "capture target must change the grant key");
+            }
+        }
+        std::fs::remove_dir_all(p).unwrap();
     }
 
     #[test]
