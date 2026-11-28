@@ -50,7 +50,7 @@ These are hard rules. A pull request that breaks one isn't merged.
 |---|---|
 | Language | Stable Rust, edition 2024, MSRV 1.89 (`rust-version` in `Cargo.toml`). Don't use APIs newer than the MSRV |
 | Concurrency | No async runtime. Use threads and blocking I/O |
-| Size | The release binary must stay **≤ 2 MB** (target ≤ 1.5 MB). Check with `scripts/size-check.sh` |
+| Size | The release binary must stay **≤ 3 MB** (target ≤ 2 MB). Check with `scripts/size-check.sh` |
 | Dependencies | std first. A new crate needs a one-line justification in the PR (why std isn't enough) plus the binary size before and after |
 | Lints | `cargo clippy --all-targets --all-features -- -D warnings` must be clean. No `unwrap`/`expect` outside tests, no unchecked indexing or arithmetic. Every `#[allow]` needs a `reason = "…"`; prefer `#[expect]` |
 | Errors | User- and agent-facing errors are a single line starting with `keygent:`, at most 120 characters, naming the next action. Exit codes are stable (`77` policy deny, `78` sealed, `79` broker/internal, `64` usage, `74` run limit, `75` approval denied, `76` manifest not trusted) |
@@ -101,7 +101,7 @@ It runs, in order:
 1. `cargo fmt --check`;
 2. clippy (all targets, `-D warnings`);
 3. the test suite;
-4. a release build and the 2 MB size check;
+4. a release build and the 3 MB size check;
 5. `cargo deny`, if installed.
 
 As the broker lands on `main`, it also checks the plaintext boundary, where `unsafe` is used, runs the end-to-end tests

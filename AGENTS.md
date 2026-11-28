@@ -66,7 +66,7 @@ Progress is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 | Item | Budget |
 |---|---|
 | Language | Rust stable, edition 2024, **no async runtime** (threads + blocking I/O) |
-| Release binary (every target) | ≤ 2 MB hard, ≤ 1.5 MB target |
+| Release binary (every target) | ≤ 3 MB hard, ≤ 2 MB target (ADR 0023) |
 | Unsealed broker idle RSS | ≤ 5 MB |
 | Hook invocation p95 | ≤ 30 ms (≤ 50 ms on Windows) |
 | `keygent run` overhead | ≤ 10 ms, redaction ≥ 200 MB/s |
@@ -106,7 +106,7 @@ cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo deny check          # licenses, bans, advisories (covers cargo audit)
-scripts/size-check.sh     # fails if target/release/keygent > 2 MB
+scripts/size-check.sh     # fails if target/release/keygent > 3 MB
 ```
 
 ## Output style for agent-facing text

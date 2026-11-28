@@ -44,7 +44,7 @@ Option 2.
   - Also built during the survey but **not shipped**: `i686` and `powerpc64le` musl (they build; agents don't realistically
     run there), `s390x` (no prebuilt std), `x86_64-unknown-freebsd` (compile error in `src/platform`; needs a FreeBSD port).
   - Darwin builds natively. Linux builds through zig: keygent links no Apple framework, because AppKit and objc are `dlopen`ed.
-- Every binary passes `scripts/release-check.sh` (the 2 MB budget and no `KEYGENT_TEST_ROOT`, per SPEC §11).
+- Every binary passes `scripts/release-check.sh` (the size budget, now 3 MB per ADR 0023, and no `KEYGENT_TEST_ROOT`, per SPEC §11).
 
 **Release assets**
 - Archives, `SHA256SUMS` and a CycloneDX SBOM (`cargo cyclonedx`, from `Cargo.lock`) are signed keylessly with cosign.

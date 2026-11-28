@@ -1,7 +1,7 @@
 # Dependencies
 
 Every crate needs a justification: **size delta** (measured on a `--release` linux-x86_64 build) and **why std
-is not enough**. Budget: total binary ≤ 2 MB (target 1.5 MB).
+is not enough**. Budget: total binary ≤ 3 MB (target 2 MB; [ADR 0023](adr/0023-binary-size-budget.md)).
 
 | Crate | Version | Size Δ | Why std is not enough | Added in |
 |---|---|---|---|---|
@@ -14,7 +14,7 @@ is not enough**. Budget: total binary ≤ 2 MB (target 1.5 MB).
 | ~~`objc2` + `objc2-foundation`~~ | removed in Phase 2 | — | `objc2` always links Foundation (+AppKit for the pasteboard): every keygent process idled at 8.7 MB RSS (plain Rust: 1.4 MB). Replaced by `dlopen`/`dlsym` of libobjc + AppKit inside `reveal --copy` only (raw `objc_msgSend` fallback named above) | Phase 1 → removed Phase 2 |
 
 **Phase 1 release sizes:** aarch64-apple-darwin 586 096 B · x86_64-unknown-linux-musl 822 904 B · aarch64-unknown-linux-musl 724 128 B
-(budget 2 MB, target 1.5 MB). Windows not built (ADR 0010).
+(budget then 2 MB, target 1.5 MB; now 3 MB / 2 MB, ADR 0023). Windows not built (ADR 0010).
 
 ## Candidates measured (Phase 0)
 
