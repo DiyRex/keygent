@@ -16,6 +16,8 @@ builds:
       - aarch64-apple-darwin
       - x86_64-unknown-linux-musl
       - aarch64-unknown-linux-musl
+      - armv7-unknown-linux-musleabihf   # Raspberry Pi and other 32-bit ARM boards
+      - riscv64gc-unknown-linux-musl
     env:
       - RUSTFLAGS=--remap-path-prefix={{ .Env.PWD }}=.
     hooks:

@@ -37,7 +37,12 @@
 Option 2.
 
 **Build**
-- `.goreleaser.yaml` builds `aarch64`/`x86_64` × `apple-darwin` and `unknown-linux-musl` from one macOS runner.
+- `.goreleaser.yaml` builds `aarch64`/`x86_64` × `apple-darwin` and `unknown-linux-musl`, plus Linux `armv7` (musleabihf) and
+  `riscv64gc` (musl), from one macOS runner. Static musl means one Linux build covers glibc distros, Alpine and WSL.
+  - armv7 and riscv64 are build-verified only (2026-11-28: 1,005,651 / 1,023,497 bytes). They have no runtime test until an
+    emulator or board run. The installer maps `armv7l`/`riscv64` to them; Homebrew on Linux supports only x86_64/arm64.
+  - Also built during the survey but **not shipped**: `i686` and `powerpc64le` musl (they build; agents don't realistically
+    run there), `s390x` (no prebuilt std), `x86_64-unknown-freebsd` (compile error in `src/platform`; needs a FreeBSD port).
   - Darwin builds natively. Linux builds through zig: keygent links no Apple framework, because AppKit and objc are `dlopen`ed.
 - Every binary passes `scripts/release-check.sh` (the 2 MB budget and no `KEYGENT_TEST_ROOT`, per SPEC §11).
 

@@ -99,7 +99,8 @@ irm https://raw.githubusercontent.com/DiyRex/keygent/main/install.ps1 | iex
 
 The installer:
 
-1. Picks the right build for your system (macOS Apple Silicon/Intel, Linux x86_64/arm64, Windows x64/ARM64).
+1. Picks the right build for your system (macOS Apple Silicon/Intel; Linux x86_64/arm64/armv7/riscv64, including WSL and Alpine;
+   Windows x64/ARM64 once the Windows build lands).
 2. **Verifies the download's Sigstore signature.** It must come from this repository's release workflow and a `vX.Y.Z` tag. If you don't
    have `cosign`, the installer fetches a pinned copy into a temp folder and checks that copy's own fingerprint first.
 3. **Verifies the SHA-256 checksum** against the signed checksum list.

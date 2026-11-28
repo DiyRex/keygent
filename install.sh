@@ -49,7 +49,9 @@ case "$os/$arch" in
   Darwin/x86_64)              TARGET="x86_64-apple-darwin";        COSIGN_ASSET="cosign-darwin-amd64"; COSIGN_SHA="9d1e4abe2b6be279ed0d2ff706fde1ccd738747c834e3e6d44039c238867334f" ;;
   Linux/x86_64|Linux/amd64)   TARGET="x86_64-unknown-linux-musl";  COSIGN_ASSET="cosign-linux-amd64";  COSIGN_SHA="424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa" ;;
   Linux/aarch64|Linux/arm64)  TARGET="aarch64-unknown-linux-musl"; COSIGN_ASSET="cosign-linux-arm64";  COSIGN_SHA="ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2" ;;
-  *) fail "unsupported platform $os/$arch (supported: macOS arm64/x86_64, Linux x86_64/arm64)" ;;
+  Linux/armv7l|Linux/armv7)   TARGET="armv7-unknown-linux-musleabihf"; COSIGN_ASSET="cosign-linux-arm"; COSIGN_SHA="09e77a313910cf5c4774508d85d017d9c60983f41bf657f83ecbd3892f7952cb" ;;
+  Linux/riscv64)              TARGET="riscv64gc-unknown-linux-musl"; COSIGN_ASSET="cosign-linux-riscv64"; COSIGN_SHA="24f3865df0fd9b055827b888d56e13583112ac7d4c87b45967af1f0febf35455" ;;
+  *) fail "unsupported platform $os/$arch (supported: macOS arm64/x86_64, Linux x86_64/arm64/armv7/riscv64)" ;;
 esac
 
 sha256() {
