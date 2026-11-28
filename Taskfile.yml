@@ -1,0 +1,86 @@
+# Developer tasks. Run `task --list`. Requires go-task v3 (https://taskfile.dev).
+version: "3"
+
+env:
+  CARGO_TERM_COLOR: always
+
+vars:
+  # Homebrew's rustup is keg-only; make its cargo shims reachable without editing shell rc files.
+  # (Task gives OS env precedence over `env:`, so PATH is set per command.)
+  RUST: 'export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:$PATH";'
+  BIN: target/release/keygent
+  # Linux checks run in a throwaway container; the repo is mounted read-only, target dir lives in a volume.
+  LINUX_IMAGE: rust:1-bookworm
+  LINUX_RUN: >-
+    docker run --rm -v "{{.ROOT_DIR}}:/src:ro" -v keygent-linux-target:/target
+    -v keygent-cargo-registry:/usr/local/cargo/registry
+    -e CARGO_TARGET_DIR=/target -w /src {{.LINUX_IMAGE}}
+
+tasks:
+  default:
+    cmds: [task --list]
+    silent: true
+
+  fmt:
+    desc: Format the code
+    cmds: ["{{.RUST}} cargo fmt"]
+
+  fmt:check:
+    desc: Check formatting
+    cmds: ["{{.RUST}} cargo fmt --check"]
+
+  clippy:
+    desc: Lint with clippy (warnings are errors)
+    cmds: ["{{.RUST}} cargo clippy --locked --all-targets --all-features -- -D warnings"]
+
+  test:
+    desc: Run the test suite
+    cmds: ["{{.RUST}} cargo test --locked"]
+
+  build:
+    desc: Debug build
+    cmds: ["{{.RUST}} cargo build --locked"]
+
+  release:
+    desc: Release build
+    sources: [src/**/*.rs, Cargo.toml, Cargo.lock]
+    generates: ["{{.BIN}}"]
+    cmds: ["{{.RUST}} cargo build --locked --release"]
+
+  size:
+    desc: Check the release binary against the size budget
+    deps: [release]
+    cmds: ["{{.RUST}} sh scripts/size-check.sh {{.BIN}}"]
+
+  deny:
+    desc: cargo-deny (advisories, licenses, bans, sources)
+    preconditions:
+      - sh: '{{.RUST}} command -v cargo-deny'
+        msg: "cargo-deny not installed (cargo install --locked cargo-deny)"
+    cmds: ["{{.RUST}} cargo deny check"]
+
+  preflight:
+    desc: Full local quality gate (fmt, clippy, test, build, size, deny)
+    cmds: ["{{.RUST}} sh scripts/preflight.sh"]
+
+  linux:test:
+    desc: Run fmt/clippy/test inside a Linux container (Docker)
+    cmds:
+      - >-
+        {{.LINUX_RUN}} sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
+        cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
+
+  linux:shell:
+    desc: Interactive shell in the Linux dev container
+    interactive: true
+    cmds: ["{{.LINUX_RUN}} -it bash"]
+
+  ci:
+    desc: Local gates on macOS plus tests in the Linux container
+    cmds:
+      - task: preflight
+      - task: linux:test
+
+  clean:
+    desc: Remove build output
+    cmds: ["{{.RUST}} cargo clean"]
