@@ -125,6 +125,11 @@ mkdir -p ~/.local/bin
 install -m 0755 target/release/keygent ~/.local/bin/keygent      # Windows: copy target\release\keygent.exe onto your PATH
 ```
 
+On **Linux**, build the static musl binary instead, like the releases: `rustup target add x86_64-unknown-linux-musl` (or
+`aarch64-…`), then `cargo build --release --locked --target x86_64-unknown-linux-musl` and install
+`target/x86_64-unknown-linux-musl/release/keygent`. A glibc build works, but `LD_PRELOAD` can inject into it and its locked
+shared libraries push the broker over its 5 MB memory budget.
+
 Until the first release, keygent is **pre-alpha**: commands that aren't built yet are rejected as unknown (exit `64`).
 The commands below start working as each phase in [`docs/ROADMAP.md`](docs/ROADMAP.md) is merged. If your shell says
 `command not found` right after installing, run `hash -r` or open a new terminal.

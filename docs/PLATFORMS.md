@@ -27,7 +27,7 @@ Decisions: [ADR 0006](adr/0006-cross-platform.md). Every row is **verified in th
 | **Secret memory** | locked arena + `mlockall` | locked arena (`mlock`) | locked arena (`VirtualLock` after `SetProcessWorkingSetSize`) |
 | **Other heap** | zero-on-free allocator (locked by `mlockall`) | zero-on-free. Swap exposure documented | zero-on-free. Pagefile exposure documented |
 | **No dumps / debug** | `PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0` | `PT_DENY_ATTACH`, `RLIMIT_CORE=0`, hardened runtime when signed | WER exclusion (per-user), `SEM_NOGPFAULTERRORBOX`, process DACL with **OWNER RIGHTS** ACE (removes the owner's implicit WRITE_DAC) |
-| **Injection** | static musl (no `LD_PRELOAD`) | hardened runtime + library validation (no `DYLD_*`) | `SetDefaultDllDirectories(SYSTEM32)`, static CRT, mitigation policies set at runtime on the broker only (not inherited by children) |
+| **Injection** | static musl (no `LD_PRELOAD`). A glibc build has neither this nor the RSS budget: measured 2026-11-28 on `rust:1-bookworm` arm64, idle broker 2.61 MiB (musl) vs 5.55 MiB (glibc, `mlockall` keeps 2.3 MiB of shared libraries resident) | hardened runtime + library validation (no `DYLD_*`) | `SetDefaultDllDirectories(SYSTEM32)`, static CRT, mitigation policies set at runtime on the broker only (not inherited by children) |
 | **`NO_NEW_PRIVS`** | **not used** (it would be inherited and break `sudo`) | n/a | n/a |
 | **Child containment** | process group + `PR_SET_CHILD_SUBREAPER`, kill the tree | process group + `KEYGENT_RUN_ID` env tag, `KERN_PROCARGS2` sweep at run end (**best effort**) | Job Object `KILL_ON_JOB_CLOSE`, no breakaway |
 | **Interrupts** | SIGINT/SIGTERM → pgid | same | `CREATE_NEW_PROCESS_GROUP` + `CTRL_BREAK`, then `TerminateJobObject` |

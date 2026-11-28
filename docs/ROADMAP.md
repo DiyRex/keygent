@@ -45,7 +45,7 @@ Every phase ends with tests **on Linux, macOS and Windows**, the leak suite, and
 - [x] Allow rules (pin + `flags` allowlist), grants + grant key + **script binding** + `render_for_approval()`, `pending`/`approve`/`deny` — *ADR 0014, 0015*
 - [x] Run: containment, pipes-only env, runtime/output caps + `--max-runtime` (≤ 4 h, in grant key), `\r` flush, redactor (old values kept after rotate) — *ADR 0014; LANG/TZ not yet passed*
 - [x] Manifest trust, `capture`, audit chain (fail closed) — *ADR 0015; open: audit rotation, tripwire anchor, rekey epoch record, trust diff, global manifest*
-- [ ] Leak harness + T1/T2 cases
+- [x] Leak harness + T1/T2 cases — *`tests/leak.rs`: 28 broker-path cases + 9 scenarios, macOS + Linux; hook-path cases move to Phase 3*
 
 ## Phase 3 — Claude Code integration
 
