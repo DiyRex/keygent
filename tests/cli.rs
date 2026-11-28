@@ -543,6 +543,23 @@ fn unseal_status_ls_seal() {
     assert_eq!(add(&root, "c/d", &canary()).0, 0);
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert_eq!(out, "a/b  $A_B  approve\nc/d  $C_D  approve\n");
+    // the description is listed so an agent can find a handle from the user's words
+    let (code, _, err) = run(
+        &root,
+        &[
+            "edit",
+            "c/d",
+            "--description",
+            "DigitalOcean API token (personal)",
+        ],
+        &[PASS, "y"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        out,
+        "a/b  $A_B  approve\nc/d  $C_D  approve  — DigitalOcean API token (personal)\n"
+    );
     // runtime files are owner-only; the broker log never contains the value
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
