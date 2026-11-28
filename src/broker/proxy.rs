@@ -22,6 +22,10 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const HEAD_MAX: usize = 64 * 1024;
+/// Concurrent connections per run; more are dropped (a run's own proxy, so this bounds same-user abuse, PR #14 review).
+const MAX_CONNS: usize = 32;
+/// The request head must arrive quickly (slowloris); bodies and responses get the longer I/O timeout.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADERS_MAX: usize = 100;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const CHUNK: usize = 16 * 1024;
@@ -88,6 +92,7 @@ struct Ctx {
     redactor: Arc<Redactor>,
     connect: Arc<Connect>,
     report: Arc<Report>,
+    active: std::sync::atomic::AtomicUsize,
 }
 
 /// Start a proxy for one run. `token` is random per run (hex); `connect` dials `https://<host>:443`.
@@ -107,6 +112,7 @@ pub fn start(
         redactor,
         connect,
         report,
+        active: std::sync::atomic::AtomicUsize::new(0),
     });
     let st = stop.clone();
     let join = std::thread::Builder::new()
@@ -117,11 +123,21 @@ pub fn start(
                     break;
                 }
                 let Ok(conn) = conn else { continue };
+                if ctx.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+                    ctx.active.fetch_sub(1, Ordering::SeqCst);
+                    continue; // dropped: the client sees a reset
+                }
                 let c = ctx.clone();
                 // a connection we can't serve is dropped (the client sees a reset): fail closed
-                let _ = std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("kg-proxy-conn".into())
-                    .spawn(move || serve(&c, conn));
+                    .spawn(move || {
+                        serve(&c, conn);
+                        c.active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                if spawned.is_err() {
+                    ctx.active.fetch_sub(1, Ordering::SeqCst);
+                }
             }
         })?;
     Ok(Proxy {
@@ -133,7 +149,7 @@ pub fn start(
 }
 
 fn serve(ctx: &Ctx, mut client: TcpStream) {
-    let _ = client.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
     let _ = client.set_write_timeout(Some(IO_TIMEOUT));
     if let Err((status, msg, outcome)) = handle(ctx, &mut client) {
         if let Some(o) = outcome {
@@ -160,6 +176,7 @@ fn handle(ctx: &Ctx, client: &mut TcpStream) -> Result<(), Fail> {
         .map_err(|_| fail("500 Internal Server Error", "proxy error"))?;
     let mut r = BufReader::with_capacity(CHUNK, reader);
     let head = read_head(&mut r).map_err(|_| fail("400 Bad Request", "bad request head"))?;
+    let _ = r.get_ref().set_read_timeout(Some(IO_TIMEOUT));
     let req = parse_head(&head).ok_or_else(|| fail("400 Bad Request", "bad request head"))?;
     let (host, path) =
         route(&req.target, &ctx.token, &ctx.creds).map_err(|m| fail("404 Not Found", m))?;

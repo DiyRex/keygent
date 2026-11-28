@@ -48,6 +48,15 @@ pub fn policy_snapshot(index: &Index) -> Vec<HandlePolicy> {
         .collect()
 }
 
+/// The grant's custody handles, fixed at build time (see [`Grant::custody`]).
+fn custody_handles(snap: &[HandlePolicy], handles: &[String]) -> Vec<String> {
+    handles
+        .iter()
+        .filter(|h| lookup(snap, h).is_some_and(|x| x.custody))
+        .cloned()
+        .collect()
+}
+
 fn lookup<'a>(snap: &'a [HandlePolicy], h: &str) -> Option<&'a HandlePolicy> {
     snap.iter().find(|x| x.handle == h)
 }
@@ -91,6 +100,9 @@ pub struct Grant {
     pub cwd: PathBuf,
     pub handles: Vec<String>,
     pub bindings: Vec<Binding>,
+    /// Handles that were custody when this grant was built (ADR 0022). The run gives exactly these a dummy, whatever
+    /// the live policy says by then, so an approval-free grant can never receive a real value (review fix, PR #14).
+    pub custody: Vec<String>,
     pub programs: Vec<Program>,
     pub scripts: Vec<Script>,
     pub max_runtime: Duration,
@@ -476,6 +488,7 @@ pub fn build(
         max_runtime_min: minutes(max_runtime),
         notes: &notes,
     });
+    let custody = custody_handles(snap, &handles);
     Ok(Grant {
         direct: None,
         scratch: false,
@@ -486,6 +499,7 @@ pub fn build(
         rewritten: rw.cmd,
         cwd,
         handles,
+        custody,
         bindings,
         programs,
         scripts,
@@ -680,6 +694,7 @@ fn allow_grant(
         max_runtime_min: minutes(max_runtime),
         notes: &notes,
     });
+    let custody = custody_handles(snap, &handles);
     Ok(Some(Grant {
         direct: Some(argv.to_vec()),
         scratch,
@@ -690,6 +705,7 @@ fn allow_grant(
         rewritten: String::new(),
         cwd: cwd.to_path_buf(),
         handles,
+        custody,
         bindings,
         programs,
         scripts: Vec::new(),
@@ -907,6 +923,46 @@ mod tests {
                 assert_ne!(g.key, fresh.key, "capture target must change the grant key");
             }
         }
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    /// PR #14 review fix: the grant fixes which handles get dummies; a mixed command still needs approval.
+    #[test]
+    fn custody_handles_are_fixed_when_the_grant_is_built() {
+        let p = tmp_project();
+        let mut ix = index();
+        ix.handles
+            .push(new_handle("do/token", "DO_TOKEN", "", Mode::Approve, 0)); // custody on (default)
+        let snap = policy_snapshot(&ix);
+        let only = build(
+            &req("T={{keygent:do/token}} true", p.to_str().unwrap()),
+            &snap,
+            &[],
+            "/usr/bin:/bin",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (only.state, only.custody.clone()),
+            (State::Approved, vec!["do/token".to_owned()])
+        );
+        let mixed = build(
+            &req(
+                "T={{keygent:do/token}} S={{keygent:stripe/live}} true",
+                p.to_str().unwrap(),
+            ),
+            &snap,
+            &[],
+            "/usr/bin:/bin",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.state,
+            State::Pending,
+            "a non-custody secret needs the human"
+        );
+        assert_eq!(mixed.custody, vec!["do/token".to_owned()]);
         std::fs::remove_dir_all(p).unwrap();
     }
 

@@ -490,8 +490,8 @@ pub fn add(a: Args) -> Result<()> {
     strength::check_secret(value.expose())?;
     let now = vault::now();
     let mut rec = index::new_handle(&h, &env, &desc, v.index.security.default_mode, now);
-    // custody swaps a single-line token in headers; a multi-line value (PEM, JSON key) always uses approval
-    rec.custody = !a.has("--no-custody") && !value.expose().contains(&b'\n');
+    // custody swaps a plain token in headers; a value with line breaks or control bytes (PEM, JSON key) uses approval
+    rec.custody = !a.has("--no-custody") && !value.expose().iter().any(|&c| c < 0x20 || c == 0x7f);
     v.index.handles.push(rec);
     v.put_entry(&h, 1, &value)?;
     drop(value);

@@ -388,3 +388,34 @@ fn system_ca_bundle_loads() {
     let roots = system_roots().unwrap();
     assert!(roots.len() > 50, "only {} roots", roots.len());
 }
+
+#[test]
+fn concurrent_connections_are_capped() {
+    let (up, _rx) = upstream("never");
+    let r = run(
+        vec![cred("svc/key", DUMMY, VALUE, &["api.example.com"])],
+        up,
+    );
+    let port: u16 = r
+        .proxy
+        .url()
+        .trim_start_matches("http://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // fill every slot with an idle connection, then one more is dropped at once
+    let idle: Vec<TcpStream> = (0..MAX_CONNS)
+        .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut extra = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut b = [0u8; 1];
+    let n = extra.read(&mut b).unwrap_or(0);
+    assert_eq!(n, 0, "the connection over the cap is closed");
+    drop(idle);
+}

@@ -203,3 +203,68 @@ fn custody_sends_the_value_only_to_the_approved_host() {
     assert!(out.contains("no host is approved"), "{out}");
     assert_eq!(std::fs::read_to_string(&seen).unwrap(), before);
 }
+
+/// PR #14 review fixes: a mixed command (custody + non-custody secret) needs approval and the custody secret still only
+/// reaches the child as a dummy; a value with control bytes never uses custody.
+#[test]
+fn mixed_commands_need_approval_and_keep_dummies() {
+    let root = Root::new();
+    init(&root);
+    let (c_custody, c_plain) = (canary(), canary());
+    assert_eq!(add(&root, "do/token", &c_custody).0, 0);
+    let (code, _, err) = run(
+        &root,
+        &["add", "db/pass", "--no-custody"],
+        &[PASS, &c_plain],
+    );
+    assert_eq!(code, 0, "{err}");
+    // a value with a carriage return defaults to no custody; forcing custody on is refused at run time
+    let f = root.0.join("cr.txt");
+    std::fs::write(&f, format!("{}\rX-Injected: 1", canary())).unwrap();
+    let (code, _, err) = run(
+        &root,
+        &[
+            "add",
+            "cr/val",
+            "--from-file",
+            f.to_str().unwrap(),
+            "--delete",
+        ],
+        &[PASS],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(
+        out.contains("cr/val  $CR_VAL  approve\n")
+            && out.contains("do/token  $DO_TOKEN  approve  custody"),
+        "{out}"
+    );
+    let proj = root.0.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+
+    let cmd = "T={{keygent:do/token}} P={{keygent:db/pass}} sh -c 'printf \"%s|%s\" \"$T\" \"$P\"'";
+    let mut s = run_in(&root, &proj, &["run", "--", cmd]);
+    s.expect(WAITING);
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    let (t, p) = out.split_once('|').unwrap();
+    assert!(
+        t.len() == c_custody.len() && t != c_custody,
+        "custody secret stays a dummy: {out}"
+    );
+    assert_eq!(
+        p, "‹keygent:db/pass›",
+        "the approved plain secret is real (and redacted): {out}"
+    );
+
+    let (code, _, err) = run(&root, &["edit", "cr/val", "--custody", "on"], &[PASS, "y"]);
+    assert_eq!(code, 0, "{err}");
+    let s = run_in(&root, &proj, &["run", "--", "V={{keygent:cr/val}} true"]);
+    let (code, _, err) = s.finish();
+    assert_eq!(code, 77, "{err}");
+    assert!(err.contains("has control bytes"), "{err}");
+    assert_no_plaintext(&root, &c_custody);
+    assert_no_plaintext(&root, &c_plain);
+}

@@ -655,14 +655,21 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
                 .vault
                 .read_entry(&b.handle)
                 .map_err(|_| Error::Internal(143))?;
-            let rec = st.vault.index.get(&b.handle);
             if b.file {
                 file_secrets.push((b.var.clone(), v));
-            } else if let Some(rec) = rec.filter(|r| r.custody) {
-                // ADR 0022: the child gets a dummy; the value stays in the broker's proxy
-                if v.expose().contains(&b'\n') {
+            } else if g.custody.contains(&b.handle) {
+                // ADR 0022: the child gets a dummy; the value stays in the broker's proxy. Decided by the grant, never
+                // by the live flag: a grant built without a prompt must not turn into a real-value run (PR #14 review).
+                // Line breaks and other control bytes would split headers, so such values can't use custody.
+                if v.expose().iter().any(|&c| c < 0x20 || c == 0x7f) {
                     return Err(Error::Policy(PolicyMsg::CustodyMultiline(b.handle.clone())));
                 }
+                let hosts = st
+                    .vault
+                    .index
+                    .get(&b.handle)
+                    .map(|r| r.hosts.clone())
+                    .unwrap_or_default();
                 let existing = custody
                     .iter()
                     .find(|c| c.handle == b.handle)
@@ -676,7 +683,7 @@ fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
                             handle: b.handle.clone(),
                             dummy: d.clone(),
                             value: crypto::Secret::from_slice(v.expose()),
-                            hosts: rec.hosts.clone(),
+                            hosts,
                         });
                         d
                     }
