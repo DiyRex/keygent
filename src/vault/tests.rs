@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "tests: a panic is the failure report"
+)]
 
 use super::*;
 use crate::vault::index::{Mode, new_handle};
@@ -22,6 +27,7 @@ fn tmp() -> (Tmp, Dirs) {
         data: root.join("data"),
         config: root.join("config"),
         state: root.join("state"),
+        run: root.join("run"),
     };
     (Tmp(root), dirs)
 }
@@ -246,6 +252,29 @@ fn rollback_detected_by_tripwire() {
             .unwrap()
             .rolled_back
     );
+}
+
+#[test]
+fn commit_reports_success_once_the_vault_is_written() {
+    // review fix: a tripwire write failure after the vault replace must not turn a durable commit into an error
+    let (_t, dirs) = tmp();
+    init_with_secrets(&dirs);
+    let mut v = open(&dirs, Unlock::Passphrase(&pass())).unwrap();
+    let tw: Vec<_> = std::fs::read_dir(&dirs.state)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("tripwire-"))
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(tw.len(), 1);
+    std::fs::remove_file(&tw[0]).unwrap();
+    std::fs::create_dir(&tw[0]).unwrap(); // the tripwire can no longer be replaced
+    let g = v.file.generation;
+    v.commit(Prev::Keep).unwrap();
+    assert_eq!(v.file.generation, g + 1, "memory follows disk");
+    std::fs::remove_dir(&tw[0]).unwrap();
+    let v2 = open(&dirs, Unlock::Passphrase(&pass())).unwrap();
+    assert_eq!(v2.file.generation, g + 1);
 }
 
 #[test]

@@ -1,5 +1,8 @@
 //! Unix implementation shared by Linux and macOS (PLATFORMS §Primitives).
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "platform layer: the only FFI in the crate; every block carries a SAFETY comment"
+)]
 
 use super::{Dirs, Platform, TermGuard};
 use crate::error::{Error, Result};

@@ -44,7 +44,10 @@ fn lists() -> &'static Lists {
                 .iter()
                 .filter(|w| w.len() >= 3 && w.bytes().any(|b| b.is_ascii_alphabetic())),
         );
-        #[allow(clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "entropy estimates; counts far below 2^52"
+        )]
         let dict_bits = (dict.len() as f64).log2();
         Lists {
             dict,
@@ -105,7 +108,10 @@ fn log2(x: f64) -> f64 {
     x.log2()
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "entropy estimates; counts far below 2^52"
+)]
 fn f(n: usize) -> f64 {
     n as f64
 }
@@ -308,7 +314,11 @@ pub fn check_passphrase(p: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     #[test]

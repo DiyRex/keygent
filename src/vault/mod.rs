@@ -10,6 +10,7 @@
 //! - The header MAC is verified on every open; any failure fails closed with `Damaged`.
 //! - Values stay in `Secret`s; nothing here logs or formats them.
 
+pub mod audit;
 pub mod format;
 pub mod index;
 pub mod keystore;
@@ -87,12 +88,56 @@ fn prepare_data_dir(dirs: &Dirs) -> Result<()> {
     Ok(())
 }
 
+pub fn check_new_handle(ix: &Index, h: &str) -> Result<()> {
+    if ix.get(h).is_some() {
+        return Err(Error::Exists(h.to_owned()));
+    }
+    if let Some(other) = names::collision(h, ix.handles.iter().map(|r| r.handle.as_str())) {
+        return Err(Error::Collision(other.to_owned()));
+    }
+    if ix.handles.len() >= names::MAX_HANDLES {
+        return Err(Error::TooLarge("1000 secrets"));
+    }
+    Ok(())
+}
+
+/// SPEC §5.8: refuse a write that would push the redactor past its 8 MiB pattern cap (current and previous values of
+/// every handle, plus `new` values). Checked here so `unseal` never has to refuse the vault later.
+pub fn check_redactor_cap(v: &Vault, new: &[&[u8]]) -> Result<()> {
+    let mut total = 0usize;
+    for r in &v.index.handles {
+        total = total.saturating_add(crate::redact::pattern_bytes(
+            v.read_entry(&r.handle)?.expose(),
+        ));
+        if let Some(p) = &r.previous_value {
+            total = total.saturating_add(crate::redact::pattern_bytes(p.expose()));
+        }
+    }
+    for n in new {
+        total = total.saturating_add(crate::redact::pattern_bytes(n));
+    }
+    if total > crate::redact::MAX_PATTERN_BYTES {
+        return Err(Error::RedactorTooLarge);
+    }
+    Ok(())
+}
+
 /// Exclusive lock for the whole command (released on drop).
 pub struct Lock {
     _f: File,
 }
 
 pub fn lock(dirs: &Dirs) -> Result<Lock> {
+    lock_inner(dirs, true)
+}
+
+/// Non-blocking `lock` for the broker: a human command holding the lock (e.g. at its passphrase prompt) makes this
+/// fail with `RateLimited` ("retry in a few seconds") instead of stalling a broker thread.
+pub fn try_lock(dirs: &Dirs) -> Result<Lock> {
+    lock_inner(dirs, false)
+}
+
+fn lock_inner(dirs: &Dirs, wait: bool) -> Result<Lock> {
     prepare_data_dir(dirs)?;
     let p = dirs.data.join(LOCK_FILE);
     let os = platform::os();
@@ -106,7 +151,14 @@ pub fn lock(dirs: &Dirs) -> Result<Lock> {
             Err(_) => os.open_private(&p)?.ok_or(Error::UnsafePath("lock file"))?,
         },
     };
-    f.lock()?;
+    if wait {
+        f.lock()?;
+    } else {
+        f.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => Error::RateLimited,
+            std::fs::TryLockError::Error(e) => e.into(),
+        })?;
+    }
     platform::sweep_tmp(&dirs.data);
     Ok(Lock { _f: f })
 }
@@ -256,9 +308,21 @@ impl Vault {
 
     /// Open vault bytes from anywhere (the live file or a backup for `restore`).
     pub fn open_bytes(dirs: &Dirs, bytes: Vec<u8>, how: Unlock<'_>) -> Result<Vault> {
-        let (file, header_len) = format::parse(&bytes)?;
+        let (file, _) = format::parse(&bytes)?;
         let keystore = Keystore::new(&dirs.state)?;
         let dek = unwrap(&file, &keystore, how)?;
+        Self::with_dek(dirs, bytes, dek)
+    }
+
+    /// Open the live vault with a DEK handed over at unseal (the broker). Header MAC and index are verified.
+    pub fn open_with_dek(dirs: &Dirs, dek: Dek) -> Result<Vault> {
+        let bytes = read_file(&Self::path(dirs))?.ok_or(Error::NoVault)?;
+        Self::with_dek(dirs, bytes, dek)
+    }
+
+    fn with_dek(dirs: &Dirs, bytes: Vec<u8>, dek: Dek) -> Result<Vault> {
+        let (file, header_len) = format::parse(&bytes)?;
+        let keystore = Keystore::new(&dirs.state)?;
         let keys = Keys::derive(&file.uuid, dek)?;
         let hdr = bytes.get(..header_len).ok_or(Error::Damaged)?;
         if !crypto::hmac_verify(&keys.hdr, hdr, &file.header_mac) {
@@ -364,6 +428,35 @@ impl Vault {
         Ok(())
     }
 
+    /// The broker's handshake proof for this vault (ADR 0004).
+    pub fn broker_proof(&self, nc: &[u8], nb: &[u8]) -> Result<[u8; 32]> {
+        let kb = crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::BROKER)?;
+        crypto::proof_broker(&kb, nc, nb)
+    }
+
+    /// `proof_c` for an authenticated request (ADR 0004): `HMAC(K_auth, enc("kg/v1/client")‖enc(nb)‖enc(nc)‖enc(H(req)))`.
+    /// Both the CLI (after the passphrase) and the broker (to verify) compute it from the DEK.
+    pub fn auth_proof(&self, nb: &[u8], nc: &[u8], request: &[u8]) -> Result<[u8; 32]> {
+        let ka = crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::AUTH)?;
+        crypto::proof_client(&ka, nb, nc, request)
+    }
+
+    /// `K_audit` for the audit chain (SPEC §9).
+    pub fn audit_key(&self) -> Result<crypto::Subkey> {
+        crypto::subkey(&self.file.uuid, &self.keys.dek, crypto::label::AUDIT)
+    }
+
+    /// A copy of the DEK for reopening (the broker's reload). Lives in the locked arena when active.
+    pub fn dek_copy(&self) -> Dek {
+        Dek::from_bytes(*self.keys.dek.expose())
+    }
+
+    /// Generation of the file on disk right now (header only; no keys needed). The broker reloads when it differs.
+    pub fn generation_on_disk(dirs: &Dirs) -> Result<u64> {
+        let bytes = read_file(&Self::path(dirs))?.ok_or(Error::NoVault)?;
+        Ok(format::parse(&bytes)?.0.generation)
+    }
+
     pub fn keystore(&self) -> &Keystore {
         &self.keystore
     }
@@ -413,15 +506,21 @@ impl Vault {
             platform::atomic_replace(data, PREV_FILE, &self.original)?;
         }
         platform::atomic_replace(data, VAULT_FILE, &bytes)?;
-        if prev == Prev::Drop {
-            drop_old_copies(data);
-        }
-        self.keystore
-            .set_tripwire(&self.index.tripwire_id, &file.uuid, generation)?;
+        // the new vault is durable from here on: memory must follow it, and nothing below may report "unchanged"
+        let uuid = file.uuid;
         self.file = file;
         self.tripwire_gen = generation;
         self.original = bytes;
         self.rolled_back = false;
+        if prev == Prev::Drop {
+            drop_old_copies(data);
+        }
+        // Defense in depth only: a failed tripwire write leaves the previous generation recorded, which the next
+        // successful commit (or open, `max(seen, file)`) repairs. Failing here would claim the commit didn't happen
+        // after it did (e.g. `passwd` reporting an error while the new passphrase is live) — review fix.
+        let _ = self
+            .keystore
+            .set_tripwire(&self.index.tripwire_id, &uuid, generation);
         Ok(())
     }
 }

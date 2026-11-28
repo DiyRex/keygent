@@ -1,10 +1,20 @@
 //! Command-line front end (SPEC §5.1): argument parsing, dispatch, and the one-line `keygent:` error contract
 //! (ERRORS.md). Hand-rolled parser (DEPENDENCIES: no `clap`); unknown flags are usage errors, never ignored.
 
+#[cfg(unix)]
+mod client;
 mod cmds;
 mod console;
 mod dotenv;
+#[cfg(unix)]
+mod grants;
 mod recovery;
+#[cfg(unix)]
+mod rules;
+#[cfg(unix)]
+mod session;
+#[cfg(unix)]
+mod trust;
 
 use crate::error::{Error, Result};
 use std::io::Write;
@@ -13,6 +23,14 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 keygent — let AI coding agents use secrets without seeing them
 
+Session:  unseal [--ttl 8h] · seal · status · ls
+Run:      run [--max-runtime 30m] -- '<command with {{keygent:<handle>}}>' · run --grant <id>
+          capture <handle> -- '<command>'   (stores the command's stdout as a new secret)
+Approve:  pending · approve [<id>] [--remember] · deny [<id> | --all]
+Rules:    rule add <handle> [--home scratch] -- <program> [args… | * | ** --flag --value-flag=]
+          rule ls <handle> · rule rm <handle> <n>
+Project:  trust · untrust   (.keygent.toml: version = 1, then [secrets] entries)
+Audit:    audit [--since 1h] [--verify]
 Vault:    init [--own-passphrase] · passwd [--own-passphrase] · rekey · recover [--own-passphrase]
           verify · backup <file> · restore <file> [--new-machine] [--own-passphrase] · status
 Secrets:  add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]
@@ -97,7 +115,68 @@ fn run(argv: &[String]) -> Result<()> {
             let _ = writeln!(std::io::stdout(), "{}", build_id());
             Ok(())
         }
-        "status" => cmds::status(Args::parse(&rest, &[], "keygent status")?),
+        #[cfg(unix)]
+        "status" => session::status(Args::parse(&rest, &[], "keygent status")?),
+        #[cfg(unix)]
+        "unseal" => session::unseal(Args::parse(
+            &rest,
+            &[("--ttl", true), ("--log", true)],
+            "keygent unseal [--ttl 8h] [--log info|debug]",
+        )?),
+        #[cfg(unix)]
+        "run" => grants::run(Args::parse(
+            &rest,
+            &[
+                ("--grant", true),
+                ("--max-runtime", true),
+                ("--dialect", true),
+            ],
+            "keygent run [--max-runtime 30m] -- '<command>' | run --grant <id>",
+        )?),
+        #[cfg(unix)]
+        "rule" => rules::rule(Args::parse(
+            &rest,
+            &[("--home", true)],
+            "keygent rule add|ls|rm — see 'keygent help'",
+        )?),
+        #[cfg(unix)]
+        "trust" => trust::trust(Args::parse(&rest, &[], "keygent trust")?),
+        #[cfg(unix)]
+        "untrust" => trust::untrust(Args::parse(&rest, &[], "keygent untrust")?),
+        #[cfg(unix)]
+        "audit" => session::audit(Args::parse(
+            &rest,
+            &[("--since", true), ("--verify", false)],
+            "keygent audit [--since 1h] [--verify]",
+        )?),
+        #[cfg(unix)]
+        "capture" => grants::capture(Args::parse(
+            &rest,
+            &[("--max-runtime", true)],
+            "keygent capture <handle> -- '<command>'",
+        )?),
+        #[cfg(unix)]
+        "pending" => grants::pending(Args::parse(&rest, &[], "keygent pending")?),
+        #[cfg(unix)]
+        "approve" => grants::approve(Args::parse(
+            &rest,
+            &[("--remember", false)],
+            "keygent approve [<id>] [--remember]",
+        )?),
+        #[cfg(unix)]
+        "deny" => grants::deny(Args::parse(
+            &rest,
+            &[("--all", false)],
+            "keygent deny [<id> | --all]",
+        )?),
+        #[cfg(unix)]
+        "seal" => session::seal(Args::parse(&rest, &[], "keygent seal")?),
+        #[cfg(all(unix, feature = "test-profile"))]
+        "__redact" => session::test_redact(),
+        #[cfg(unix)]
+        "broker" => Err(Error::Usage(
+            "keygent broker is started by 'keygent unseal'",
+        )),
         "init" => cmds::init(Args::parse(
             &rest,
             &[("--own-passphrase", false)],
@@ -144,7 +223,8 @@ fn run(argv: &[String]) -> Result<()> {
         )?),
         "rm" => cmds::rm(Args::parse(&rest, &[], "keygent rm <handle>")?),
         "rename" => cmds::rename(Args::parse(&rest, &[], "keygent rename <old> <new>")?),
-        "ls" => cmds::ls(Args::parse(&rest, &[], "keygent ls")?),
+        #[cfg(unix)]
+        "ls" => session::ls(Args::parse(&rest, &[], "keygent ls")?),
         "reveal" => cmds::reveal(Args::parse(
             &rest,
             &[("--copy", false)],
@@ -188,6 +268,14 @@ pub fn build_id() -> String {
 }
 
 pub fn main() -> ExitCode {
+    // internal: `keygent broker` reads its handoff from the inherited pipe (started only by `unseal`)
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).is_some_and(|a| a == "broker") && std::env::args_os().len() == 2 {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return crate::broker::main();
+        }
+    }
     let mut argv = Vec::new();
     for a in std::env::args_os().skip(1) {
         match a.into_string() {
@@ -202,13 +290,16 @@ pub fn main() -> ExitCode {
 }
 
 fn fail(e: &Error) -> ExitCode {
+    if let Error::Exit(code) = e {
+        return ExitCode::from(*code);
+    }
     let _ = writeln!(std::io::stderr(), "{e}");
     ExitCode::from(e.exit_code())
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {

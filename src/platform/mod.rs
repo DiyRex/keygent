@@ -13,6 +13,11 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod alloc;
+#[cfg(unix)]
+pub mod arena;
+#[cfg(unix)]
+pub mod ipc;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -32,10 +37,15 @@ pub use windows::Os;
 #[derive(Debug, Clone)]
 pub struct Dirs {
     pub data: PathBuf,
-    /// `config/config.toml` and `global.toml` (Phase 2+).
-    #[allow(dead_code)]
+    /// `config/config.toml` and `global.toml` (FORMATS §4).
+    #[expect(
+        dead_code,
+        reason = "config.toml and the global manifest are read from Phase 3 on"
+    )]
     pub config: PathBuf,
     pub state: PathBuf,
+    /// Broker runtime dir (socket, `broker.lock`): fixed per user, owner-only.
+    pub run: PathBuf,
 }
 
 /// RAII guard that restores the terminal mode on drop.
@@ -92,6 +102,7 @@ pub fn dirs() -> Result<Dirs> {
             data: root.join("data"),
             config: root.join("config"),
             state: root.join("state"),
+            run: root.join("run"),
         });
     }
     os().default_dirs()
@@ -116,10 +127,7 @@ pub fn test_console() -> bool {
 pub fn atomic_replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let os = os();
-    let suffix: String = crate::crypto::random::<8>()?
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let suffix: String = crate::crypto::random_hex::<8>()?;
     let tmp = dir.join(format!("{name}.{suffix}.tmp"));
     let res = (|| -> Result<()> {
         let mut f = os.create_private(&tmp)?;
@@ -167,7 +175,7 @@ pub(crate) fn is_sync_folder(canonical: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, reason = "tests: a panic is the failure report")]
     use super::*;
 
     #[test]

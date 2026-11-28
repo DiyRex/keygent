@@ -635,7 +635,11 @@ pub fn new_handle(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     pub(crate) fn sample() -> Index {

@@ -34,7 +34,6 @@ pub const KDF_DEFAULT: KdfParams = KdfParams {
 
 /// HKDF labels (SPEC §5.2). `info` strings are fixed; never derived from input.
 /// `AUDIT`, `AUTH` and `BROKER` are used from Phase 2 (audit chain, mutual auth, broker session).
-#[allow(dead_code)]
 pub mod label {
     pub const KEK_PASSPHRASE: &[u8] = b"kg/v1/kek/passphrase";
     pub const KEK_RECOVERY: &[u8] = b"kg/v1/kek/recovery";
@@ -68,59 +67,83 @@ impl KdfParams {
 }
 
 /// A secret byte string (value, passphrase, recovery key, pepper). Zeroized on drop, never printable.
-pub struct Secret(Box<[u8]>);
+/// In the broker (once the locked arena exists) the bytes live in `mlock`ed memory (SPEC §5.4); elsewhere on the
+/// zero-on-free heap.
+pub struct Secret(Store);
+
+enum Store {
+    Heap(Box<[u8]>),
+    #[cfg(unix)]
+    Locked(crate::platform::arena::LockedBuf),
+}
+
+/// Set when the arena was full and a secret had to stay on the (unlocked) heap; reported by `status`.
+static ARENA_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn arena_overflowed() -> bool {
+    ARENA_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl Secret {
-    /// Takes ownership without leaving an unzeroized copy behind: if the vector has spare capacity, the bytes are
-    /// copied into an exact-size box and the original buffer (including spare capacity) is wiped.
+    /// Takes ownership without leaving an unzeroized copy behind: the bytes are copied into the locked arena (if
+    /// active) or an exact-size box, and the original buffer (including spare capacity) is wiped.
     pub(crate) fn new(mut v: Vec<u8>) -> Self {
-        if v.capacity() == v.len() {
-            return Secret(v.into_boxed_slice());
-        }
-        let b: Box<[u8]> = v.as_slice().into();
+        let s = Self::from_slice(&v);
         v.zeroize();
-        Secret(b)
+        s
     }
 
     pub(crate) fn from_slice(s: &[u8]) -> Self {
-        Secret(s.into())
+        #[cfg(unix)]
+        match crate::platform::arena::LockedBuf::copy_from(s) {
+            Some(Ok(b)) => return Secret(Store::Locked(b)),
+            Some(Err(_)) => ARENA_OVERFLOW.store(true, std::sync::atomic::Ordering::Relaxed),
+            None => {}
+        }
+        Secret(Store::Heap(s.into()))
     }
 
     pub(crate) fn expose(&self) -> &[u8] {
-        &self.0
+        match &self.0 {
+            Store::Heap(b) => b,
+            #[cfg(unix)]
+            Store::Locked(b) => b.as_slice(),
+        }
     }
 
     /// Constant-time equality (used for confirmations; length is not secret here).
     pub(crate) fn ct_eq(&self, other: &[u8]) -> bool {
-        ct_eq(&self.0, other)
+        ct_eq(self.expose(), other)
     }
 }
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        self.0.zeroize();
+        // locked blocks wipe themselves on drop
+        if let Store::Heap(b) = &mut self.0 {
+            b.zeroize();
+        }
     }
 }
 
 macro_rules! key_type {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        pub struct $name([u8; KEY_LEN]);
+        pub struct $name(Secret);
 
-        #[allow(dead_code)]
         impl $name {
-            pub(crate) fn from_bytes(b: [u8; KEY_LEN]) -> Self {
-                $name(b)
+            pub(crate) fn from_bytes(mut b: [u8; KEY_LEN]) -> Self {
+                let k = $name(Secret::from_slice(&b));
+                b.zeroize();
+                k
             }
 
             pub(crate) fn expose(&self) -> &[u8; KEY_LEN] {
-                &self.0
-            }
-        }
-
-        impl Drop for $name {
-            fn drop(&mut self) {
-                self.0.zeroize();
+                match self.0.expose().first_chunk::<KEY_LEN>() {
+                    Some(k) => k,
+                    // unreachable: constructed from exactly KEY_LEN bytes; never fall back to a weak key
+                    None => std::process::abort(),
+                }
             }
         }
     };
@@ -182,6 +205,53 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// SHA-256 of at most `limit` bytes read from `r`, in 64 KiB steps (never the whole file in memory; executables can be
+/// hundreds of MiB and the broker's budget is 5 MB). `None` if more than `limit` bytes are available.
+pub fn sha256_reader(mut r: impl std::io::Read, limit: u64) -> std::io::Result<Option<[u8; 32]>> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            return Ok(Some(h.finalize().into()));
+        }
+        total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        if total > limit {
+            return Ok(None);
+        }
+        h.update(buf.get(..n).unwrap_or_default());
+    }
+}
+
+/// Lower-case hex of non-secret bytes (ids, hashes, nonces for names). Never for values.
+pub fn hex(b: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(b.len().saturating_mul(2));
+    for &x in b {
+        for nibble in [x >> 4, x & 0x0f] {
+            out.push(char::from(
+                DIGITS.get(usize::from(nibble)).copied().unwrap_or(b'0'),
+            ));
+        }
+    }
+    out
+}
+
+/// First 4 bytes as 8 hex chars: the short form shown to humans (grant keys, script and manifest hashes).
+pub fn hex8(h: &[u8; 32]) -> String {
+    hex(h.get(..4).unwrap_or_default())
+}
+
+/// `N` random bytes as hex: temp-file suffixes, run ids, binding names.
+pub fn random_hex<const N: usize>() -> Result<String> {
+    Ok(hex(&random::<N>()?))
+}
+
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -218,12 +288,12 @@ fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Result<[u8; KEY_LEN]> {
 /// passphrase KEK = HKDF(salt = uuid, ikm = enc(Argon2id(pass, slot_salt)) ‖ enc(pepper), info = "kg/v1/kek/passphrase")
 pub fn kek_passphrase(uuid: &[u8; 16], argon_out: &Secret, pepper: &Secret) -> Result<Kek> {
     let ikm = enc(&[argon_out.expose(), pepper.expose()])?;
-    Ok(Kek(hkdf32(uuid, &ikm, label::KEK_PASSPHRASE)?))
+    Ok(Kek::from_bytes(hkdf32(uuid, &ikm, label::KEK_PASSPHRASE)?))
 }
 
 /// recovery KEK = HKDF(salt = uuid, ikm = recovery_key, info = "kg/v1/kek/recovery")
 pub fn kek_recovery(uuid: &[u8; 16], recovery_key: &Secret) -> Result<Kek> {
-    Ok(Kek(hkdf32(
+    Ok(Kek::from_bytes(hkdf32(
         uuid,
         recovery_key.expose(),
         label::KEK_RECOVERY,
@@ -232,11 +302,11 @@ pub fn kek_recovery(uuid: &[u8; 16], recovery_key: &Secret) -> Result<Kek> {
 
 /// subkey = HKDF(salt = uuid, ikm = DEK, info = label)
 pub fn subkey(uuid: &[u8; 16], dek: &Dek, info: &'static [u8]) -> Result<Subkey> {
-    Ok(Subkey(hkdf32(uuid, &dek.0, info)?))
+    Ok(Subkey::from_bytes(hkdf32(uuid, dek.expose(), info)?))
 }
 
 pub fn new_dek() -> Result<Dek> {
-    Ok(Dek(random()?))
+    Ok(Dek::from_bytes(random()?))
 }
 
 /// XChaCha20-Poly1305 seal. `key` is any 32-byte key type's bytes.
@@ -265,7 +335,7 @@ pub fn open(
 }
 
 pub fn wrap_dek(kek: &Kek, nonce: &[u8; NONCE_LEN], aad: &[u8], dek: &Dek) -> Result<Vec<u8>> {
-    seal(&kek.0, nonce, aad, &dek.0)
+    seal(kek.expose(), nonce, aad, dek.expose())
 }
 
 pub fn unwrap_dek(
@@ -274,23 +344,23 @@ pub fn unwrap_dek(
     aad: &[u8],
     ct: &[u8],
 ) -> std::result::Result<Dek, ()> {
-    let pt = open(&kek.0, nonce, aad, ct)?;
+    let pt = open(kek.expose(), nonce, aad, ct)?;
     let b: [u8; KEY_LEN] = pt.expose().try_into().map_err(|_| ())?;
-    Ok(Dek(b))
+    Ok(Dek::from_bytes(b))
 }
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
 pub fn hmac(key: &Subkey, data: &[u8]) -> Result<[u8; 32]> {
-    let mut m =
-        <HmacSha256 as hmac::KeyInit>::new_from_slice(&key.0).map_err(|_| Error::Internal(6))?;
+    let mut m = <HmacSha256 as hmac::KeyInit>::new_from_slice(key.expose())
+        .map_err(|_| Error::Internal(6))?;
     m.update(data);
     Ok(m.finalize().into_bytes().into())
 }
 
 /// Constant-time MAC verification.
 pub fn hmac_verify(key: &Subkey, data: &[u8], tag: &[u8]) -> bool {
-    match <HmacSha256 as hmac::KeyInit>::new_from_slice(&key.0) {
+    match <HmacSha256 as hmac::KeyInit>::new_from_slice(key.expose()) {
         Ok(mut m) => {
             m.update(data);
             m.verify_slice(tag).is_ok()
@@ -301,3 +371,17 @@ pub fn hmac_verify(key: &Subkey, data: &[u8], tag: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Broker handshake proof (ADR 0004): `HMAC(K_broker, enc("kg/v1/broker") ‖ enc(nc) ‖ enc(nb))`.
+pub fn proof_broker(k_broker: &Subkey, nc: &[u8], nb: &[u8]) -> Result<[u8; 32]> {
+    hmac(k_broker, &enc(&[b"kg/v1/broker", nc, nb])?)
+}
+
+/// Client auth proof (ADR 0004), used by `Approve` (M3): `HMAC(K_auth, enc("kg/v1/client") ‖ enc(nb) ‖ enc(nc) ‖ enc(H(request)))`.
+pub fn proof_client(k_auth: &Subkey, nb: &[u8], nc: &[u8], request: &[u8]) -> Result<[u8; 32]> {
+    hmac(k_auth, &enc(&[b"kg/v1/client", nb, nc, &sha256(request)])?)
+}
+
+pub fn verify_proof(expected: &[u8; 32], got: &[u8]) -> bool {
+    ct_eq(expected, got)
+}

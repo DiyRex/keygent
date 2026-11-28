@@ -9,7 +9,8 @@
     clippy::print_stderr,
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
-    clippy::type_complexity
+    clippy::type_complexity,
+    reason = "tests: a panic is the failure report"
 )]
 
 use std::hash::{BuildHasher, Hasher};
@@ -58,6 +59,8 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
+        // never leave a broker running after a test (even a failed one)
+        let _ = cmd(self, &["seal"]).stdin(Stdio::null()).output();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -225,9 +228,10 @@ fn assert_no_plaintext(root: &Root, c: &str) {
     fn walk(p: &Path, c: &str) {
         for e in std::fs::read_dir(p).unwrap().flatten() {
             let path = e.path();
-            if path.is_dir() {
+            let ft = e.file_type().unwrap();
+            if ft.is_dir() {
                 walk(&path, c);
-            } else {
+            } else if ft.is_file() {
                 let b = std::fs::read(&path).unwrap();
                 assert!(
                     !b.windows(c.len()).any(|w| w == c.as_bytes()),
@@ -725,4 +729,889 @@ fn disk_full_leaves_vault_intact() {
     drop(filler);
     std::fs::remove_file(root.0.join("filler")).unwrap();
     assert_eq!(run(&root, &["verify"], &[PASS]).0, 0);
+}
+
+// ---------------------------------------------------------------- broker (Phase 2)
+
+fn unseal(root: &Root, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec!["unseal"];
+    args.extend_from_slice(extra);
+    run(root, &args, &[PASS])
+}
+
+fn broker_pid(root: &Root) -> i32 {
+    let s = std::fs::read_to_string(root.0.join("run/broker.lock")).unwrap();
+    s.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(10) {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn unseal_status_ls_seal() {
+    let root = Root::new();
+    init(&root);
+    let c = canary();
+    assert_eq!(add(&root, "a/b", &c).0, 0);
+    let (code, out, err) = unseal(&root, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.is_empty() && err.contains("keygent: unsealed for 8h00m"),
+        "{err}"
+    );
+    // a second unseal is a no-op
+    let (code, _, err) = run(&root, &["unseal"], &[]);
+    assert_eq!((code, err.trim()), (0, "keygent: already unsealed"));
+    let (code, out, _) = run(&root, &["status"], &[]);
+    assert_eq!(code, 0);
+    assert!(
+        out.starts_with("keygent: unsealed — 7h59m left")
+            || out.starts_with("keygent: unsealed — 8h00m left"),
+        "{out}"
+    );
+    assert!(
+        out.contains("1 secret(s)") && out.contains("hardening on"),
+        "{out}"
+    );
+    let (code, out, err) = run(&root, &["ls"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "a/b  $A_B  approve\n");
+    // a CLI write while unsealed is picked up by the broker (ADR 0012 reload)
+    assert_eq!(add(&root, "c/d", &canary()).0, 0);
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert_eq!(out, "a/b  $A_B  approve\nc/d  $C_D  approve\n");
+    // runtime files are owner-only; the broker log never contains the value
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(root.0.join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(root.0.join("run/broker.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let pid = broker_pid(&root);
+    let (code, _, err) = run(&root, &["seal"], &[]);
+    assert_eq!((code, err.trim()), (0, "keygent: sealed"));
+    assert!(wait_until(|| std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)));
+    let (code, _, err) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            78,
+            "keygent: vault sealed — ask the user to run 'keygent unseal'"
+        )
+    );
+    let (_, out, _) = run(&root, &["status"], &[]);
+    assert_eq!(out.trim(), "keygent: vault sealed");
+    assert_no_plaintext(&root, &c);
+}
+
+#[test]
+fn broker_seals_on_ttl_signal_and_tamper() {
+    let root = Root::new();
+    init(&root);
+    assert_eq!(add(&root, "a/b", &canary()).0, 0);
+    // TTL
+    assert_eq!(unseal(&root, &["--ttl", "2s"]).0, 0);
+    assert!(wait_until(|| run(&root, &["ls"], &[]).0 == 78), "TTL seal");
+    // SIGTERM
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let pid = broker_pid(&root);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        wait_until(|| run(&root, &["ls"], &[]).0 == 78),
+        "SIGTERM seal"
+    );
+    // tampered vault (MAC fails on reload) → the broker seals instead of serving stale or forged data
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let p = root.data().join("vault.kgt");
+    let mut b = std::fs::read(&p).unwrap();
+    b[22] ^= 1; // generation: forces a reload, and breaks the header MAC
+    std::fs::write(&p, b).unwrap();
+    let (code, _, _) = run(&root, &["ls"], &[]);
+    assert_ne!(code, 0);
+    assert!(
+        wait_until(|| run(&root, &["ls"], &[]).0 == 78),
+        "tamper seal"
+    );
+}
+
+#[test]
+fn fake_broker_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new();
+    init(&root);
+    let run_dir = root.0.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // an agent squats the endpoint with its own listener (no held lock, wrong pid, wrong binary)
+    let l = std::os::unix::net::UnixListener::bind(run_dir.join("broker.sock")).unwrap();
+    let t = std::thread::spawn(move || {
+        for s in l.incoming().take(2).flatten() {
+            let mut s = s;
+            let _ = s.write_all(b"\x00\x00\x00\x02\x01\x02");
+        }
+    });
+    let (code, out, err) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        (code, out.as_str(), err.trim()),
+        (
+            79,
+            "",
+            "keygent: broker could not be verified — run 'keygent doctor'"
+        )
+    );
+    // even with a forged broker.lock naming this process and holding the lock
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(run_dir.join("broker.lock"))
+        .unwrap();
+    std::fs::set_permissions(
+        run_dir.join("broker.lock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    (&lock)
+        .write_all(
+            format!(
+                "v1 {} 1 {}\n",
+                std::process::id(),
+                std::env::current_exe().unwrap().display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    let (code, _, err) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            79,
+            "keygent: broker could not be verified — run 'keygent doctor'"
+        )
+    );
+    // unseal refuses to hand a DEK to a squatter
+    let (code, _, _) = run(&root, &["unseal"], &[PASS]);
+    assert_eq!(code, 79);
+    drop(lock);
+    let _ = std::os::unix::net::UnixStream::connect(run_dir.join("broker.sock"));
+    let _ = t.join();
+}
+
+#[test]
+fn stale_socket_after_crash_is_recovered() {
+    let root = Root::new();
+    init(&root);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let pid = broker_pid(&root);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(wait_until(|| std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)));
+    assert!(
+        root.0.join("run/broker.sock").exists(),
+        "socket left behind by the crash"
+    );
+    // the lock is free and nothing answers, so the endpoint reads as sealed, and a new unseal rebinds it
+    assert_eq!(
+        run(&root, &["ls"], &[]).0,
+        78,
+        "a dead endpoint reads as sealed"
+    );
+    let (code, _, err) = unseal(&root, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(run(&root, &["ls"], &[]).0, 0);
+}
+
+#[test]
+fn passwd_seals_the_broker_first() {
+    let root = Root::new();
+    init(&root);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let (code, _, err) = run(
+        &root,
+        &["passwd", "--own-passphrase"],
+        &[PASS, PASS2, PASS2],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("keygent: sealed the running broker first"),
+        "{err}"
+    );
+    assert_eq!(run(&root, &["ls"], &[]).0, 78);
+}
+
+#[test]
+fn broker_redacts_values_old_values_and_detectors() {
+    let root = Root::new();
+    init(&root);
+    let (c1, c2) = (canary(), canary());
+    assert_eq!(add(&root, "svc/key", &c1).0, 0);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let redact = |input: &str| {
+        let mut c = cmd(&root, &["__redact"]);
+        let mut child = c.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    let b64 = {
+        let mut s = String::new();
+        let t = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for ch in c1.as_bytes().chunks(3) {
+            let b = [ch[0], *ch.get(1).unwrap_or(&0), *ch.get(2).unwrap_or(&0)];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for k in 0..=ch.len() {
+                s.push(t[((n >> (18 - 6 * k)) & 63) as usize] as char);
+            }
+        }
+        s
+    };
+    let out = redact(&format!("raw {c1} b64 {b64} aws AKIAIOSFODNN7EXAMPLE\n"));
+    assert!(
+        !out.contains(&c1) && !out.contains(&b64[..20]) && !out.contains("AKIAIOSFODNN7EXAMPLE"),
+        "{out}"
+    );
+    assert!(
+        out.contains("‹keygent:svc/key›") && out.contains("‹keygent:unknown›"),
+        "{out}"
+    );
+    // after a rotate (a CLI write while unsealed), the broker redacts the new value and still the old one
+    assert_eq!(run(&root, &["rotate", "svc/key"], &[PASS, &c2]).0, 0);
+    let out = redact(&format!("{c1} {c2}"));
+    assert_eq!(out, "‹keygent:svc/key› ‹keygent:svc/key›");
+}
+
+// ---------------------------------------------------------------- grants, approvals and run (Phase 2 M3)
+
+const WAITING: &str = "keygent: waiting for approval — ask the user to run 'keygent approve'";
+
+/// An unsealed vault with `svc/key` = a canary, and a project dir (`.git`) to run in.
+fn run_setup() -> (Root, String, PathBuf) {
+    let root = Root::new();
+    init(&root);
+    let c = canary();
+    assert_eq!(add(&root, "svc/key", &c).0, 0);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    let proj = root.0.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    (root, c, proj)
+}
+
+fn run_in(root: &Root, proj: &Path, args: &[&str]) -> Session {
+    let mut c = cmd(root, args);
+    c.current_dir(proj);
+    Session::start_cmd(c)
+}
+
+fn approve(root: &Root) {
+    let (code, _, err) = run(root, &["approve"], &[PASS]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("keygent: approved"), "{err}");
+}
+
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[test]
+fn run_with_approval_streams_redacted_output() {
+    let (root, c, proj) = run_setup();
+    let mut s = run_in(
+        &root,
+        &proj,
+        &[
+            "run",
+            "--",
+            "X={{keygent:svc/key}} sh -c 'printf \"%s\\n\" \"$X\"; echo to-stderr >&2; exit 3'",
+        ],
+    );
+    s.expect(WAITING);
+    // the request as the human sees it: command, cwd, secret → env, programs, unbound warning
+    let (code, out, _) = run(&root, &["pending"], &[]);
+    assert_eq!(code, 0);
+    for want in [
+        "request ",
+        "X={{keygent:svc/key}} sh -c",
+        "svc/key → $KEYGENT_SVC_KEY",
+        "program:  /",
+        "⚠ unbound",
+    ] {
+        assert!(out.contains(want), "missing {want}: {out}");
+    }
+    assert!(!out.contains(&c));
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(out, "‹keygent:svc/key›\n");
+    assert!(err.contains("to-stderr"), "{err}");
+    assert!(!out.contains(&c) && !err.contains(&c));
+    // the grant was single-use and nothing is pending any more
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert_eq!(out, "no pending requests\n");
+    assert_no_plaintext(&root, &c);
+}
+
+#[test]
+fn deny_and_policy_refusals() {
+    let (root, _c, proj) = run_setup();
+    let mut s = run_in(&root, &proj, &["run", "--", "X={{keygent:svc/key}} true"]);
+    s.expect(WAITING);
+    let (code, _, err) = run(&root, &["deny"], &[]);
+    assert_eq!((code, err.trim()), (0, "keygent: denied"));
+    let (code, _, err) = s.finish();
+    assert_eq!(
+        (code, err.lines().last().unwrap()),
+        (75, "keygent: approval denied or timed out for svc/key")
+    );
+    // refusals happen before anything is queued
+    let refuse = |c: &str, cwd: &Path| {
+        let mut x = cmd(&root, &["run", "--", c]);
+        x.current_dir(cwd);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let (code, err) = refuse("tool --key {{keygent:svc/key}}", &proj);
+    assert_eq!(code, 77);
+    assert!(
+        err.starts_with("keygent: secret would be visible in the process list"),
+        "{err}"
+    );
+    let (code, err) = refuse("X='{{keygent:svc/key}}' tool", &proj);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            77,
+            "keygent: placeholder inside single quotes won't expand — use double quotes"
+        )
+    );
+    let (code, err) = refuse("X={{keygent:no/such}} tool", &proj);
+    assert_eq!(code, 77, "{err}");
+    let (code, err) = refuse("echo hi", Path::new("/"));
+    assert_eq!(
+        (code, err.trim()),
+        (
+            77,
+            "keygent: can't approve runs from this folder — run inside a project"
+        )
+    );
+    let (code, err) = refuse("echo 'unterminated", &proj);
+    assert_eq!(code, 64, "{err}");
+    // approve with nothing pending
+    let (code, _, err) = run(&root, &["approve"], &[]);
+    assert_eq!((code, err.trim()), (1, "keygent: no pending requests"));
+    // a command without placeholders runs without approval
+    let mut x = cmd(&root, &["run", "--", "echo hi; exit 4"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        (o.status.code(), o.stdout.as_slice()),
+        (Some(4), b"hi\n".as_slice())
+    );
+}
+
+#[test]
+fn bound_script_runs_the_approved_bytes() {
+    let (root, c, proj) = run_setup();
+    std::fs::write(proj.join("x.sh"), "printf '%s|' \"$X\"\n").unwrap();
+    let mut s = run_in(
+        &root,
+        &proj,
+        &["run", "--", "X={{keygent:svc/key}} sh ./x.sh"],
+    );
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("--- ") && out.contains("printf '%s|'"),
+        "script shown in full: {out}"
+    );
+    // swapping the script after approval-time reading has no effect
+    std::fs::write(proj.join("x.sh"), "echo SWAPPED\n").unwrap();
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!((code, out.as_str()), (0, "‹keygent:svc/key›|"), "{err}");
+    assert!(!out.contains(&c));
+}
+
+#[test]
+fn changed_program_after_approval_fails_closed() {
+    let (root, _c, proj) = run_setup();
+    std::fs::create_dir_all(proj.join("bin")).unwrap();
+    let tool = proj.join("bin/tool");
+    std::fs::copy("/bin/echo", &tool).unwrap();
+    let mut s = run_in(
+        &root,
+        &proj,
+        &["run", "--", "X={{keygent:svc/key}} ./bin/tool hi"],
+    );
+    s.expect(WAITING);
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tool)
+        .unwrap();
+    f.write_all(b"\0").unwrap();
+    drop(f);
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 77, "{err}");
+    assert!(out.is_empty());
+    assert!(err.ends_with("keygent: a program or script changed after approval — re-run to request approval again\n"), "{err}");
+}
+
+#[test]
+fn run_limits_and_containment() {
+    let (root, _c, proj) = run_setup();
+    // runtime cap: exit 74 with the canonical line; the backgrounded child dies with the session
+    let mut x = cmd(
+        &root,
+        &[
+            "run",
+            "--max-runtime",
+            "2s",
+            "--",
+            "sleep 30 & echo $!; sleep 30",
+        ],
+    );
+    x.current_dir(&proj);
+    let t = Instant::now();
+    let o = x.output().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(10));
+    let err = String::from_utf8(o.stderr).unwrap();
+    assert_eq!(o.status.code(), Some(74), "{err}");
+    assert_eq!(
+        err.trim(),
+        "keygent: run stopped at its limit (1 min / 10 MiB) — use --max-runtime or run_in_background"
+    );
+    let bg = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        wait_until(|| !alive(bg.trim())),
+        "background child {bg} survived"
+    );
+    // output cap
+    let mut x = cmd(&root, &["run", "--", "head -c 11000000 /dev/zero"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(74));
+    assert!(o.stdout.len() <= 10 * 1024 * 1024);
+    // a killed client kills its run
+    let mut s = run_in(&root, &proj, &["run", "--", "echo $$; sleep 30"]);
+    assert!(
+        wait_until(|| s.out.lock().unwrap().ends_with(b"\n")),
+        "run never printed its pid"
+    );
+    let pid = String::from_utf8(s.out.lock().unwrap().clone())
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(alive(&pid));
+    s.child.kill().unwrap();
+    let _ = s.finish();
+    assert!(wait_until(|| !alive(&pid)), "run survived its client");
+    // an interrupt is forwarded: sh dies of SIGINT → 130
+    let s = run_in(&root, &proj, &["run", "--", "echo ready; sleep 30"]);
+    assert!(
+        wait_until(|| s.out.lock().unwrap().ends_with(b"ready\n")),
+        "run never got ready"
+    );
+    Command::new("kill")
+        .args(["-INT", &s.child.id().to_string()])
+        .status()
+        .unwrap();
+    let (code, _, _) = s.finish();
+    assert_eq!(code, 130);
+}
+
+// ---------------------------------------------------------------- audit chain (Phase 2 M4)
+
+#[test]
+fn audit_chain_records_verifies_and_fails_closed() {
+    let (root, c, proj) = run_setup();
+    let mut x = cmd(&root, &["run", "--", "echo hi"]);
+    x.current_dir(&proj);
+    assert!(x.output().unwrap().status.success());
+    let (code, out, _) = run(&root, &["audit"], &[]);
+    assert_eq!(code, 0);
+    for ev in [
+        "\"event\":\"add\"",
+        "\"event\":\"unseal\"",
+        "\"event\":\"grant\"",
+        "\"decision\":\"start\"",
+        "\"exit\":0",
+    ] {
+        assert!(out.contains(ev), "missing {ev}: {out}");
+    }
+    assert!(!out.contains(&c));
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.starts_with("keygent: audit log intact ("), "{err}");
+    // an edited record is detected
+    let log = root.0.join("state/audit.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::write(
+        &log,
+        text.replacen("\"event\":\"add\"", "\"event\":\"rm\"", 1),
+    )
+    .unwrap();
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(
+        (code, err.trim()),
+        (
+            79,
+            "keygent: audit log tampered at record 1 — run 'keygent doctor'"
+        )
+    );
+    // an unwritable log refuses runs and value changes (fail closed)
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    let mut x = cmd(&root, &["run", "--", "echo hi"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(79));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap().trim(),
+        "keygent: audit log unwritable — run 'keygent doctor'"
+    );
+    assert!(o.stdout.is_empty());
+    let (code, _, err) = add(&root, "new/one", &canary());
+    assert_eq!(code, 79, "{err}");
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(!out.contains("new/one"));
+}
+
+// ---------------------------------------------------------------- allow rules (Phase 2 M4)
+
+#[test]
+fn allow_rules_run_pinned_tools_silently() {
+    let (root, c, proj) = run_setup();
+    let tool = proj.join("tool");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$SVC_KEY\" \"$*\" \"$HOME\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // shapes that can never be rules
+    let mut x = cmd(&root, &["rule", "add", "svc/key", "--", "/bin/sh", "*"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(64));
+    let mut x = cmd(&root, &["rule", "add", "svc/key", "--", "./tool", "**"]);
+    x.current_dir(&proj);
+    assert_eq!(
+        x.output().unwrap().status.code(),
+        Some(64),
+        "** needs flags"
+    );
+    // add a rule (passphrase), then switch the handle to allow mode
+    let mut x = cmd(
+        &root,
+        &[
+            "rule", "add", "svc/key", "--home", "scratch", "--", "./tool", "list", "*", "**",
+            "--limit=",
+        ],
+    );
+    x.current_dir(&proj);
+    let mut s = Session::start_cmd(x);
+    s.send(PASS);
+    let (code, _, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("rules apply only in 'allow'"), "{err}");
+    let (code, _, err) = run(&root, &["edit", "svc/key", "--mode", "allow"], &[PASS, "y"]);
+    assert_eq!(code, 0, "{err}");
+    let go = |c: &str| {
+        let mut x = cmd(&root, &["run", "--", c]);
+        x.current_dir(&proj);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stdout).unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    // a matching command runs at once, no approval, value injected under the handle's env name, redacted output,
+    // scratch HOME
+    let (code, out, err) = go("./tool list acme --limit 3");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.is_empty(), "silent: {err}");
+    assert!(
+        out.starts_with("‹keygent:svc/key›|list acme --limit 3|"),
+        "{out}"
+    );
+    assert!(
+        out.contains("/h-") && out.trim_end().ends_with("/home"),
+        "scratch home: {out}"
+    );
+    assert!(!out.contains(&c));
+    // non-matching shapes get no secret (no rule → plain run without injection)
+    let (code, out, _) = go("./tool list acme --other 1");
+    assert_eq!(
+        (code, out.starts_with("|list acme --other 1|")),
+        (0, true),
+        "{out}"
+    );
+    let (_, out, _) = go("./tool list -x");
+    assert!(out.starts_with("|list -x|"), "{out}");
+    // a changed binary falls back to approval with a re-pin warning
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tool)
+        .unwrap();
+    f.write_all(b"# changed\n").unwrap();
+    drop(f);
+    let mut s = run_in(&root, &proj, &["run", "--", "./tool list acme"]);
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("⚠ re-pin:") && out.contains("allow rule matched"),
+        "{out}"
+    );
+    assert!(!out.contains("⚠ unbound"), "a rule run is bound: {out}");
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("‹keygent:svc/key›|list acme|"), "{out}");
+    // the audit trail shows the silent run
+    let (_, out, _) = run(&root, &["audit"], &[]);
+    assert!(out.contains("\"decision\":\"auto\""), "{out}");
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+}
+
+// ---------------------------------------------------------------- manifest trust (Phase 2 M4)
+
+#[test]
+fn manifest_needs_trust_and_any_change_untrusts_it() {
+    let (root, c, proj) = run_setup();
+    let mf = proj.join(".keygent.toml");
+    std::fs::write(
+        &mf,
+        "version = 1\n[secrets]\n\"svc/key\" = { env = \"SVC_TOKEN\" }\n",
+    )
+    .unwrap();
+    let use_it = "X=\"$SVC_TOKEN\" sh -c 'printf \"%s\\n\" \"$X\"'";
+    let go = |c: &str| {
+        let mut x = cmd(&root, &["run", "--", c]);
+        x.current_dir(&proj);
+        let o = x.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    };
+    let not_trusted = "keygent: .keygent.toml changed — ask the user to run 'keygent trust'";
+    assert_eq!(go(use_it), (76, format!("{not_trusted}\n")));
+    // trust shows the whole file and the bindings, then needs the passphrase
+    let mut x = cmd(&root, &["trust"]);
+    x.current_dir(&proj);
+    let mut s = Session::start_cmd(x);
+    s.send(PASS);
+    let (code, _, err) = s.finish();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("  | \"svc/key\" = { env = \"SVC_TOKEN\" }"),
+        "{err}"
+    );
+    assert!(
+        err.contains("svc/key → $SVC_TOKEN") && err.contains("keygent: trusted "),
+        "{err}"
+    );
+    // now a reference is an approval-required binding; the value is injected under the manifest's name
+    let mut s = run_in(&root, &proj, &["run", "--", use_it]);
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("svc/key → $SVC_TOKEN") && out.contains("manifest: "),
+        "{out}"
+    );
+    approve(&root);
+    let (code, out, err) = s.finish();
+    assert_eq!((code, out.as_str()), (0, "‹keygent:svc/key›\n"), "{err}");
+    assert!(!out.contains(&c));
+    // the argv rule applies to $NAME too
+    let (code, err) = go("printf %s \"$SVC_TOKEN\"");
+    assert_eq!(code, 77, "{err}");
+    // unrelated variables need nothing
+    let mut x = cmd(&root, &["run", "--", "echo \"$TERM\""]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        (o.status.code(), o.stdout.as_slice()),
+        (Some(0), b"dumb\n".as_slice())
+    );
+    // any change un-trusts it
+    let mut f = std::fs::OpenOptions::new().append(true).open(&mf).unwrap();
+    f.write_all(b"# edited\n").unwrap();
+    drop(f);
+    assert_eq!(go(use_it), (76, format!("{not_trusted}\n")));
+    // untrust is agent-safe (no passphrase) and drops the trust of the current content
+    let mut x = cmd(&root, &["trust"]);
+    x.current_dir(&proj);
+    let mut s = Session::start_cmd(x);
+    s.send(PASS);
+    assert_eq!(s.finish().0, 0);
+    let mut x = cmd(&root, &["untrust"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(go(use_it), (76, format!("{not_trusted}\n")));
+    // invalid manifests can't be trusted
+    std::fs::write(
+        &mf,
+        "version = 1\n[secrets]\n\"svc/key\" = { env = \"PATH\" }\n",
+    )
+    .unwrap();
+    let mut x = cmd(&root, &["trust"]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8(o.stderr)
+            .unwrap()
+            .contains("line 3 is not valid")
+    );
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
+}
+
+// ---------------------------------------------------------------- capture (Phase 2 M4)
+
+#[test]
+fn capture_stores_stdout_as_a_new_handle_without_showing_it() {
+    let (root, _c, proj) = run_setup();
+    let make = "v=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \\n'); echo \"  $v\"; echo \"token=$v\" >&2";
+    // every capture writes a secret, so every capture needs the human's approval (review fix)
+    let approved = |args: &[&str]| {
+        let mut s = run_in(&root, &proj, args);
+        s.expect(WAITING);
+        approve(&root);
+        s.finish()
+    };
+    let (code, out, err) = approved(&["capture", "new/tok", "--", make]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.is_empty(), "stdout is never returned: {out}");
+    assert!(
+        err.contains("token=‹keygent:new/tok›"),
+        "stderr redacted with the new value: {err}"
+    );
+    assert!(
+        err.ends_with("keygent: stored new/tok (env KEYGENT_NEW_TOK, mode approve)\n"),
+        "{err}"
+    );
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(out.contains("new/tok  $KEYGENT_NEW_TOK  approve"), "{out}");
+    // the stored value is usable (and redacted) like any other
+    let (code, out, _) = approved(&[
+        "run",
+        "--",
+        "X={{keygent:new/tok}} sh -c 'printf \"%s\" \"$X\"'",
+    ]);
+    assert_eq!((code, out.as_str()), (0, "‹keygent:new/tok›"));
+    // create-only: an existing handle is refused before anyone is asked to approve
+    let mut x = cmd(&root, &["capture", "svc/key", "--", make]);
+    x.current_dir(&proj);
+    let o = x.output().unwrap();
+    assert_eq!(
+        (o.status.code(), String::from_utf8(o.stderr).unwrap().trim()),
+        (
+            Some(1),
+            "keygent: this needs your passphrase — run it in your own terminal"
+        )
+    );
+    // weak values and failed commands store nothing
+    let (code, _, _) = approved(&["capture", "weak/one", "--", "echo short"]);
+    assert_eq!(code, 1);
+    let (code, _, _) = approved(&[
+        "capture",
+        "fail/one",
+        "--",
+        "echo abcdefghijklmnopqrstuvwxyz0123456789; exit 3",
+    ]);
+    assert_eq!(code, 3);
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert!(
+        !out.contains("weak/one") && !out.contains("fail/one"),
+        "{out}"
+    );
+    // a capture whose command uses a secret needs approval, and the approval says where stdout goes
+    let mut s = run_in(
+        &root,
+        &proj,
+        &[
+            "capture",
+            "derived/one",
+            "--",
+            "X={{keygent:svc/key}} sh -c 'echo \"$X\"'",
+        ],
+    );
+    s.expect(WAITING);
+    let (_, out, _) = run(&root, &["pending"], &[]);
+    assert!(
+        out.contains("⚠ capture: stdout (trimmed) is stored as the new secret derived/one"),
+        "{out}"
+    );
+    assert_eq!(run(&root, &["deny"], &[]).0, 0);
+    assert_eq!(s.finish().0, 75);
+    let (code, out, _) = run(&root, &["audit"], &[]);
+    assert_eq!(code, 0);
+    assert!(out.contains("\"event\":\"capture\""), "{out}");
+    let (code, _, err) = run(&root, &["audit", "--verify"], &[]);
+    assert_eq!(code, 0, "{err}");
 }

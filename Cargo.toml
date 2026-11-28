@@ -24,10 +24,6 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", default-features = false }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray"] }
-
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -43,7 +39,6 @@ opt-level = 3
 
 [lints.rust]
 unsafe_code = "deny"
-missing_debug_implementations = "allow"
 
 [lints.clippy]
 dbg_macro = "deny"
@@ -58,3 +53,4 @@ cast_sign_loss = "warn"
 cast_lossless = "warn"
 mem_forget = "deny"
 undocumented_unsafe_blocks = "deny"
+allow_attributes_without_reason = "warn"

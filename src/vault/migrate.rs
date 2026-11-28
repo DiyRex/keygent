@@ -53,7 +53,8 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
-        clippy::arithmetic_side_effects
+        clippy::arithmetic_side_effects,
+        reason = "tests: a panic is the failure report"
     )]
     use super::*;
 

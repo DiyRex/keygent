@@ -80,6 +80,12 @@ tasks:
       - "{{.RUST}} cargo build --locked --features test-profile"
       - python3 tests/smoke/pty_smoke.py target/debug/keygent
 
+  rss:
+    desc: Broker idle RSS with 20 secrets (budget 5 MB), release + test-profile build in target/rss
+    cmds:
+      - "{{.RUST}} CARGO_TARGET_DIR=target/rss cargo build --locked --release --features test-profile"
+      - python3 tests/smoke/broker_rss.py target/rss/release/keygent 20
+
   linux:shell:
     desc: Interactive shell in the Linux dev container
     interactive: true

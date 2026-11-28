@@ -159,7 +159,11 @@ pub fn parse(src: &[u8]) -> Result<Vec<Item>, ParseError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     #[test]

@@ -7,8 +7,30 @@ use std::fmt;
 pub mod exit {
     pub const HUMAN: u8 = 1;
     pub const USAGE: u8 = 64;
+    pub const RUN_LIMIT: u8 = 74;
+    pub const APPROVAL: u8 = 75;
+    pub const NOT_TRUSTED: u8 = 76;
+    pub const POLICY: u8 = 77;
     pub const SEALED: u8 = 78;
     pub const BROKER: u8 = 79;
+}
+
+/// Agent-facing policy decisions (ERRORS.md rows with exits 74/75/77, plus Phase 2 additions).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum PolicyMsg {
+    NotAllowed(String),
+    ArgvSecret,
+    SingleQuoted,
+    BadCwd,
+    Changed,
+    Unparsable,
+    UnknownHandle(String),
+    ScriptNotBindable,
+    Denied(String),
+    QueueTimeout,
+    Limit(u64),
+    NoRemember,
+    NotTrusted,
 }
 
 /// Every failure keygent itself reports. Variants hold only non-secret data (handles, env names, limits, codes).
@@ -44,6 +66,28 @@ pub enum Error {
     NothingToUndo(String),
     UuidMismatch,
     Unsupported(&'static str),
+    /// The process behind the endpoint is not the verified keygent broker (SPEC §5.4). Fail closed.
+    BrokerUnverified,
+    /// The redactor's 8 MiB pattern cap would be exceeded (SPEC §5.8).
+    RedactorTooLarge,
+    VersionMismatch,
+    RateLimited,
+    /// A protocol error code from the broker (ADR 0004), never request contents.
+    Broker(u16),
+    Policy(PolicyMsg),
+    /// An error line relayed from the verified broker (already a canonical `keygent:` line) with its exit code.
+    Remote(u8, String),
+    NoPending,
+    AmbiguousPending,
+    /// An audit append failed: fail closed (SPEC §5.7 step 7, §9).
+    AuditUnwritable,
+    NoManifest,
+    /// `.keygent.toml` failed to parse at this line (0 = size/encoding).
+    BadManifest(usize),
+    /// `audit --verify` found a broken chain at this record (0 = anchor/truncation).
+    AuditBroken(u64),
+    /// The child's own exit code, passed through silently (`run`). Never displayed.
+    Exit(u8),
     /// I/O or OS failure. The code is an `std::io::ErrorKind`-derived number, never a path or value.
     Io(i32),
     /// Internal invariant failure (crypto/RNG). The code identifies the site.
@@ -55,7 +99,22 @@ impl Error {
         match self {
             Error::Usage(_) | Error::InvalidHandle | Error::InvalidEnvName => exit::USAGE,
             Error::Sealed => exit::SEALED,
-            Error::TooLarge(_) | Error::Internal(_) => exit::BROKER,
+            Error::Policy(p) => match p {
+                PolicyMsg::Denied(_) | PolicyMsg::QueueTimeout => exit::APPROVAL,
+                PolicyMsg::Limit(_) => exit::RUN_LIMIT,
+                PolicyMsg::Unparsable | PolicyMsg::NoRemember => exit::USAGE,
+                PolicyMsg::NotTrusted => exit::NOT_TRUSTED,
+                _ => exit::POLICY,
+            },
+            Error::Remote(code, _) | Error::Exit(code) => *code,
+            Error::TooLarge(_)
+            | Error::Internal(_)
+            | Error::BrokerUnverified
+            | Error::VersionMismatch
+            | Error::RateLimited
+            | Error::AuditUnwritable
+            | Error::AuditBroken(_)
+            | Error::Broker(_) => exit::BROKER,
             _ => exit::HUMAN,
         }
     }
@@ -102,6 +161,46 @@ impl fmt::Display for Error {
             Error::NothingToUndo(h) => write!(f, "keygent: nothing to undo for {} (only within 24 h of a rotate)", short(h)),
             Error::UuidMismatch => f.write_str("keygent: backup belongs to a different vault — use 'restore --new-machine'"),
             Error::Unsupported(what) => write!(f, "keygent: {what} is not supported on this platform yet"),
+            Error::BrokerUnverified => {
+                f.write_str("keygent: broker could not be verified — run 'keygent doctor'")
+            }
+            Error::VersionMismatch => {
+                f.write_str("keygent: updated — run 'keygent seal' then 'keygent unseal'")
+            }
+            Error::RateLimited => f.write_str("keygent: too many requests — retry in a few seconds"),
+            Error::RedactorTooLarge => {
+                f.write_str("keygent: too many or too large secrets to redact safely — remove some or split vaults")
+            }
+            Error::Broker(code) => write!(f, "keygent: broker error {code} — run 'keygent doctor'"),
+            Error::Policy(p) => match p {
+                PolicyMsg::NotAllowed(h) => write!(f, "keygent: {} is not allowed for this command — ask the user to approve or add a rule", short_n(h, 32)),
+                PolicyMsg::ArgvSecret => f.write_str("keygent: secret would be visible in the process list — use {{keygent-file:<h>}} or a tool that reads $KEYGENT_<H>"),
+                PolicyMsg::SingleQuoted => f.write_str("keygent: placeholder inside single quotes won't expand — use double quotes"),
+                PolicyMsg::BadCwd => f.write_str("keygent: can't approve runs from this folder — run inside a project"),
+                PolicyMsg::Changed => f.write_str("keygent: a program or script changed after approval — re-run to request approval again"),
+                PolicyMsg::Unparsable => f.write_str("keygent: can't parse this command — check its quotes and placeholders"),
+                PolicyMsg::UnknownHandle(h) => write!(f, "keygent: {} is not in the vault — run 'keygent ls' for handles", short(h)),
+                PolicyMsg::ScriptNotBindable => f.write_str("keygent: a script must be a regular file ≤ 16 KiB inside the project to be approved"),
+                PolicyMsg::Denied(h) => write!(f, "keygent: approval denied or timed out for {}", short(h)),
+                PolicyMsg::QueueTimeout => f.write_str("keygent: approval timed out in the queue — retry"),
+                PolicyMsg::Limit(min) => write!(f, "keygent: run stopped at its limit ({min} min / 10 MiB) — use --max-runtime or run_in_background"),
+                PolicyMsg::NoRemember => f.write_str("keygent: --remember isn't available for this run (it runs code keygent can't fully show)"),
+                PolicyMsg::NotTrusted => f.write_str("keygent: .keygent.toml changed — ask the user to run 'keygent trust'"),
+            },
+            Error::Remote(_, m) => f.write_str(m),
+            Error::NoPending => f.write_str("keygent: no pending requests"),
+            Error::NoManifest => f.write_str("keygent: no .keygent.toml here or above (up to the repo root)"),
+            Error::BadManifest(0) => f.write_str("keygent: .keygent.toml is too large or not UTF-8 (max 64 KiB)"),
+            Error::BadManifest(n) => write!(f, "keygent: .keygent.toml line {n} is not valid — only version and [secrets] entries"),
+            Error::AuditUnwritable => f.write_str("keygent: audit log unwritable — run 'keygent doctor'"),
+            Error::AuditBroken(0) => {
+                f.write_str("keygent: audit log truncated or its anchor doesn't match — run 'keygent doctor'")
+            }
+            Error::AuditBroken(n) => write!(f, "keygent: audit log tampered at record {n} — run 'keygent doctor'"),
+            Error::AmbiguousPending => {
+                f.write_str("keygent: several requests pending — pass an id from 'keygent pending'")
+            }
+            Error::Exit(_) => Ok(()),
             Error::Io(code) => write!(f, "keygent: file error {code} — run 'keygent doctor'"),
             Error::Internal(code) => write!(f, "keygent: internal error {code} — run 'keygent doctor'"),
         }
@@ -110,10 +209,14 @@ impl fmt::Display for Error {
 
 /// Keeps templated lines within 120 chars: handles and env names are cut to 48 chars.
 fn short(s: &str) -> String {
-    if s.chars().count() <= 48 {
+    short_n(s, 48)
+}
+
+fn short_n(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
         return s.to_owned();
     }
-    let mut t: String = s.chars().take(47).collect();
+    let mut t: String = s.chars().take(n.saturating_sub(1)).collect();
     t.push('…');
     t
 }
@@ -168,6 +271,32 @@ mod tests {
             Error::NothingToUndo(long.clone()),
             Error::UuidMismatch,
             Error::Unsupported("clipboard"),
+            Error::BrokerUnverified,
+            Error::RedactorTooLarge,
+            Error::VersionMismatch,
+            Error::RateLimited,
+            Error::Broker(10),
+            Error::Policy(PolicyMsg::NotAllowed(long.clone())),
+            Error::Policy(PolicyMsg::ArgvSecret),
+            Error::Policy(PolicyMsg::SingleQuoted),
+            Error::Policy(PolicyMsg::BadCwd),
+            Error::Policy(PolicyMsg::Changed),
+            Error::Policy(PolicyMsg::Unparsable),
+            Error::Policy(PolicyMsg::UnknownHandle(long.clone())),
+            Error::Policy(PolicyMsg::ScriptNotBindable),
+            Error::Policy(PolicyMsg::Denied(long.clone())),
+            Error::Policy(PolicyMsg::QueueTimeout),
+            Error::Policy(PolicyMsg::Limit(240)),
+            Error::Policy(PolicyMsg::NoRemember),
+            Error::Policy(PolicyMsg::NotTrusted),
+            Error::NoManifest,
+            Error::BadManifest(0),
+            Error::BadManifest(usize::MAX),
+            Error::NoPending,
+            Error::AmbiguousPending,
+            Error::AuditUnwritable,
+            Error::AuditBroken(0),
+            Error::AuditBroken(u64::MAX),
             Error::Io(28),
             Error::Internal(1),
         ];

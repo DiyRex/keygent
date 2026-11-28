@@ -26,8 +26,11 @@ pub const MAX_FILE_LEN: u64 = 31
     + 1000 * (1 + 255 + 4 + 24 + 4 + 64 * 1024 + 16);
 
 /// Slot kinds (FORMATS §1). `Prf` and `OsUv` arrive in Phase 6; unknown kinds are preserved, never used.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[expect(
+    dead_code,
+    reason = "reserved v1 slot kinds; constructed once passkey-PRF / OS-UV unseal lands (Phase 6)"
+)]
 pub enum SlotKind {
     Passphrase = 1,
     Recovery = 2,
@@ -302,7 +305,11 @@ pub fn entry_aad(uuid: &[u8; 16], handle: &str, version: u32) -> Result<Vec<u8>>
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "tests: a panic is the failure report"
+    )]
     use super::*;
 
     fn sample() -> VaultFile {
