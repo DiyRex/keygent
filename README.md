@@ -261,10 +261,13 @@ tool at another server only ever reveals the dummy.
 
 ```sh
 keygent add do/token --description "DigitalOcean API token"     # custody is on by default for single-line values
-keygent edit do/token --allow-host api.digitalocean.com          # approve the host once (passphrase)
 keygent run -- 'DIGITALOCEAN_ACCESS_TOKEN={{keygent:do/token}} \
   doctl -u "$KEYGENT_PROXY_URL/api.digitalocean.com/" compute droplet list'   # single quotes: expanded inside the run
 ```
+
+The first time a key heads to a new host, keygent refuses that request and asks you: `keygent pending` shows
+`allow do/token → https://api.digitalocean.com`, and `keygent approve` (passphrase) stores it. The agent retries and from then
+on that host works with no prompts. You can also approve a host up front: `keygent edit do/token --allow-host <host>`.
 
 The agent points the tool's API base URL at `$KEYGENT_PROXY_URL/<host>/` (most CLIs and SDKs have a flag or variable for it).
 A tool that skips the proxy just sends the dummy and gets "unauthorized", so nothing leaks. Every proxied request is audited.

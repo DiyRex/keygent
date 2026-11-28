@@ -121,6 +121,7 @@ bytes. `audit.anchor` lines are `<seq> <hex HMAC(K_audit, enc(seq as u64 LE) ‖
 Not built yet: rotation, the 10-min tripwire anchor, the `rekey` epoch record.
 Custody (ADR 0022): an `egress` record per (decision, host, handles) of a run, written before the run's `end` record:
 `{"event":"egress","handles":["do/token"],"decision":"forwarded"|"credential_endpoint_mismatch","host":"api.digitalocean.com","requests":3}`.
+Approving a host on first use (C1c) writes `{"event":"host_allow","handles":["do/token"],"decision":"approved","channel":"terminal","host":"…"}`.
 
 ## 6. Hook I/O (Claude Code adapter, per ADR 0001)
 
