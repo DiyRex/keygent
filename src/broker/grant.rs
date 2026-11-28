@@ -69,6 +69,7 @@ pub fn host_request(handle: &str, host: &str) -> Result<Grant> {
         key,
         command: format!("allow {handle} → {host}"),
         rewritten: String::new(),
+        // "/" is never a command's cwd (`forbidden_cwd`), so host requests have their own per-cwd queue bucket (≤ 4)
         cwd: PathBuf::from("/"),
         handles: vec![handle.to_owned()],
         custody: Vec::new(),

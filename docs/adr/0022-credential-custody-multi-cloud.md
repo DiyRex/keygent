@@ -166,6 +166,11 @@ for a provider.
 - **Routing.** An explicit `/<token>/<host>/…` segment is routed to that host even when nobody has approved it, if it is a
   valid lower-case DNS name with a dot. A dummy toward it is then refused until approval.
 - **Unchanged.** Requests carrying no dummy are forwarded as-is, to public addresses only.
+- **The proxy is a general relay (review note, PR #15).** Explicit host routing means a run's proxy relays to *any* public host.
+  This is not a new capability: the child can already reach the internet directly. SSRF to internal addresses stays blocked
+  by the public-address filter. Only dummy-bearing requests to approved hosts get a real value.
+- **Queue isolation.** Host requests use cwd `/`, which `forbidden_cwd` refuses for commands, so they fill their own bucket
+  (≤ 4, oldest replaced) and can't crowd out command approvals.
 - **Verified:**
   - `tests/custody.rs::first_use_of_a_new_host_asks_the_human`: the full curl flow on macOS and Linux;
   - a proxy unit test with a live check;
