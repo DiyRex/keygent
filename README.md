@@ -119,8 +119,8 @@ mkdir -p ~/.local/bin
 install -m 0755 target/release/keygent ~/.local/bin/keygent      # Windows: copy target\release\keygent.exe onto your PATH
 ```
 
-Until the first release, `main` builds a **placeholder**: every command prints one `keygent: pre-alpha placeholder build…` line and
-exits `64`. The commands below start working as each phase in [`docs/ROADMAP.md`](docs/ROADMAP.md) is merged. If your shell says
+Until the first release, keygent is **pre-alpha**: commands that aren't built yet are rejected as unknown (exit `64`).
+The commands below start working as each phase in [`docs/ROADMAP.md`](docs/ROADMAP.md) is merged. If your shell says
 `command not found` right after installing, run `hash -r` or open a new terminal.
 
 ## Quickstart (60 seconds)
