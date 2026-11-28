@@ -17,6 +17,7 @@ apart. Golden tests pin every line. Exit `1` is used only by human-facing comman
 | 79 | `VersionMismatch` | `keygent: updated — run 'keygent seal' then 'keygent unseal'` | user re-unseals |
 | 79 | `Internal` | `keygent: broker error <code> — run 'keygent doctor'` | user runs doctor |
 | 79 | — | `keygent: audit log unwritable — run 'keygent doctor'` | user runs doctor |
+| 1 | — | `keygent: ~/.claude/settings.json isn't valid JSON — fix it, then run 'keygent integrate claude'` | user fixes the file (it is left untouched) |
 | 79 | `RateLimited` | `keygent: too many requests — retry in a few seconds` | wait |
 | 79 | `TooLarge` | `keygent: input too large (limit <n>)` | split the input |
 | 1 | `NeedsAuth` | `keygent: this needs your passphrase — run it in your own terminal` | human runs it |

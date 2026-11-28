@@ -336,12 +336,22 @@ keygent check 'stripe customers list --limit 10'
 
 ```sh
 keygent integrate claude              # user scope (~/.claude/settings.json)
-keygent integrate claude --project    # this repo only (.claude/settings.local.json)
 keygent integrate claude --remove     # undo exactly what was added
-keygent doctor                        # verify hooks, version support, vault state
+keygent integrate claude --project    # (planned) this repo only (.claude/settings.local.json)
+keygent doctor                        # (planned) verify hooks, version support, vault state
 ```
 
-This installs:
+**Built today:** the `PreToolUse` · Bash hook. When the agent writes a command with `{{keygent:…}}`, the hook hands it to the
+broker and rewrites it to `keygent run --grant <id>`; everything else passes untouched (zero tokens). Custody keys run with no
+prompt; other secrets wait for `keygent approve`. Your own Claude Code permission rules still judge the command the agent
+asked for, because the hook returns no permission decision. A sealed vault or a policy refusal blocks the command with
+keygent's one-line reason. Verified on Claude Code 2.1.332 ([ADR 0001](docs/adr/0001-hook-contract.md)).
+
+If another tool already rewrites Bash commands (lean-ctx, for example), `integrate claude` moves its hook behind keygent's. keygent
+rewrites first, then that tool wraps the result, so neither rewrite is lost; `--remove` puts it back where it was
+([ADR 0002](docs/adr/0002-lean-ctx-composition.md)).
+
+The full set below lands with Phase 3:
 
 | Hook | What it does |
 |---|---|

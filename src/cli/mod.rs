@@ -8,6 +8,10 @@ mod console;
 mod dotenv;
 #[cfg(unix)]
 mod grants;
+#[cfg(unix)]
+mod hook;
+#[cfg(unix)]
+mod integrate;
 mod recovery;
 #[cfg(unix)]
 mod rules;
@@ -42,6 +46,7 @@ Secrets:  add <handle> [--env NAME] [--description TEXT] [--no-custody] [--multi
           edit --settings [--ttl-max SECS] [--idle SECS] [--run-max-minutes N] [--remember on|off]
                           [--default-mode MODE]
           import <.env file> [--overwrite] [--delete]
+Agents:   integrate claude [--remove]   (Claude Code hook: rewrites {{keygent:…}} commands)
 Other:    version · help
 ";
 
@@ -155,6 +160,27 @@ fn run(argv: &[String]) -> Result<()> {
             &rest,
             &[("--max-runtime", true)],
             "keygent capture <handle> -- '<command>'",
+        )?),
+        #[cfg(unix)]
+        "hook" => match rest.first().map(String::as_str) {
+            Some("pre") => {
+                let mut chain = Vec::new();
+                let mut it = rest.iter().skip(1);
+                while let Some(flag) = it.next() {
+                    match (flag.as_str(), it.next()) {
+                        ("--chain", Some(spec)) => chain.push(spec.clone()),
+                        _ => return Err(Error::Usage("keygent hook pre [--chain '<hook json>']…")),
+                    }
+                }
+                hook::pre(&chain)
+            }
+            _ => Err(Error::Usage("keygent hook pre [--chain '<hook json>']…")),
+        },
+        #[cfg(unix)]
+        "integrate" => integrate::claude(Args::parse(
+            &rest,
+            &[("--remove", false)],
+            "keygent integrate claude [--remove]",
         )?),
         #[cfg(unix)]
         "pending" => grants::pending(Args::parse(&rest, &[], "keygent pending")?),

@@ -1,1 +1,3 @@
-//! Hook prompt/pre/post and chain composer — never touches secret types (SPEC §5.10). Phase 3.
+//! Agent hooks (SPEC §5.10). No plaintext types here (SPEC §4.2, preflight boundary gate).
+
+pub mod json;

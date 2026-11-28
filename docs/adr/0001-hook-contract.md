@@ -40,3 +40,43 @@
 - Golden tests pin these shapes. Phase 3 must capture real payloads for every *verify* item, on macOS, Linux and Windows.
 - If `suppressOriginalPrompt` turns out unsupported, SPEC §15's fallback applies.
 - Re-verify when the minimum supported Claude Code version changes. `doctor` reports the installed version.
+
+## Re-verified by real runs: Claude Code 2.1.332 (2026-11-28)
+
+The docs pages read through summarising tools gave contradictory answers, so these facts come from real `claude -p` runs
+with a throwaway hook passed through `--settings`, which leaves the user's settings untouched.
+
+**Runs**
+
+| Hook output | Result |
+|---|---|
+| `updatedInput` with **no** `permissionDecision` | The rewrite **is applied**: `echo ORIGINAL` ran as `echo REWRITTEN_none` |
+| `updatedInput` + `allow` | Applied |
+| `updatedInput` + `ask` in `-p` mode | Not run (no prompt is possible) |
+| `updatedInput` + `defer` in `-p` mode | No output (behaviour unclear) |
+
+**Findings**
+- **Permission rules are evaluated against the original command.** With only `Bash(echo ORIGINAL*)` allowed and the
+  command rewritten to `echo REWRITTEN`, the rewritten command ran without a prompt.
+  - This supersedes finding 2's "against the input your hook returns" for 2.1.332.
+- **The `if` filter strips leading env assignments before matching.**
+  - `"if": "Bash(*{{keygent*)"` matched `echo ORIGINAL {{keygent:x/y}}` and `T=1 echo … {{keygent:x/y}}`.
+  - It **missed** `T={{keygent:do/token}} sh -c '…'`: the placeholder sat in the stripped assignment, so the hook never ran
+    and the command ran unrewritten (a live run).
+  - So keygent uses **no `if` filter**.
+- **Exec form works.** `command` plus `args`, with no shell.
+- **Stdin keys:** `cwd`, `effort`, `hook_event_name`, `permission_mode`, `prompt_id`, `scratchpad_dir`, `session_id`,
+  `tool_input` (`command`, `description`), `tool_name`, `tool_use_id`, `transcript_path`.
+
+**Decision (S2, as built):** `keygent hook pre`
+- returns `updatedInput` (every original `tool_input` field kept, `command` replaced by `'<keygent>' run --grant <id>`) and
+  **no** permission decision, so the user's own rules keep judging what the agent asked for;
+- on refusal, returns `deny` with keygent's line.
+
+`integrate claude` installs:
+- one `PreToolUse` group with matcher `Bash`;
+- **no `if` filter** (see above): `hook pre` exits silently for commands without a placeholder;
+- exec form `<keygent> hook pre`, `timeout: 10`;
+- **`onFailure: continue`**. A broken keygent lets the command run with the literal `{{keygent:…}}` text, which holds no
+  value, so failing open leaks nothing and never blocks the user's other Bash commands. This supersedes the earlier
+  decision's `block` for Bash.

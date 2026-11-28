@@ -46,3 +46,40 @@ or rewriters on those events. Every change is backed up first, and `--remove` re
 - If lean-ctx updates and changes its hook command, `doctor` notices that the chained command differs from what lean-ctx installs, and offers to re-chain.
 - Chaining adds one process spawn per event. That falls within the 30 ms (50 ms Windows) budget and is measured in Phase 5.
 - lean-ctx's own redaction stays on as a third layer. Its allowlist gets `keygent`, and its secret paths get the vault and runtime dir.
+
+## Built: the `PreToolUse` chain (2026-11-29, Claude Code 2.1.332, lean-ctx 3.11.0)
+
+Problem 1 is real, observed in a live `claude -p` run: both hooks fired in parallel and Claude Code ran lean-ctx's
+`updatedInput` (a wrap of the **original** placeholder command), so keygent's rewrite was lost. Nothing leaked, since the
+literal placeholder holds no value, but the command failed. What is built differs from the plan above in three ways:
+
+- **Generic, inside `integrate claude`.** There's no separate `integrate lean-ctx`. Every `PreToolUse` group whose matcher
+  names only Bash (`Bash`, `Bash|bash`, any case) and whose hooks are plain command hooks is moved into keygent's own
+  entry as `--chain '{"at":<index>,"group":<the group as written>}'`. That covers lean-ctx and any other Bash rewriter.
+  Groups with an `if` rule (only Claude Code can evaluate it), `async` hooks, or a broader matcher (`.*`) stay where they
+  are, and `integrate` prints how many may still match Bash in parallel. Re-running `integrate` first restores the chained
+  groups, so it's idempotent. `--remove` puts each one back at its original index, and the file round-trips exactly.
+- **Order and combining** (`keygent hook pre --chain …`):
+  - keygent's step runs first, and a keygent `deny` ends the chain;
+  - each chained hook then gets the payload with `tool_input` already rewritten. Exec form is used if it has `args`,
+    otherwise `sh -c`. Its `timeout` is honoured (default 60 s) and its process group is killed when it expires;
+  - exit 2 blocks the call, passing on that hook's stderr. Any other failure is skipped unless that hook set
+    `onFailure: block`;
+  - decisions combine deny > ask > allow, and `additionalContext` strings are joined.
+- **A chained hook may wrap keygent's command but not drop it.** Its `updatedInput` is used only if the command still
+  contains `run --grant <id>`. That part is unquoted and unique per grant, so a wrapper's re-quoting of the launcher path
+  doesn't break it. Only Claude Code's documented common top-level fields pass through (`continue`, `stopReason`,
+  `suppressOutput`, `systemMessage`). lean-ctx also emits `modifiedArgs` and `updated_input`, which carry a command, and
+  these are dropped so they can't bring back a rewrite keygent refused.
+
+Verified: lean-ctx 3.11.0 given `'/opt/homebrew/bin/keygent' run --grant <id>` returns `allow` with
+`lean-ctx -c ''\''/opt/homebrew/bin/keygent'\'' run --grant <id>'` (keygent innermost, as planned). keygent's own entry
+timeout is 10 s plus each chained hook's timeout (capped at 600 s).
+
+This is not a security boundary (ADR 0003): a chained hook is the user's own configuration, and the agent is the same OS
+user. Problem 2 (observers on prompts and tool output) is still open and lands with the Phase 3 `prompt`/`post` hooks.
+
+**Live check (2026-11-29, Claude Code 2.1.332, `claude -p --model haiku`, test-profile root, settings produced by
+`integrate claude` from a copy of the user's lean-ctx group, user settings excluded with `--setting-sources project,local`):**
+one `PreToolUse:Bash` hook ran (80 ms) and returned lean-ctx's wrap of `keygent run --grant <id>`. The command ran under
+custody, the model saw only the dummy, the canary appeared nowhere in the transcript, and the audit log shows `grant` → `run`.
