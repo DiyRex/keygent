@@ -103,7 +103,7 @@ the Windows installer script may add its own install dir to the *user* `PATH`. I
 
 - Rust stable, edition 2024, **MSRV 1.89**. Single binary (plus `keygent-ui`, feature `ui`). No async runtime.
 - Targets: linux x86_64/arm64 (static musl), macOS arm64/x86_64, Windows x64/arm64 (static CRT).
-- Budgets: binary ≤ 2 MB per target; broker idle RSS ≤ 5 MB; hook p95 ≤ 30 ms (≤ 50 ms Windows); `run` overhead ≤ 10 ms; redaction ≥ 200 MB/s.
+- Budgets: binary ≤ 3 MB per target (target ≤ 2 MB; [ADR 0023](adr/0023-binary-size-budget.md)); broker idle RSS ≤ 5 MB; hook p95 ≤ 30 ms (≤ 50 ms Windows); `run` overhead ≤ 10 ms; redaction ≥ 200 MB/s.
 - Crypto: RustCrypto only (`chacha20poly1305`, `argon2`, `hkdf`, `sha2`, `hmac`, `p256` verify), `zeroize`, `getrandom`. MAC and token comparisons are constant-time.
 - FFI only in `src/platform/` (`libc`, `windows-sys`). Secret types have no `Debug`/`Display`. No panics on untrusted input. Every input has a limit.
 
@@ -874,3 +874,4 @@ broker unredacted. **Chain composer:** keygent wrapping another tool's hook so t
 | 177 | Owner wants a Homebrew tap, auto-updates, and no automatic CI | GoReleaser on one macOS runner, manual `release.yml` (snapshot/release), formula tap, updates via `brew upgrade`/`brew autoupdate`, no self-update; Windows release asset waits for the platform layer ([ADR 0017](adr/0017-release-pipeline-and-updates.md)) |
 | 178 | Linux broker RSS 5.55 MiB on a glibc build (budget 5 MB) | Budget and injection defence apply to the static musl build that ships (2.61 MiB); source installs on Linux use the musl target (§12, PLATFORMS, README) |
 | 179 | Agents run tools many times; per-command approval is impractical, and leases leave a T2 value leak | **Credential custody** for single-line values (default): the child gets a format-preserving dummy, a broker proxy adds the value only toward hosts the human approved (`edit --allow-host`); custody-only commands need no per-command approval. Non-HTTP secrets use `--no-custody` and approval ([ADR 0022](adr/0022-credential-custody-multi-cloud.md)) |
+| 180 | Custody (TLS client) left 39 KB under the 2 MB cap; C2–C5 need more | Hard cap raised to **3 MB** per target, target 2 MB (owner decision); RSS and latency budgets unchanged ([ADR 0023](adr/0023-binary-size-budget.md)) |

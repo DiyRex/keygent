@@ -63,7 +63,7 @@ prints is redacted before the agent reads it.
 - 🔒 **Seal/unseal.** Works like `ssh-agent`: unseal once per session; it auto-seals on TTL, idle timeout or command. A small
   local broker is the only process that ever holds values, in locked memory that is wiped on exit.
 - 🧾 **Tamper-evident audit log.** Records which handles were used, by which command, and the result. It never records values.
-- 🪶 **Small and fast.** Single static binary ≤ 2 MB, ≤ 5 MB RAM when idle, hooks under 30 ms, zero agent tokens on the
+- 🪶 **Small and fast.** Single static binary ≤ 3 MB, ≤ 5 MB RAM when idle, hooks under 30 ms, zero agent tokens on the
   happy path.
 - 🤝 **Works with lean-ctx.** Detects it automatically and composes with it, redacting before anything is compressed or cached.
 - 💻 **macOS, Windows and Linux.** Same guarantees on each, built on each OS's native protections: named pipes and Job Objects
