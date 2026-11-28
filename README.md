@@ -87,6 +87,11 @@ One line, no admin rights (available from the first release on):
 curl -fsSL https://raw.githubusercontent.com/DiyRex/keygent/main/install.sh | sh
 ```
 
+```sh
+# macOS / Linux with Homebrew — update later with `brew upgrade keygent`
+brew install diyrex/tap/keygent
+```
+
 ```powershell
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/DiyRex/keygent/main/install.ps1 | iex
