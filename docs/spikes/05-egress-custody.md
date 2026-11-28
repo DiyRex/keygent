@@ -47,9 +47,24 @@ What this shows:
 
 Exit code 2 came from the stub's `{}` reply, which is not a valid account body.
 
+## 3. Generic routing: `HTTPS_PROXY` and an env-provided CA (doctl 2.11.0, macOS 26)
+
+- **`HTTPS_PROXY=http://127.0.0.1:<port>`**: doctl sent `CONNECT api.digitalocean.com:443`. The proxy env var is honoured.
+- **Private CA, intercepting.** Setup:
+  - a temporary P-256 CA and leaf for `api.digitalocean.com`, made with the `openssl` CLI;
+  - a Python TLS stub as the intercepting proxy;
+  - `SSL_CERT_FILE` pointing at the CA plus the system roots.
+
+  Result: doctl failed with `x509: "api.digitalocean.com" certificate is not trusted`, both without and **with**
+  `SSL_CERT_FILE`. Go on macOS uses the system verifier and ignores the env bundle. So CA interception can't be the only route
+  (ADR 0022 adds the agent-driven base-URL route).
+- **Base-URL path handling.** `-u http://127.0.0.1:<port>/tok123/api.digitalocean.com` produced `GET /tok123/v2/account`, so the
+  last segment was dropped. With a trailing `/`, it produced `GET /tok123/api.digitalocean.com/v2/account`. The proxy must route
+  a token-only path to the handle's single bound host.
+
 ## Not yet verified (next spike items)
 
 - AWS CLI and SDKs: re-signing SigV4 through a base-URL override (`AWS_ENDPOINT_URL`), including S3 chunked uploads.
 - Azure CLI, gcloud and Huawei KooCLI: honouring `HTTPS_PROXY` plus a CA bundle passed through env (Mode C).
-- Go binaries on macOS with a private CA (Mode C). This may be unreliable, so Mode R is preferred for Go tools.
+- Go on **Linux** with `SSL_CERT_FILE` (documented as honoured; not yet run).
 - GCP service-account JWT re-signing: needs RSA signing. RSA is not in keygent's allowed crypto set, so it needs an ADR exception.
