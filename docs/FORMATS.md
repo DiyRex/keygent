@@ -119,6 +119,8 @@ As built in Phase 2 (ADR 0015): `mac` and `grant_key` are lower-case hex (64 cha
 bytes. `audit.anchor` lines are `<seq> <hex HMAC(K_audit, enc(seq as u64 LE) ‖ enc(mac))>`. A run writes a `run` record with
 `decision:"start"` before exec (fail closed) and one with `decision:"end"|"limit"|"client_gone"`, `exit`, `redactions`, `dur_ms` after.
 Not built yet: rotation, the 10-min tripwire anchor, the `rekey` epoch record.
+Custody (ADR 0022): an `egress` record per (decision, host, handles) of a run, written before the run's `end` record:
+`{"event":"egress","handles":["do/token"],"decision":"forwarded"|"credential_endpoint_mismatch","host":"api.digitalocean.com","requests":3}`.
 
 ## 6. Hook I/O (Claude Code adapter, per ADR 0001)
 

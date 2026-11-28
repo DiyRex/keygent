@@ -253,6 +253,23 @@ precedence. Lookup stops at the repo root, so vendored repos never inherit your 
 With the Claude Code integration installed you never type `keygent run` yourself. The hook wraps matching commands
 automatically.
 
+**API keys without approval prompts: credential custody** ([ADR 0022](docs/adr/0022-credential-custody-multi-cloud.md)).
+For an HTTP API key, the command never gets the real value. It gets a **dummy** with the same shape, and keygent's local
+proxy puts the real value in only on requests to a host you approved for that key. So the agent can run any tool, any number
+of times, with no prompt, and a hostile agent still can't get the key: printing it, dumping the environment or pointing the
+tool at another server only ever reveals the dummy.
+
+```sh
+keygent add do/token --description "DigitalOcean API token"     # custody is on by default for single-line values
+keygent edit do/token --allow-host api.digitalocean.com          # approve the host once (passphrase)
+keygent run -- 'DIGITALOCEAN_ACCESS_TOKEN={{keygent:do/token}} \
+  doctl -u "$KEYGENT_PROXY_URL/api.digitalocean.com/" compute droplet list'   # single quotes: expanded inside the run
+```
+
+The agent points the tool's API base URL at `$KEYGENT_PROXY_URL/<host>/` (most CLIs and SDKs have a flag or variable for it).
+A tool that skips the proxy just sends the dummy and gets "unauthorized", so nothing leaks. Every proxied request is audited.
+Values that aren't HTTP API keys (database passwords, SSH keys, multi-line files) use `--no-custody` and the normal approval.
+
 ### 4. Capture a newly minted secret
 
 For commands that **produce** a credential:
