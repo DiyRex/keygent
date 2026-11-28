@@ -93,7 +93,7 @@ See SPEC §14.
 - [ ] `audit export|verify --archive`, `backup --with-audit`; alerts; console Audit page
 
 **Release** ([ADR 0017](adr/0017-release-pipeline-and-updates.md))
-- [ ] GoReleaser config + manual-only `release.yml` (snapshot/release), formula generator — branch `build/goreleaser`, verified with a local snapshot
+- [x] GoReleaser config + manual-only `release.yml` (snapshot/release), formula generator — merged in #10, verified with a local snapshot
 - [ ] Public tap `DiyRex/homebrew-tap` + `HOMEBREW_TAP_TOKEN` (owner)
 - [ ] Windows targets once `src/platform` builds there
 

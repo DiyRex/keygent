@@ -18,8 +18,8 @@ Start here: [`docs/diagrams/01-system-architecture.excalidraw`](docs/diagrams/) 
 
 ## Current status
 
-**Pre-alpha.** Phases 0–2 (design, vault core, broker + `run`) are built and under review on development branches;
-`main` carries the design docs, installers and a placeholder binary until each phase is reviewed and merged.
+**Pre-alpha.** Phases 0–2 (design, vault core, broker + `run`) are merged into `main`. Phase 2's leak harness (M5) and the
+Windows platform layer are still open; no release has been cut yet.
 Progress is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Working rules
