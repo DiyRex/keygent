@@ -79,6 +79,10 @@ See SPEC §14.
   `{{keygent:<handle>}}` in its command; the broker shows the exact command and programs, the human approves, only that child gets the
   value. Allow rules stay an optional shortcut for repeated commands. Instead: `keygent ls` lists each handle's description so the
   agent can find it from the user's words
+- [ ] C1–C5 **Dynamic credential custody** ([ADR 0022](adr/0022-credential-custody-multi-cloud.md)): C1 proxy core + base-URL
+  route + header swap + learned hosts · C2 `HTTPS_PROXY` route + per-run CA · C3 SigV4 re-sign · C4 token-request custody ·
+  C5 Huawei/SharedKey re-sign (GCP deferred: RSA)
+- [ ] L1–L4 Approval leases for non-HTTP / `--no-custody` secrets ([ADR 0021](adr/0021-approval-leases.md))
 - [ ] S2 Claude Code `PreToolUse` hook rewrites to `keygent run --grant <id>` (contract verified per ADR 0001)
 - [ ] S3 Native Touch ID approval on macOS (LAContext, broker-rendered text)
 - [ ] S4 Web console: loopback random port, passkeys (Touch ID / Windows Hello), write-only value entry, gated reveal, approvals (ADR 0005 amendment)

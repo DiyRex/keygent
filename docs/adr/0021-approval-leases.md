@@ -1,6 +1,7 @@
 # ADR 0021 — Approval leases: approve a secret + program once for a while, not every command
 
-- **Status:** proposed
+- **Status:** proposed — scope narrowed by [ADR 0022](0022-credential-custody-multi-cloud.md): leases cover non-HTTP secrets
+  (databases, SSH) and `--no-custody` handles; HTTP API keys use custody instead
 - **Date:** 2026-11-28
 - **Verified against:** keygent `main` @ c0c56e2: allow-rule matcher and `never_wildcard` (`policy/allow.rs`), grant build
   (`broker/grant.rs`), scratch HOME (`run.rs`). doctl source `commands/doit.go` @ `424f37f` (2026-11-28): global flags
