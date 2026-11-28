@@ -99,6 +99,10 @@ for a provider.
 - **Residual: local proxy use.** Same-user code can reach the run's proxy while the run lives. The run token in the path and a
   random port narrow this. This is T3 per ADR 0016 §9.
 - **Residual: hostile approved host.** Prompts show the exact host. Wildcards are explicit and flagged.
+- **Residual: reflection on an approved host.** An approved host that echoes a request header back (e.g. a debug endpoint)
+  could return the swapped value. Every response passes the redactor, which knows the value (ADR 0016 §6), so the child sees
+  the dummy again. The proxy fails closed if redaction of a response fails. Swapping is limited to header values where the
+  dummy appears **whole**, never a substring of a longer token.
 
 ## Consequences
 
