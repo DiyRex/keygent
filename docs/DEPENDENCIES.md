@@ -10,6 +10,7 @@ is not enough**. Budget: total binary ≤ 2 MB (target 1.5 MB).
 | `hkdf` / `hmac` / `sha2` | 0.13 / 0.13 / 0.11 | in crypto set | key separation, header MAC; mandated | Phase 1 |
 | `zeroize` / `getrandom` | 1.9 / 0.4 | in crypto set | memory hygiene, OS RNG; mandated | Phase 1 |
 | `libc` | 0.2 (unix only) | ~2 KB | termios, poll, statfs, getpwuid_r, fcntl; std has no API for these | Phase 1 |
+| `rustls` / `webpki-roots` | 0.23 (`ring`, `std`, `tls12`) / 1 | +681,856 B standalone ([spike 05](spikes/05-egress-custody.md)); in-binary size recorded when wired (custody C1d) | TLS client for the custody proxy: the broker must dial the real API itself (ADR 0022); std has no TLS. `ring` provider (no C toolchain beyond `cc`), no `aws-lc` | Custody C1b |
 | ~~`objc2` + `objc2-foundation`~~ | removed in Phase 2 | — | `objc2` always links Foundation (+AppKit for the pasteboard): every keygent process idled at 8.7 MB RSS (plain Rust: 1.4 MB). Replaced by `dlopen`/`dlsym` of libobjc + AppKit inside `reveal --copy` only (raw `objc_msgSend` fallback named above) | Phase 1 → removed Phase 2 |
 
 **Phase 1 release sizes:** aarch64-apple-darwin 586 096 B · x86_64-unknown-linux-musl 822 904 B · aarch64-unknown-linux-musl 724 128 B

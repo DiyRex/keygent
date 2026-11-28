@@ -11,3 +11,6 @@ Embedded data:
   Source: https://www.eff.org/dice
 - assets/common10k.txt: 10k most common passwords from SecLists, (c) Daniel Miessler and contributors,
   MIT License. Source: https://github.com/danielmiessler/SecLists (lower-cased and de-duplicated).
+- Mozilla CA root certificates via the webpki-roots crate (used by the custody proxy to verify API hosts),
+  licensed under the Community Data License Agreement – Permissive, Version 2.0
+  (https://cdla.dev/permissive-2-0/). Source: https://github.com/rustls/webpki-roots
