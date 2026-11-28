@@ -105,7 +105,12 @@ All items below are tagged **`known-gap`** in the leak suite: the test asserts t
    before launching it.
 3. **(T2, alongside gap 1) File bindings** exist as plaintext (memfd on Linux, owner-only temp file on macOS and Windows) for the run's lifetime.
 4. **Rollback** of the vault and the keystore tripwire together.
-5. **Verify-then-exec TOCTOU** for pinned binaries on macOS and Windows (Linux uses `fexecve`).
+5. **(T2) Verify-then-exec TOCTOU** for pinned binaries on macOS and Windows. Linux hashes and execs the same open fd
+   (`/dev/fd/N`), so there is no window. On macOS the broker re-hashes the pinned program right before exec
+   (`broker/run.rs` `prepare`, then `base_command` execs **by path**). A same-user process that swaps the file in that
+   window runs unpinned code with the secret. Fix candidates: `posix_spawn` from a private copy, or an
+   `O_EXLOCK` / immutable-flag check. Windows: same pattern, revisit with the Windows platform layer.
 6. **Swap exposure** of non-secret-arena broker heap on macOS and Windows (encrypted swap recommended).
 7. **macOS containment** is best effort. The env-tag sweep alone misses Apple-binary survivors on macOS 26; session-id sweep proposed in [ADR 0009](adr/0009-macos-session-sweep.md).
 8. **Approved commands** can leak through transformations or exit codes (T2, by design the human's call). The approval prompt shows the exact command.
+   The leak suite asserts two forms: the value reversed, and halves written to stdout and stderr (`tests/leak.rs`, `known-gap`).
