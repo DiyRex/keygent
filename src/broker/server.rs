@@ -211,6 +211,7 @@ fn list(shared: &Shared, s: &mut UnixStream) {
                 binding: r.binding as u8,
                 exposed: r.exposed,
                 description: r.description.clone(),
+                custody: r.custody,
             })
             .collect::<Vec<ListEntry>>()
     }) else {

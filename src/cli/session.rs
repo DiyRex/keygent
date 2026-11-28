@@ -228,6 +228,8 @@ pub fn ls(a: Args) -> Result<()> {
         let mut line = format!("{}  ${}  {}", e.handle, e.env_name, mode.name());
         if e.binding == 1 {
             line.push_str("  file");
+        } else if e.custody {
+            line.push_str("  custody");
         }
         if e.exposed {
             line.push_str("  EXPOSED — rotate it");

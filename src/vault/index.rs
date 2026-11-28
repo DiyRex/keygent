@@ -122,6 +122,9 @@ pub struct HandleRec {
     pub argv: Argv,
     pub config_seen: Vec<ConfigSeen>,
     pub previous_value: Option<Secret>,
+    /// Credential custody (ADR 0022): runs get a dummy and the broker proxy instead of the value. Only effective for
+    /// single-line env-bound values; others always use approval.
+    pub custody: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -336,6 +339,7 @@ fn enc_handle(e: &mut Encoder, h: &HandleRec) -> std::result::Result<(), TlvErro
     if let Some(p) = &h.previous_value {
         e.bytes(th::PREVIOUS_VALUE, p.expose())?;
     }
+    e.bool(th::CUSTODY, h.custody)?;
     Ok(())
 }
 
@@ -458,6 +462,11 @@ fn decode_handle(d: &mut Decoder<'_>) -> std::result::Result<HandleRec, TlvError
         });
     }
     let previous_value = d.opt(th::PREVIOUS_VALUE)?.map(Secret::from_slice);
+    // optional and last (tags ascend); absent in vaults written before ADR 0022 means on
+    let custody = match d.opt(th::CUSTODY)? {
+        Some(v) => d.as_bool(th::CUSTODY, v)?,
+        None => true,
+    };
     if previous_value.is_some() != previous_version_until.is_some() {
         return Err(TlvError::Shape(th::PREVIOUS_VALUE));
     }
@@ -478,6 +487,7 @@ fn decode_handle(d: &mut Decoder<'_>) -> std::result::Result<HandleRec, TlvError
         argv,
         config_seen,
         previous_value,
+        custody,
     })
 }
 
@@ -630,6 +640,7 @@ pub fn new_handle(
         argv: Argv::Deny,
         config_seen: Vec::new(),
         previous_value: None,
+        custody: true,
     }
 }
 

@@ -538,11 +538,14 @@ fn unseal_status_ls_seal() {
     );
     let (code, out, err) = run(&root, &["ls"], &[]);
     assert_eq!(code, 0, "{err}");
-    assert_eq!(out, "a/b  $A_B  approve\n");
+    assert_eq!(out, "a/b  $A_B  approve  custody\n");
     // a CLI write while unsealed is picked up by the broker (ADR 0012 reload)
     assert_eq!(add(&root, "c/d", &canary()).0, 0);
     let (_, out, _) = run(&root, &["ls"], &[]);
-    assert_eq!(out, "a/b  $A_B  approve\nc/d  $C_D  approve\n");
+    assert_eq!(
+        out,
+        "a/b  $A_B  approve  custody\nc/d  $C_D  approve  custody\n"
+    );
     // the description is listed so an agent can find a handle from the user's words
     let (code, _, err) = run(
         &root,
@@ -558,7 +561,18 @@ fn unseal_status_ls_seal() {
     let (_, out, _) = run(&root, &["ls"], &[]);
     assert_eq!(
         out,
-        "a/b  $A_B  approve\nc/d  $C_D  approve  — DigitalOcean API token (personal)\n"
+        "a/b  $A_B  approve  custody\nc/d  $C_D  approve  custody  — DigitalOcean API token (personal)\n"
+    );
+    // custody is on by default (ADR 0022); `add --no-custody` and `edit --custody off` turn it off
+    let (code, _, err) = run(&root, &["add", "e/f", "--no-custody"], &[PASS, &canary()]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = run(&root, &["edit", "a/b", "--custody", "off"], &[PASS, "y"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("custody:     on → off"), "{err}");
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        out,
+        "a/b  $A_B  approve\nc/d  $C_D  approve  custody  — DigitalOcean API token (personal)\ne/f  $E_F  approve\n"
     );
     // runtime files are owner-only; the broker log never contains the value
     use std::os::unix::fs::PermissionsExt;

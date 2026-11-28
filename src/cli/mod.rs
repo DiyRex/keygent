@@ -33,11 +33,11 @@ Project:  trust · untrust   (.keygent.toml: version = 1, then [secrets] entries
 Audit:    audit [--since 1h] [--verify]
 Vault:    init [--own-passphrase] · passwd [--own-passphrase] · rekey · recover [--own-passphrase]
           verify · backup <file> · restore <file> [--new-machine] [--own-passphrase] · status
-Secrets:  add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]
+Secrets:  add <handle> [--env NAME] [--description TEXT] [--no-custody] [--multiline | --from-file PATH [--delete]]
           rotate <handle> [--undo | --multiline | --from-file PATH [--delete]]
           rm <handle> · rename <old> <new> · ls · reveal <handle>
           edit <handle> [--env NAME] [--description TEXT] [--mode allow|confirm|approve|deny]
-                        [--binding env|file] [--argv deny|allow]
+                        [--binding env|file] [--argv deny|allow] [--custody on|off]
           edit --settings [--ttl-max SECS] [--idle SECS] [--run-max-minutes N] [--remember on|off]
                           [--default-mode MODE]
           import <.env file> [--overwrite] [--delete]
@@ -208,8 +208,9 @@ fn run(argv: &[String]) -> Result<()> {
                 ("--multiline", false),
                 ("--from-file", true),
                 ("--delete", false),
+                ("--no-custody", false),
             ],
-            "keygent add <handle> [--env NAME] [--description TEXT] [--multiline | --from-file PATH [--delete]]",
+            "keygent add <handle> [--env N] [--description T] [--no-custody] [--multiline | --from-file P [--delete]]",
         )?),
         "rotate" => cmds::rotate(Args::parse(
             &rest,
@@ -238,6 +239,7 @@ fn run(argv: &[String]) -> Result<()> {
                 ("--mode", true),
                 ("--binding", true),
                 ("--argv", true),
+                ("--custody", true),
                 ("--settings", false),
                 ("--ttl-max", true),
                 ("--idle", true),
