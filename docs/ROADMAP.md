@@ -75,7 +75,14 @@ See SPEC §14.
 ## Owner-requested tracks (2026-11-28, proposed — each lands as its own small PR, verified before the next)
 
 **DO token slice** ("make a DO droplet" without the token in chat)
-- [ ] S1 Tool binding: `keygent edit <h> --tool doctl` pins the program; the broker injects the handle's env name; e2e with a fake tool
+- [x] S1 ~~Tool binding~~ **dropped (owner decision 2026-11-28):** keygent stays tool-agnostic. The agent picks any tool and writes
+  `{{keygent:<handle>}}` in its command; the broker shows the exact command and programs, the human approves, only that child gets the
+  value. Allow rules stay an optional shortcut for repeated commands. Instead: `keygent ls` lists each handle's description so the
+  agent can find it from the user's words
+- [ ] C1–C5 **Dynamic credential custody** ([ADR 0022](adr/0022-credential-custody-multi-cloud.md)): C1 proxy core + base-URL
+  route + header swap + learned hosts · C2 `HTTPS_PROXY` route + per-run CA · C3 SigV4 re-sign · C4 token-request custody ·
+  C5 Huawei/SharedKey re-sign (GCP deferred: RSA)
+- [ ] L1–L4 Approval leases for non-HTTP / `--no-custody` secrets ([ADR 0021](adr/0021-approval-leases.md))
 - [ ] S2 Claude Code `PreToolUse` hook rewrites to `keygent run --grant <id>` (contract verified per ADR 0001)
 - [ ] S3 Native Touch ID approval on macOS (LAContext, broker-rendered text)
 - [ ] S4 Web console: loopback random port, passkeys (Touch ID / Windows Hello), write-only value entry, gated reveal, approvals (ADR 0005 amendment)

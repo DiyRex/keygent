@@ -232,6 +232,11 @@ pub fn ls(a: Args) -> Result<()> {
         if e.exposed {
             line.push_str("  EXPOSED — rotate it");
         }
+        // the human's description lets an agent pick the handle from plain words ("my DO token"); metadata only
+        if !e.description.is_empty() {
+            line.push_str("  — ");
+            line.push_str(&e.description);
+        }
         out.push_str(&line);
         out.push('\n');
     }
