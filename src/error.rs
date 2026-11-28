@@ -94,6 +94,8 @@ pub enum Error {
     Io(i32),
     /// Internal invariant failure (crypto/RNG). The code identifies the site.
     Internal(u16),
+    /// `integrate claude`: the existing settings file isn't valid JSON (it is left untouched).
+    BadSettings,
 }
 
 impl Error {
@@ -196,6 +198,7 @@ impl fmt::Display for Error {
             Error::BadManifest(0) => f.write_str("keygent: .keygent.toml is too large or not UTF-8 (max 64 KiB)"),
             Error::BadManifest(n) => write!(f, "keygent: .keygent.toml line {n} is not valid — only version and [secrets] entries"),
             Error::AuditUnwritable => f.write_str("keygent: audit log unwritable — run 'keygent doctor'"),
+            Error::BadSettings => f.write_str("keygent: ~/.claude/settings.json isn't valid JSON — fix it, then run 'keygent integrate claude'"),
             Error::AuditBroken(0) => {
                 f.write_str("keygent: audit log truncated or its anchor doesn't match — run 'keygent doctor'")
             }
@@ -299,6 +302,7 @@ mod tests {
             Error::NoPending,
             Error::AmbiguousPending,
             Error::AuditUnwritable,
+            Error::BadSettings,
             Error::AuditBroken(0),
             Error::AuditBroken(u64::MAX),
             Error::Io(28),

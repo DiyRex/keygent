@@ -86,7 +86,7 @@ See SPEC §14.
   - [ ] C2 `HTTPS_PROXY` route + per-run CA · C3 SigV4 re-sign · C4 token-request custody · C5 Huawei/SharedKey re-sign
     (GCP deferred: RSA). Size budget: x86_64-musl has 45 KB left — decide before C2
 - [ ] L1–L4 Approval leases for non-HTTP / `--no-custody` secrets ([ADR 0021](adr/0021-approval-leases.md))
-- [ ] S2 Claude Code `PreToolUse` hook rewrites to `keygent run --grant <id>` (contract verified per ADR 0001)
+- [x] S2 Claude Code `PreToolUse` hook — `hook pre` + `integrate claude [--remove]`, contract re-verified on 2.1.332 by real runs (ADR 0001), co-installed Bash rewriters (lean-ctx) chained behind keygent (ADR 0002); other Phase 3 hooks remain
 - [ ] S3 Native Touch ID approval on macOS (LAContext, broker-rendered text)
 - [ ] S4 Web console: loopback random port, passkeys (Touch ID / Windows Hello), write-only value entry, gated reveal, approvals (ADR 0005 amendment)
 

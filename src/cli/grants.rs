@@ -86,24 +86,14 @@ fn run_inner(a: &Args, words: &[String], capture: Option<&String>) -> Result<()>
                 None => None,
             };
             let cwd = std::env::current_dir()?;
-            let req = GrantCreate {
-                cmd: words.join(" "),
-                cwd: cwd
-                    .to_str()
-                    .ok_or(Error::Policy(PolicyMsg::BadCwd))?
-                    .to_owned(),
+            let cwd = cwd.to_str().ok_or(Error::Policy(PolicyMsg::BadCwd))?;
+            let (id, state) = create_grant(
+                &d,
+                &words.join(" "),
+                cwd,
                 max_runtime_secs,
-                capture: capture.cloned(),
-            }
-            .encode()
-            .map_err(|_| Error::TooLarge("64 KiB command"))?;
-            let mut c = client::connect(&d, Class::Run)?;
-            let f = c.request(ty::GRANT_CREATE, &req)?;
-            if f.ty != ty::GRANT_CREATED {
-                return Err(Error::BrokerUnverified);
-            }
-            let (id, state) =
-                msg::decode_grant(&f.payload, true).map_err(|_| Error::BrokerUnverified)?;
+                capture.cloned(),
+            )?;
             if state == gstate::PENDING {
                 let _ = writeln!(std::io::stderr(), "{WAITING}");
             }
@@ -120,6 +110,30 @@ fn run_inner(a: &Args, words: &[String], capture: Option<&String>) -> Result<()>
     }
     drop(c);
     stream(&d, &id)
+}
+
+/// Ask the broker to build a grant for `cmd` run in `cwd`; returns its id and state (approved or pending).
+pub(super) fn create_grant(
+    d: &platform::Dirs,
+    cmd: &str,
+    cwd: &str,
+    max_runtime_secs: Option<u64>,
+    capture: Option<String>,
+) -> Result<([u8; GRANT_ID_LEN], u8)> {
+    let req = GrantCreate {
+        cmd: cmd.to_owned(),
+        cwd: cwd.to_owned(),
+        max_runtime_secs,
+        capture,
+    }
+    .encode()
+    .map_err(|_| Error::TooLarge("64 KiB command"))?;
+    let mut c = client::connect(d, Class::Run)?;
+    let f = c.request(ty::GRANT_CREATE, &req)?;
+    if f.ty != ty::GRANT_CREATED {
+        return Err(Error::BrokerUnverified);
+    }
+    msg::decode_grant(&f.payload, true).map_err(|_| Error::BrokerUnverified)
 }
 
 /// `Run{id}`: copy STDOUT/STDERR frames out, forward interrupts, exit with the child's code.
