@@ -546,10 +546,6 @@ fn client_environment_is_ignored() {
     std::fs::create_dir_all(&evil).unwrap();
     let fake = evil.join("sh");
     std::fs::write(&fake, "#!/bin/sh\necho EVIL_SHELL \"$X\"\n").unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(
-        &mut std::fs::metadata(&fake).unwrap().permissions(),
-        0o755,
-    );
     Command::new("chmod")
         .args(["755"])
         .arg(&fake)
