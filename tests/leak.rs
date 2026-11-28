@@ -18,7 +18,8 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    reason = "tests: a panic is the failure report"
+    clippy::print_stderr,
+    reason = "tests: a panic is the failure report; skipped cases are reported on stderr"
 )]
 
 mod common;

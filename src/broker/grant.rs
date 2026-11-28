@@ -788,6 +788,7 @@ pub fn find<'a>(grants: &'a mut [Grant], id: &[u8]) -> Option<&'a mut Grant> {
 mod tests {
     #![allow(
         clippy::unwrap_used,
+        clippy::expect_used,
         clippy::indexing_slicing,
         reason = "tests: a panic is the failure report"
     )]
