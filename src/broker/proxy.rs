@@ -59,6 +59,9 @@ impl<T: Read + Write + Send> Upstream for T {}
 
 pub type Connect = dyn Fn(&str) -> io::Result<Box<dyn Upstream>> + Send + Sync;
 pub type Report = dyn Fn(Outcome) + Send + Sync;
+/// Live host check (ADR 0022 §3, step C1c): `true` if the human has approved `host` for `handle` by now; otherwise
+/// the broker queues an "allow handle → host?" request for `keygent approve` and returns `false`.
+pub type Check = dyn Fn(&str, &str) -> bool + Send + Sync;
 
 /// A running proxy; stops (and joins its accept thread) on drop.
 pub struct Proxy {
@@ -92,7 +95,28 @@ struct Ctx {
     redactor: Arc<Redactor>,
     connect: Arc<Connect>,
     report: Arc<Report>,
+    check: Option<Arc<Check>>,
+    /// (handle, host) pairs approved while this run was live.
+    learned: std::sync::Mutex<Vec<(String, String)>>,
     active: std::sync::atomic::AtomicUsize,
+}
+
+impl Ctx {
+    /// May `c`'s value go to `host`? Approved when the run started, approved since, or (live check) approved now.
+    fn allowed(&self, c: &Cred, host: &str) -> bool {
+        if c.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            return true;
+        }
+        let mut learned = super::lock(&self.learned);
+        if learned.iter().any(|(h, x)| *h == c.handle && x == host) {
+            return true;
+        }
+        let ok = self.check.as_ref().is_some_and(|f| f(&c.handle, host));
+        if ok {
+            learned.push((c.handle.clone(), host.to_owned()));
+        }
+        ok
+    }
 }
 
 /// Start a proxy for one run. `token` is random per run (hex); `connect` dials `https://<host>:443`.
@@ -102,6 +126,7 @@ pub fn start(
     redactor: Arc<Redactor>,
     connect: Arc<Connect>,
     report: Arc<Report>,
+    check: Option<Arc<Check>>,
 ) -> io::Result<Proxy> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -112,6 +137,8 @@ pub fn start(
         redactor,
         connect,
         report,
+        check,
+        learned: std::sync::Mutex::new(Vec::new()),
         active: std::sync::atomic::AtomicUsize::new(0),
     });
     let st = stop.clone();
@@ -180,7 +207,7 @@ fn handle(ctx: &Ctx, client: &mut TcpStream) -> Result<(), Fail> {
     let req = parse_head(&head).ok_or_else(|| fail("400 Bad Request", "bad request head"))?;
     let (host, path) =
         route(&req.target, &ctx.token, &ctx.creds).map_err(|m| fail("404 Not Found", m))?;
-    let (out_head, used) = build_head(&req, &host, &path, &ctx.creds)?;
+    let (out_head, used) = build_head(&req, &host, &path, ctx)?;
     let mut up =
         (ctx.connect)(&host).map_err(|_| fail("502 Bad Gateway", "upstream unreachable"))?;
     up.write_all(&out_head)
@@ -384,6 +411,11 @@ fn route(target: &str, token: &str, creds: &[Cred]) -> Result<(String, String), 
             let path = after.get(seg.len()..).unwrap_or_default();
             return Ok(((*h).to_owned(), normalize_path(path)));
         }
+        // a host nobody approved yet: route to it; a dummy toward it is refused until the human approves (C1c)
+        if crate::vault::names::valid_host(seg) && seg.contains('.') {
+            let path = after.get(seg.len()..).unwrap_or_default();
+            return Ok((seg.to_owned(), normalize_path(path)));
+        }
     }
     match hosts.as_slice() {
         [only] => Ok(((*only).to_owned(), normalize_path(rest))),
@@ -422,7 +454,7 @@ fn build_head(
     req: &Request,
     host: &str,
     path: &str,
-    creds: &[Cred],
+    ctx: &Ctx,
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<String>), Fail> {
     let mut out = Zeroizing::new(Vec::with_capacity(1024));
     out.extend_from_slice(format!("{} {path} HTTP/1.1\r\nHost: {host}\r\n", req.method).as_bytes());
@@ -431,7 +463,7 @@ fn build_head(
         if HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             continue;
         }
-        let swapped = swap_header(name, value, host, creds, &mut used)?;
+        let swapped = swap_header(name, value, host, ctx, &mut used)?;
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(&swapped);
@@ -445,7 +477,7 @@ fn swap_header(
     name: &str,
     value: &[u8],
     host: &str,
-    creds: &[Cred],
+    ctx: &Ctx,
     used: &mut Vec<String>,
 ) -> Result<Zeroizing<Vec<u8>>, Fail> {
     if name.eq_ignore_ascii_case("authorization")
@@ -453,14 +485,14 @@ fn swap_header(
         && let Some(decoded) = b64_decode(b64.trim_ascii())
     {
         let decoded = Zeroizing::new(decoded);
-        let inner = swap_bytes(&decoded, host, creds, used)?;
+        let inner = swap_bytes(&decoded, host, ctx, used)?;
         if inner.as_slice() != decoded.as_slice() {
             let mut v = Zeroizing::new(b"Basic ".to_vec());
             v.extend_from_slice(&b64_encode(&inner));
             return Ok(v);
         }
     }
-    swap_bytes(value, host, creds, used)
+    swap_bytes(value, host, ctx, used)
 }
 
 fn token_byte(b: u8) -> bool {
@@ -471,11 +503,11 @@ fn token_byte(b: u8) -> bool {
 fn swap_bytes(
     v: &[u8],
     host: &str,
-    creds: &[Cred],
+    ctx: &Ctx,
     used: &mut Vec<String>,
 ) -> Result<Zeroizing<Vec<u8>>, Fail> {
     let mut out = Zeroizing::new(v.to_vec());
-    for c in creds {
+    for c in &ctx.creds {
         let d = c.dummy.as_slice();
         if d.is_empty() {
             continue;
@@ -493,10 +525,10 @@ fn swap_bytes(
                         .is_some_and(token_byte))
                 && !out.get(end).copied().is_some_and(token_byte);
             if whole {
-                if !c.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                if !ctx.allowed(c, host) {
                     return Err((
                         "403 Forbidden",
-                        "this secret is not approved for that host",
+                        "this secret is not approved for that host — ask the user to run 'keygent approve', then retry",
                         Some(Outcome::Refused {
                             reason: "credential_endpoint_mismatch",
                             handle: Some(c.handle.clone()),

@@ -82,7 +82,7 @@ See SPEC §14.
 - [ ] C1–C5 **Dynamic credential custody** ([ADR 0022](adr/0022-credential-custody-multi-cloud.md)):
   - [x] C1a custody flag + format-preserving dummies · C1b proxy core (base-URL route, header swap, host checks, response
     redaction) · C1d wired into runs (no prompt for custody-only commands, `edit --allow-host`, egress audit, e2e with curl)
-  - [ ] C1c learned hosts (hold the request and ask "allow handle → host?" instead of `--allow-host` up front)
+  - [x] C1c learned hosts: first use of a new host gets 403 + a queued "allow handle → host?" (`pending`/`approve`); retry works
   - [ ] C2 `HTTPS_PROXY` route + per-run CA · C3 SigV4 re-sign · C4 token-request custody · C5 Huawei/SharedKey re-sign
     (GCP deferred: RSA). Size budget: x86_64-musl has 45 KB left — decide before C2
 - [ ] L1–L4 Approval leases for non-HTTP / `--no-custody` secrets ([ADR 0021](adr/0021-approval-leases.md))

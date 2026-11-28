@@ -86,7 +86,7 @@ fn bad_request(s: &mut UnixStream) {
     );
 }
 
-fn handle(shared: &Shared, mut s: UnixStream) {
+fn handle(shared: &Arc<Shared>, mut s: UnixStream) {
     let _ = s.set_read_timeout(Some(FIRST_FRAME));
     let _ = s.set_write_timeout(Some(IDLE));
     let Ok(f) = frame::read(&mut s) else { return };
@@ -469,6 +469,29 @@ fn approve(shared: &Shared, s: &mut UnixStream, payload: &[u8], nb: &[u8], nc: &
         if a.remember && g.unbound {
             return Err(Error::Policy(PolicyMsg::NoRemember));
         }
+        // a host approval stores the host for the handle (audited vault write); it is never run (ADR 0022 C1c)
+        if let Some(host) = g.host.clone() {
+            let handle = g.handles.first().cloned().ok_or(Error::Internal(154))?;
+            let mut rec = crate::vault::audit::Record::new("host_allow");
+            rec.handles = vec![handle.clone()];
+            rec.host = Some(host.clone());
+            rec.decision = Some("approved");
+            rec.channel = Some("terminal");
+            shared.write_vault(st, &rec, |v| {
+                let r = v
+                    .index
+                    .get_mut(&handle)
+                    .ok_or_else(|| Error::NotFound(handle.clone()))?;
+                if !r.hosts.contains(&host) {
+                    r.hosts.push(host.clone());
+                }
+                Ok(crate::vault::Prev::Keep)
+            })?;
+            if let Some(g) = st.grants.get_mut(pos) {
+                g.state = GState::Consumed;
+            }
+            return Ok(());
+        }
         let mut rec = st.grant_record(g, "approve", "approved");
         rec.channel = Some("terminal");
         st.audit(&shared.dirs, &rec)?;
@@ -619,8 +642,28 @@ pub fn store_capture(shared: &Shared, h: &str, value: &crate::crypto::Secret) ->
     r.unwrap_or(Err(Error::Sealed))
 }
 
+/// The custody proxy's live host check (ADR 0022 C1c): approved now, or queue "allow handle → host?" and say no.
+pub fn check_host(shared: &Shared, handle: &str, host: &str) -> bool {
+    with_state(shared, |st| {
+        if st
+            .vault
+            .index
+            .get(handle)
+            .is_some_and(|r| r.custody && r.hosts.iter().any(|h| h == host))
+        {
+            return true;
+        }
+        if let Ok(g) = grant::host_request(handle, host) {
+            // a full queue just means the request isn't recorded this time; the answer is still "no"
+            let _ = grant::insert(&mut st.grants, g);
+        }
+        false
+    })
+    .unwrap_or(false)
+}
+
 /// `Run{grant_id}`: consume an approved grant and execute the command stored in it.
-fn run_grant(shared: &Shared, mut s: UnixStream, payload: &[u8]) {
+fn run_grant(shared: &Arc<Shared>, mut s: UnixStream, payload: &[u8]) {
     let Ok((id, _)) = msg::decode_grant(payload, false) else {
         return bad_request(&mut s);
     };

@@ -717,7 +717,7 @@ fn report(
 }
 
 /// Run `job` and stream it to `s`. Consumes the connection.
-pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
+pub fn execute(shared: &Arc<Shared>, mut s: UnixStream, mut job: Job) {
     // ADR 0022: custody values live in this run's proxy, never in the child
     let egress: Arc<Mutex<Vec<super::proxy::Outcome>>> = Arc::default();
     let proxy = if job.custody.is_empty() {
@@ -816,7 +816,7 @@ pub fn execute(shared: &Shared, mut s: UnixStream, mut job: Job) {
 
 /// Start this run's custody proxy; the credentials move out of the job into it.
 fn start_proxy(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     job: &mut Job,
     egress: &Arc<Mutex<Vec<super::proxy::Outcome>>>,
 ) -> Result<super::proxy::Proxy, Error> {
@@ -824,12 +824,16 @@ fn start_proxy(
     let connect = super::proxy::connector(&shared.dirs.state).map_err(|_| Error::Internal(152))?;
     let sink = egress.clone();
     let report: Arc<super::proxy::Report> = Arc::new(move |o| super::lock(&sink).push(o));
+    let sh = shared.clone();
+    let check: Arc<super::proxy::Check> =
+        Arc::new(move |handle: &str, host: &str| super::server::check_host(&sh, handle, host));
     super::proxy::start(
         token,
         std::mem::take(&mut job.custody),
         job.redactor.clone(),
         connect,
         report,
+        Some(check),
     )
     .map_err(|_| Error::Internal(153))
 }

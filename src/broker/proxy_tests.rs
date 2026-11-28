@@ -87,6 +87,10 @@ struct Run {
 }
 
 fn run(creds: Vec<Cred>, up: SocketAddr) -> Run {
+    run_with(creds, up, None)
+}
+
+fn run_with(creds: Vec<Cred>, up: SocketAddr, check: Option<Arc<Check>>) -> Run {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let dialed = Arc::new(Mutex::new(Vec::new()));
     let o = outcomes.clone();
@@ -97,7 +101,7 @@ fn run(creds: Vec<Cred>, up: SocketAddr) -> Run {
         Ok(Box::new(TcpStream::connect(up)?))
     });
     let report: Arc<Report> = Arc::new(move |x| o.lock().unwrap().push(x));
-    let proxy = start(TOKEN.into(), creds, redactor, connect, report).unwrap();
+    let proxy = start(TOKEN.into(), creds, redactor, connect, report, check).unwrap();
     Run {
         proxy,
         outcomes,
@@ -418,4 +422,41 @@ fn concurrent_connections_are_capped() {
     let n = extra.read(&mut b).unwrap_or(0);
     assert_eq!(n, 0, "the connection over the cap is closed");
     drop(idle);
+}
+
+#[test]
+fn unapproved_host_is_refused_until_the_live_check_approves_it() {
+    // C1c: a dummy toward a host nobody approved yet gets 403 and asks the broker; once approved, it goes through
+    let approved = Arc::new(Mutex::new(false));
+    let asked = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let (a, q) = (approved.clone(), asked.clone());
+    let check: Arc<Check> = Arc::new(move |h: &str, x: &str| {
+        q.lock().unwrap().push((h.to_owned(), x.to_owned()));
+        *a.lock().unwrap()
+    });
+    let (up, rx) = upstream("ok");
+    let r = run_with(vec![cred("svc/key", DUMMY, VALUE, &[])], up, Some(check));
+    let req = get(
+        &format!("/{TOKEN}/api.new-host.example/v2/x"),
+        &bearer(DUMMY),
+    );
+    let resp = send(&r, &req);
+    assert!(
+        resp.starts_with("HTTP/1.1 403") && resp.contains("keygent approve"),
+        "{resp}"
+    );
+    assert!(r.dialed.lock().unwrap().is_empty());
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec![("svc/key".to_owned(), "api.new-host.example".to_owned())]
+    );
+    *approved.lock().unwrap() = true;
+    let resp = send(&r, &req);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let got = String::from_utf8(rx.recv().unwrap()).unwrap();
+    assert!(
+        got.starts_with("GET /v2/x HTTP/1.1\r\nHost: api.new-host.example"),
+        "{got}"
+    );
+    assert!(got.contains(&String::from_utf8_lossy(VALUE).to_string()));
 }

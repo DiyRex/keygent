@@ -150,3 +150,28 @@ for a provider.
   - a proxy bypass sends only the dummy;
   - egress audited;
   - host removal stops forwarding.
+
+## As built: C1c (2026-11-28)
+
+- **No blocking.** §3 said the proxy *holds* the first request to a new host. A held request makes tools time out (doctl, SDKs)
+  and the agent sees nothing, so the built behaviour differs:
+  - the proxy answers at once with **403** and `keygent: … ask the user to run 'keygent approve', then retry`;
+  - the broker queues the grant "allow `<handle>` → https://`<host>`" in the normal approval queue (`pending` / `approve` /
+    `deny`, deduplicated, at most 4 pending host requests).
+- **Approval.** `approve` uses the same passphrase proof as commands; the proof binds the grant key, which covers handle and
+  host. It writes the host into the encrypted index through the broker's audited vault write (`host_allow` record). The grant
+  is then consumed and can never be run.
+- **Live check.** During a run the proxy asks the broker on every dummy-bearing request toward an unapproved host, so an
+  approval made mid-run takes effect without restarting the run.
+- **Routing.** An explicit `/<token>/<host>/…` segment is routed to that host even when nobody has approved it, if it is a
+  valid lower-case DNS name with a dot. A dummy toward it is then refused until approval.
+- **Unchanged.** Requests carrying no dummy are forwarded as-is, to public addresses only.
+- **The proxy is a general relay (review note, PR #15).** Explicit host routing means a run's proxy relays to *any* public host.
+  This is not a new capability: the child can already reach the internet directly. SSRF to internal addresses stays blocked
+  by the public-address filter. Only dummy-bearing requests to approved hosts get a real value.
+- **Queue isolation.** Host requests use cwd `/`, which `forbidden_cwd` refuses for commands, so they fill their own bucket
+  (≤ 4, oldest replaced) and can't crowd out command approvals.
+- **Verified:**
+  - `tests/custody.rs::first_use_of_a_new_host_asks_the_human`: the full curl flow on macOS and Linux;
+  - a proxy unit test with a live check;
+  - a mutation (an always-true check) fails the e2e test at step 1.

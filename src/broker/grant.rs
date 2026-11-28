@@ -48,6 +48,43 @@ pub fn policy_snapshot(index: &Index) -> Vec<HandlePolicy> {
         .collect()
 }
 
+/// "allow `handle` → `host`?" for the custody proxy (ADR 0022 §3, step C1c). Queued like a command grant (same
+/// `pending` / `approve` / `deny`, deduplicated by key); approving it stores the host, it is never run.
+pub fn host_request(handle: &str, host: &str) -> Result<Grant> {
+    let key = crypto::sha256(&crypto::enc(&[
+        b"kg/v1/host-allow".as_slice(),
+        handle.as_bytes(),
+        host.as_bytes(),
+    ])?);
+    let rendered = format!(
+        "allow {handle} → https://{host}\n  the custody proxy will add the real value of {handle} to requests for this host\n  \
+         from now on (any tool, no further prompts; ADR 0022). Deny if you don't expect this host.\n  grant key {}",
+        crypto::hex8(&key)
+    );
+    Ok(Grant {
+        direct: None,
+        scratch: false,
+        capture: None,
+        id: crypto::random()?,
+        key,
+        command: format!("allow {handle} → {host}"),
+        rewritten: String::new(),
+        // "/" is never a command's cwd (`forbidden_cwd`), so host requests have their own per-cwd queue bucket (≤ 4)
+        cwd: PathBuf::from("/"),
+        handles: vec![handle.to_owned()],
+        custody: Vec::new(),
+        host: Some(host.to_owned()),
+        bindings: Vec::new(),
+        programs: Vec::new(),
+        scripts: Vec::new(),
+        max_runtime: DEFAULT_RUNTIME,
+        unbound: false,
+        created: Deadline::after(QUEUE_LIFE),
+        state: State::Pending,
+        rendered,
+    })
+}
+
 /// The grant's custody handles, fixed at build time (see [`Grant::custody`]).
 fn custody_handles(snap: &[HandlePolicy], handles: &[String]) -> Vec<String> {
     handles
@@ -103,6 +140,8 @@ pub struct Grant {
     /// Handles that were custody when this grant was built (ADR 0022). The run gives exactly these a dummy, whatever
     /// the live policy says by then, so an approval-free grant can never receive a real value (review fix, PR #14).
     pub custody: Vec<String>,
+    /// A host approval (ADR 0022 C1c), not a command: approving it adds this host to `handles[0]`; it never runs.
+    pub host: Option<String>,
     pub programs: Vec<Program>,
     pub scripts: Vec<Script>,
     pub max_runtime: Duration,
@@ -500,6 +539,7 @@ pub fn build(
         cwd,
         handles,
         custody,
+        host: None,
         bindings,
         programs,
         scripts,
@@ -706,6 +746,7 @@ fn allow_grant(
         cwd: cwd.to_path_buf(),
         handles,
         custody,
+        host: None,
         bindings,
         programs,
         scripts: Vec::new(),

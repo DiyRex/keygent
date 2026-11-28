@@ -32,7 +32,7 @@ fn certs(dir: &Path) {
          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 1 \
            -subj '/CN=keygent test CA' -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign' && \
          openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout leaf.key -out leaf.csr -subj '/CN=localhost' && \
-         printf 'subjectAltName=DNS:localhost\\nextendedKeyUsage=serverAuth\\n' > ext && \
+         printf 'subjectAltName=DNS:localhost,DNS:api.example.test\\nextendedKeyUsage=serverAuth\\n' > ext && \
          openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out leaf.pem -days 1 -extfile ext",
         dir.display()
     );
@@ -267,4 +267,72 @@ fn mixed_commands_need_approval_and_keep_dummies() {
     assert!(err.contains("has control bytes"), "{err}");
     assert_no_plaintext(&root, &c_custody);
     assert_no_plaintext(&root, &c_plain);
+}
+
+/// C1c: no host approved up front. The first call is refused with the next step, the broker queues
+/// "allow do/token → host?", the human approves it with the passphrase, and the retry goes through.
+#[test]
+fn first_use_of_a_new_host_asks_the_human() {
+    if !["openssl", "python3", "curl"].iter().all(|t| have(t)) {
+        eprintln!("skip: needs openssl, python3 and curl");
+        return;
+    }
+    let side = Root::new();
+    certs(&side.0);
+    let (server, port, seen) = api(&side.0);
+    let _server = Killed(server);
+    let root = Root::new();
+    init(&root);
+    let c = canary();
+    assert_eq!(add(&root, "do/token", &c).0, 0);
+    assert_eq!(unseal(&root, &[]).0, 0);
+    std::fs::write(root.0.join("state/test-upstream"), port.to_string()).unwrap();
+    std::fs::copy(
+        side.0.join("ca.pem"),
+        root.0.join("state/test-upstream-ca.pem"),
+    )
+    .unwrap();
+    let proj = root.0.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    let cmd = "T={{keygent:do/token}} sh -c 'curl -s \"$KEYGENT_PROXY_URL/api.example.test/v2/account\" -H \"Authorization: Bearer $T\"'";
+    let go = || {
+        let mut x = common::cmd(&root, &["run", "--", cmd]);
+        x.current_dir(&proj);
+        Session::start_cmd(x).finish()
+    };
+    // 1. refused, nothing sent, the next step named
+    let (code, out, err) = go();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("not approved for that host") && out.contains("keygent approve"),
+        "{out}"
+    );
+    assert!(!seen.exists() || std::fs::read_to_string(&seen).unwrap().is_empty());
+    // 2. the human sees exactly which secret and host
+    let (_, pending, _) = run(&root, &["pending"], &[]);
+    assert!(
+        pending.contains("allow do/token → https://api.example.test"),
+        "{pending}"
+    );
+    approve(&root);
+    let (_, out, _) = run(&root, &["ls"], &[]);
+    assert_eq!(
+        out,
+        "do/token  $DO_TOKEN  approve  custody → api.example.test\n"
+    );
+    // 3. the retry goes through with the real value; the approval is audited
+    let (code, out, err) = go();
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("auth=Bearer ‹keygent:do/token›"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap(),
+        format!("/v2/account Bearer {c}\n")
+    );
+    let audit = std::fs::read_to_string(root.0.join("state/audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"event\":\"host_allow\"")
+            && audit.contains("\"host\":\"api.example.test\""),
+        "{audit}"
+    );
+    assert_no_plaintext(&root, &c);
 }
