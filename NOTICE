@@ -4,3 +4,10 @@ Copyright 2026 DiyRex
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Release archives additionally include third-party license notices for bundled Rust crates.
+
+Embedded data:
+- assets/eff_large.txt: EFF Large Wordlist for Passphrases, (c) Electronic Frontier Foundation,
+  licensed under CC BY 3.0 US (https://creativecommons.org/licenses/by/3.0/us/).
+  Source: https://www.eff.org/dice
+- assets/common10k.txt: 10k most common passwords from SecLists, (c) Daniel Miessler and contributors,
+  MIT License. Source: https://github.com/danielmiessler/SecLists (lower-cased and de-duplicated).

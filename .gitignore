@@ -9,3 +9,4 @@
 .env
 .env.*
 *.kgt
+__pycache__/
