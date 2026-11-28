@@ -10,3 +10,7 @@
 .env.*
 *.kgt
 __pycache__/
+
+# GoReleaser output and generated SBOM
+/dist/
+/sbom/

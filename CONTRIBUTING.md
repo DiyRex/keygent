@@ -91,7 +91,7 @@ Optional: [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) for licens
 
 ## Before you open a pull request
 
-No CI runs on pull requests (CI is release-only), so you run the gate locally and paste the result into the PR:
+No CI runs on pull requests (CI runs only when a maintainer starts it), so you run the gate locally and paste the result into the PR:
 
 ```sh
 scripts/preflight.sh
@@ -109,6 +109,16 @@ As the broker lands on `main`, it also checks the plaintext boundary, where `uns
 your branch.
 
 If you touched platform code, also run the tests on every OS you can reach and list them in the PR.
+
+## Releases (maintainers)
+
+Releases use [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`) through `.github/workflows/release.yml`, which only runs by hand
+([ADR 0017](docs/adr/0017-release-pipeline-and-updates.md)):
+
+- **Snapshot** (any branch): Actions → release → Run workflow → `snapshot`. Binaries land on the run as artifacts; nothing is published.
+  Locally: `goreleaser release --snapshot --clean --skip=sign` (needs `zig` and `cargo-zigbuild`).
+- **Release**: bump `version` in `Cargo.toml` on `main`, tag `vX.Y.Z`, push the tag, then run the workflow from that tag with `release`.
+  It publishes the signed release and updates `Formula/keygent.rb` in [DiyRex/homebrew-tap](https://github.com/DiyRex/homebrew-tap).
 
 ## Branches and commits
 

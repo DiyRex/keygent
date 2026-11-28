@@ -624,11 +624,12 @@ keystore tripwire. Truncation is detected unless the log, the anchor and the tri
   redirect any path.
 - **Advisory monitoring between releases:** CI runs only on release (owner decision), so `cargo deny check advisories` runs in `preflight.sh`.
   A scheduled weekly advisory workflow (`.github/workflows/security.yml`, Mondays, read-only plus `issues: write` to open one alert issue) **was added by owner decision**.
-- **Development testing on 3 OSes:** CI runs only on release (owner decision), so day-to-day cross-OS testing uses local VMs (UTM/Parallels
-  for Windows and Linux on macOS). An opt-in `workflow_dispatch` test workflow is proposed but **not added without owner approval**.
+- **Development testing on 3 OSes:** CI runs only when the owner starts it (owner decision), so day-to-day cross-OS testing uses local VMs
+  (UTM/Parallels for Windows and Linux on macOS). `release.yml` is `workflow_dispatch` only: `snapshot` mode checks and builds any
+  branch without publishing ([ADR 0017](adr/0017-release-pipeline-and-updates.md)).
 - **Fuzz:** redactor, TLV, hook JSON, TOML, HTTP, CBOR, clientDataJSON, renderer.
 - **Golden:** hook JSON (ADR 0001), ERRORS.md messages.
-- **Gates:** `scripts/preflight.sh`. Release workflow (3-OS checks, cargo-deny, size, signing, attestation). Hook latency and RSS checked before release.
+- **Gates:** `scripts/preflight.sh`. Release workflow (checks, cargo-deny, size and test-hook check per target, SBOM, signing, attestation; ADR 0017). Hook latency and RSS checked before release.
 
 ## 12. Operations (ADR 0008)
 
@@ -641,9 +642,10 @@ keystore tripwire. Truncation is detected unless the log, the anchor and the tri
   (`…@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$`). The bundle's workflow claims (`--certificate-github-workflow-repository`, `…-ref`) are also checked.
   Installers **refuse downgrades** unless `--allow-downgrade` is passed. The bootstrap script itself is trust-on-first-use (fetched over HTTPS from
   the repo); this is documented, and the signed-binary path is the verifiable one. Without cosign the scripts print how to verify manually. Then install to
-  the user dir. The PowerShell script asks before adding to the user PATH. Also a Homebrew tap (macOS/Linux) and `cargo install --locked`
+  the user dir. The PowerShell script asks before adding to the user PATH. Also a Homebrew tap (`brew install diyrex/tap/keygent`, macOS/Linux,
+  a formula rendered from the signed `SHA256SUMS`; ADR 0017) and `cargo install --locked`
   from source. winget/scoop come later. **Minimum Claude Code: 2.1.295** (`onFailure`). `integrate` and `doctor` refuse older versions.
-- **Upgrade:** replace the binary, then `keygent seal && keygent unseal`. Hooks call the stable launcher, so paths survive upgrades. `doctor` repairs
+- **Upgrade:** replace the binary (`brew upgrade keygent`), then `keygent seal && keygent unseal`. keygent never updates itself (ADR 0017). Hooks call the stable launcher, so paths survive upgrades. `doctor` repairs
   stale hook paths.
 - **Uninstall:** seal → stop the broker and console → `integrate --remove` for every integration → remove the skill, runtime dir, config, broker log and
   keystore tripwire → remove the binary (on Windows, delayed deletion if it is locked). **Kept unless `--purge`:** the vault, `vault.kgt.prev` and the audit log.
@@ -868,3 +870,4 @@ broker unredacted. **Chain composer:** keygent wrapping another tool's hook so t
 | 174 | No advisory checks between releases | `cargo deny` in preflight. Scheduled workflow **deferred: owner decision** (§11) |
 | 175 | `mcp` listed as v1 | Marked Phase 6 (§5.1) |
 | 176 | Only a Mac available; 3-OS rule can't be met now | Windows verification deferred, compile-check only, no phase DONE until Windows runs ([ADR 0010](adr/0010-windows-verification-deferred.md)) |
+| 177 | Owner wants a Homebrew tap, auto-updates, and no automatic CI | GoReleaser on one macOS runner, manual `release.yml` (snapshot/release), formula tap, updates via `brew upgrade`/`brew autoupdate`, no self-update; Windows release asset waits for the platform layer ([ADR 0017](adr/0017-release-pipeline-and-updates.md)) |
