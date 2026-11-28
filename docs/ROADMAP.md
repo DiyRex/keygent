@@ -57,7 +57,7 @@ Every phase ends with tests **on Linux, macOS and Windows**, the leak suite, and
 - [ ] Policy modes incl. permissive-mode handling, denylist
 - [ ] `integrate claude`, `uninstall`, skill, `permissions.deny`, `doctor` + `--report`, `version`
 - [ ] Golden tests (hooks, ERRORS.md); full T1/T2 leak suite on all OSes
-- [ ] *(ADR 0016, proposed)* Prempti coexistence (parallel PreToolUse observer, `doctor` detection, false-positive canaries); Prempti sensitive-path union + canonical matching; `policy export --format cedar|json|falco`; staged rules (`enforcement = audit`); `audit --export ocsf|coding-agent`
+- [ ] *(ADR 0016, proposed)* Prempti coexistence (parallel PreToolUse observer, `doctor` detection, false-positive canaries); Prempti sensitive-path union + canonical matching; `policy export --format json|falco` (Cedar skipped, ADR 0020); staged rules (`enforcement = audit`); `audit --export ocsf|coding-agent`
 
 ## Phase 4 — Web console
 
@@ -98,7 +98,7 @@ See SPEC §14.
 - [ ] Windows targets once `src/platform` builds there
 
 **Reviews feeding these** — [RustyVault comparison](research/rustyvault-comparison.md): revoke approved grants and `--remember`
-entries on tightening edits; Shamir (recovery key only) in Phase 6. Cedar: [ADR 0020](adr/0020-cedar-policy.md), owner decision.
+entries on tightening edits; Shamir (recovery key only) in Phase 6. Cedar: skipped by owner decision ([ADR 0020](adr/0020-cedar-policy.md)).
 
 ## Later
 

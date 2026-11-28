@@ -1,6 +1,6 @@
 # ADR 0020 — Cedar for the policy layer: measured cost and options
 
-- **Status:** proposed. **Owner decision needed** (option B recommended).
+- **Status:** rejected — owner decision 2026-11-28: skip `cedar-policy` entirely (not worth it for keygent)
 - **Date:** 2026-11-28
 - **Verified against:**
   - `cedar-policy` 4.x (crates.io, resolved 2026-11-28), with `default-features = false`.
@@ -42,14 +42,13 @@ The budget is ≤ 2 MB hard and ≤ 1.5 MB target (SPEC §4). keygent is current
 
 ## Decision
 
-Recommend **B**. It gives Cedar as the standard, reviewable policy format, with tests proving that what keygent enforces is what the
-Cedar export says, and it keeps the 2 MB and RSS budgets.
-
-If the owner prefers **A**, SPEC §4 must raise the hard cap (≥ 3 MB) and THREATS must record the larger trusted base. That
-choice needs an explicit owner yes and a §17 row.
+**Skip Cedar.** Option A breaks the size cap. Options B–D add work or a second trusted component with no T1/T2 gain for a
+single-user tool whose policy is per-handle modes plus pinned allow rules. The owner decided not to use it in any form, so
+there is no engine, no dev-dependency and no differential test. Policy review stays with `keygent ls`/`rule ls`, `edit` diffs
+and `render_for_approval()`.
 
 ## Consequences
 
-- Phase 3 (ADR 0016 item list): `policy export --format cedar` plus a schema file, and the differential test with `cedar-policy` under
-  `[dev-dependencies]`. `cargo deny` covers dev-dependencies too.
-- DEPENDENCIES records the measurement above. Re-measure if `cedar-policy` adds a minimal "evaluator only" feature.
+- No `cedar-policy` crate anywhere (release or dev). DEPENDENCIES keeps the measurement as the reason.
+- ADR 0016's optional `policy export --format cedar` is dropped. JSON export stays possible if a reviewer needs one.
+- Revisit only if keygent grows multi-user or org-wide policy (out of scope for v1).

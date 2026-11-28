@@ -48,6 +48,6 @@ attacker is an agent running as the same OS user (§3.1). In keygent's setting:
 | Leases / revoker | Grants are single-use, in memory, with deadlines. Seal wipes them | Nothing to add locally. Phase 7 backend leases already follow restore-on-unseal (ADR 0016 A5) |
 | Revoke-by-principal | At run time, the broker re-checks each handle's existence and mode (`run_grant`), so `rm` or a tighten-to-deny blocks pending runs | **Adopt the rest:** a tightening edit, `untrust` or `exposed` also drops approved-but-unused grants and `--remember` entries for that handle. Leak test: approve → deny → retry must not run |
 | Bearer tokens | None. Mutual-auth proofs and per-action UV | **Not adopted** (T2) |
-| Path-glob ACLs | Per-handle modes + pinned allow rules | **Not adopted.** Globs widen access silently. Policy review goes through the Cedar export (ADR 0020) |
+| Path-glob ACLs | Per-handle modes + pinned allow rules | **Not adopted.** Globs widen access silently. Policy review stays with `rule ls`, `edit` diffs and approval rendering (Cedar skipped, ADR 0020) |
 | Mounts / router / HTTP / OpenSSL | — | **Not adopted.** Size and multi-tenancy, no T1/T2 value |
 | Plaintext hygiene | Locked arena, zero-on-free, no dumps, `Debug` blocked | keygent is stronger here |

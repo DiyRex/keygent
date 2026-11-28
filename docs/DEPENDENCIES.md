@@ -39,7 +39,7 @@ Raw data and method: [spikes/03-dep-sizes.md](spikes/03-dep-sizes.md). "Proposal
 | Linux Secret Service, clipboard, notifications | spawn `secret-tool` / `wl-copy` / `notify-send` at fixed paths | 0 | as planned, no crate |
 | SBOM | `cargo-cyclonedx` (release CI only) | 0 (not linked) | as planned |
 | Audit segment compression | `miniz_oxide` 0.8 (DEFLATE, `with-alloc`) | **33.3 KB** (aarch64-darwin, 2026-11-28) | proposed for audit v2 ([ADR 0018](adr/0018-audit-log-v2.md)); std has no compressor. 3.6× on a 20k-record sample |
-| Policy engine | `cedar-policy` 4.x (`default-features = false`) | **1,582,816 B alone** (88 crates, aarch64-darwin, 2026-11-28) | **over the 2 MB cap with keygent**; proposed as dev-dependency only (differential tests), [ADR 0020](adr/0020-cedar-policy.md) |
+| Policy engine | `cedar-policy` 4.x (`default-features = false`) | **1,582,816 B alone** (88 crates, aarch64-darwin, 2026-11-28) | **rejected** (over the 2 MB cap with keygent; owner decision: skip, [ADR 0020](adr/0020-cedar-policy.md)) |
 
 **Projected binary (Linux musl):** baseline 372 KB + crypto 101 KB + wordlists 144 KB + libc ≈ **620 KB** before product code.
 
